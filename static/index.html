@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0e1a" />
+  <title>mesh</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d4a8'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Em%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/s/style.css" />
+</head>
+<body>
+
+<!-- ================= AUTH VIEW ================= -->
+<section id="view-auth" class="view active">
+  <div class="auth-card">
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <h1>mesh</h1>
+    </div>
+    <p class="tagline">Anonyme Adressen. Ende-zu-Ende verschluesselt. Kein Server liest mit.</p>
+
+    <div class="tabs">
+      <button class="tab active" data-tab="login">Login</button>
+      <button class="tab" data-tab="register">Neu hier</button>
+    </div>
+
+    <form id="form-login" class="auth-form active">
+      <label>Adresse
+        <input name="address" autocomplete="off" required placeholder="mesh:..." />
+        <small>Deine kryptografische Adresse vom Register-Schritt.</small>
+      </label>
+      <label>Passwort
+        <input name="password" type="password" autocomplete="current-password" required minlength="8">
+      </label>
+      <button type="submit" class="primary">Einloggen</button>
+      <div class="hint">Passwort vergessen? Verwende den 24-Wort-Backup-Code <a href="#" id="link-recover">hier</a>.</div>
+    </form>
+
+    <form id="form-register" class="auth-form">
+      <label>Passwort
+        <input name="password" type="password" autocomplete="new-password" required minlength="8">
+        <small>Mindestens 8 Zeichen. Es gibt KEIN Email-Recovery, KEINEN Username. Nur dein 24-Wort-Backup-Code rettet dich falls du das Passwort vergisst.</small>
+      </label>
+      <label>Passwort wiederholen
+        <input name="password2" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <p class="hint">Dein Account hat keinen Namen. Beim Anlegen bekommst du eine kryptografische Adresse (wie eine Krypto-Wallet). Niemand kann dich „suchen" oder „durchsehen". Wer dich kontaktieren will, braucht deine Adresse direkt von dir.</p>
+      <button type="submit" class="primary">Anonymen Account anlegen</button>
+    </form>
+
+    <div id="auth-msg" class="msg"></div>
+  </div>
+</section>
+
+<!-- ================= MNEMONIC VIEW ================= -->
+<section id="view-mnemonic" class="view">
+  <div class="mnemonic-card">
+    <h2>Dein Account</h2>
+
+    <div class="addr-box">
+      <div class="addr-label">Deine Adresse</div>
+      <div class="addr-value" id="my-address-display"></div>
+      <button class="ghost small" id="btn-copy-addr">Adresse kopieren</button>
+    </div>
+
+    <h3>Backup-Code</h3>
+    <p>Diese 24 Woerter sind das EINZIGE was deinen Account wiederherstellt, falls du das Passwort vergisst.
+       <strong>Schreib sie OFFLINE auf Papier. Niemals als Foto, niemals in der Cloud.</strong></p>
+    <div id="mnemonic-grid" class="mnemonic-grid"></div>
+    <label class="confirm-row">
+      <input type="checkbox" id="mnemonic-confirm">
+      <span>Ich habe die 24 Woerter aufgeschrieben und sicher verstaut. Mir ist klar dass es keinen anderen Recovery-Weg gibt.</span>
+    </label>
+    <button id="mnemonic-continue" class="primary" disabled>Weiter</button>
+  </div>
+</section>
+
+<!-- ================= CHAT VIEW ================= -->
+<section id="view-chat" class="view">
+  <aside class="sidebar">
+    <div class="sidebar-head">
+      <div class="me-pill" id="me-pill" title="Adresse anzeigen">
+        <div class="me-dot"></div>
+        <span id="me-address-short"></span>
+      </div>
+      <button id="btn-logout" class="ghost small">Logout</button>
+    </div>
+
+    <div class="new-chat-row">
+      <input id="new-chat-address" placeholder="Adresse eingeben (mesh:...)" />
+      <button id="btn-new-chat" class="primary small">+</button>
+    </div>
+
+    <div class="tabs sidebar-tabs">
+      <button class="tab active" data-list="chats">Chats</button>
+      <button class="tab" data-list="requests">Anfragen <span id="req-count" class="badge"></span></button>
+    </div>
+
+    <div id="contact-list" class="contact-list"></div>
+    <div id="request-list" class="contact-list" style="display:none"></div>
+  </aside>
+
+  <main class="chat-main">
+    <div id="chat-header" class="chat-header"></div>
+    <div id="chat-stream" class="chat-stream"></div>
+
+    <div id="request-banner" class="request-banner" style="display:none">
+      <span>Diese Adresse hat dir zum ersten Mal geschrieben. Anfrage akzeptieren?</span>
+      <button class="primary small" id="btn-accept">Akzeptieren</button>
+      <button class="ghost small" id="btn-decline">Ablehnen</button>
+    </div>
+
+    <form id="form-send" class="composer">
+      <button type="button" id="btn-attach" class="ghost circ" title="Bild oder Datei">+</button>
+      <input type="file" id="file-input" accept="image/*,video/*" hidden multiple>
+      <button type="button" id="btn-record" class="ghost circ" title="Sprachnachricht">o</button>
+      <input id="msg-input" placeholder="Nachricht..." autocomplete="off" />
+      <button type="submit" class="primary circ" title="Senden">&rarr;</button>
+    </form>
+  </main>
+</section>
+
+<!-- ================= ADDRESS POPUP ================= -->
+<div id="addr-popup" class="popup-bg" style="display:none">
+  <div class="popup">
+    <h3>Deine Adresse</h3>
+    <p class="hint">Teile sie mit Leuten denen du erlaubst dich zu kontaktieren. Niemand kann dich finden ohne diese Adresse.</p>
+    <div class="addr-value" id="popup-my-address"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
+      <button class="ghost small" id="btn-popup-copy">Kopieren</button>
+      <button class="primary small" id="btn-popup-close">OK</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= RECOVER VIEW ================= -->
+<section id="view-recover" class="view">
+  <div class="auth-card">
+    <h2>Account wiederherstellen</h2>
+    <p>Gib deine 24 Backup-Woerter ein und ein neues Passwort. (Phase 2 - kommt bald.)</p>
+    <button class="ghost" onclick="LehnoApp.show('auth')">Zurueck</button>
+  </div>
+</section>
+
+<script src="/s/bip39.js"></script>
+<script src="/s/crypto.js"></script>
+<script src="/s/app.js"></script>
+</body>
+</html>

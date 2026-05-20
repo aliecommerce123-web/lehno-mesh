@@ -1,0 +1,7 @@
+mesh.db
+mesh.db.*
+uploads/
+*.pyc
+__pycache__/
+.venv/
+.DS_Store

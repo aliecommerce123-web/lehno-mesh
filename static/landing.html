@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0e1a" />
+  <title>mesh - nur ueber Tor erreichbar</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d4a8'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Em%3C/text%3E%3C/svg%3E" />
+  <style>
+    :root {
+      --bg: #0a0e1a;
+      --bg-2: #111726;
+      --bg-3: #1a2236;
+      --line: #243049;
+      --text: #e6edf7;
+      --text-dim: #8794ad;
+      --text-dimmer: #5a6580;
+      --accent: #00d4a8;
+      --accent-dark: #00b893;
+      --warn: #ffb347;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0; padding: 0; min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    body { display: flex; align-items: flex-start; justify-content: center; padding: 32px 20px 80px; }
+    .card {
+      background: var(--bg-2);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 32px;
+      max-width: 580px;
+      width: 100%;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.45);
+    }
+    .brand {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
+    }
+    .brand-dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: var(--accent); box-shadow: 0 0 12px var(--accent);
+    }
+    h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
+    h2 { margin: 24px 0 10px; font-size: 17px; }
+    .lead {
+      color: var(--text-dim); font-size: 14px; margin: 14px 0 28px;
+    }
+    .warn-banner {
+      background: rgba(255,179,71,0.08);
+      border: 1px solid var(--warn);
+      color: var(--warn);
+      padding: 14px 16px;
+      border-radius: 10px;
+      font-size: 13.5px;
+      margin: 0 0 24px;
+    }
+    .warn-banner strong { color: var(--warn); }
+    .step {
+      background: var(--bg-3);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 14px 16px;
+      margin: 10px 0;
+      display: flex;
+      gap: 14px;
+      align-items: flex-start;
+    }
+    .step-num {
+      background: var(--accent);
+      color: #001b14;
+      width: 26px; height: 26px;
+      border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-weight: 700; font-size: 13px; flex-shrink: 0;
+    }
+    .step-body { flex: 1; }
+    .step-body strong { font-size: 14.5px; }
+    .step-body p { margin: 4px 0 0; color: var(--text-dim); font-size: 13px; }
+    .step-body a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px dotted var(--accent);
+    }
+    .onion-box {
+      background: var(--bg-3);
+      border: 1px solid var(--accent);
+      border-radius: 10px;
+      padding: 16px;
+      margin: 24px 0;
+    }
+    .onion-label {
+      font-size: 11px; color: var(--text-dim);
+      text-transform: uppercase; letter-spacing: 0.6px;
+      margin-bottom: 8px;
+    }
+    .onion-addr {
+      font-family: ui-monospace, "JetBrains Mono", monospace;
+      font-size: 12.5px;
+      color: var(--accent);
+      word-break: break-all;
+      line-height: 1.6;
+      margin-bottom: 12px;
+      user-select: all;
+    }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    button, .btn {
+      cursor: pointer;
+      background: var(--accent);
+      color: #001b14;
+      border: 0;
+      padding: 10px 18px;
+      border-radius: 9px;
+      font-size: 14px;
+      font-weight: 600;
+      font-family: inherit;
+      text-decoration: none;
+      display: inline-block;
+    }
+    button:hover, .btn:hover { background: var(--accent-dark); }
+    button.ghost, .btn.ghost {
+      background: transparent;
+      color: var(--text-dim);
+      border: 1px solid var(--line);
+    }
+    button.ghost:hover, .btn.ghost:hover { background: var(--bg-3); color: var(--text); }
+    .qr-wrap {
+      display: flex;
+      justify-content: center;
+      margin: 22px 0;
+    }
+    .qr {
+      background: white;
+      padding: 14px;
+      border-radius: 10px;
+    }
+    .qr img { display: block; width: 220px; height: 220px; }
+    .why {
+      margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--line);
+      color: var(--text-dimmer); font-size: 12.5px; line-height: 1.6;
+    }
+    .why h2 { margin-top: 0; color: var(--text-dim); }
+    .why p { margin: 8px 0; }
+    .why code {
+      background: var(--bg-3);
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: ui-monospace, monospace;
+      font-size: 11.5px;
+      color: var(--accent);
+    }
+    .repo-link {
+      font-size: 11.5px;
+      color: var(--text-dimmer);
+      text-align: center;
+      margin-top: 24px;
+    }
+    .repo-link a { color: var(--text-dim); }
+  </style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="brand-dot"></div>
+    <h1>mesh</h1>
+  </div>
+  <p class="lead">Anonymes Ende-zu-Ende verschluesseltes Messaging.</p>
+
+  <div class="warn-banner">
+    <strong>Du kommst gerade ueber Clearnet (ohne Tor) hier an.</strong><br>
+    Damit waeren deine IP-Adresse und der Zeitpunkt deiner Anfrage fuer Cloudflare und unseren Hoster sichtbar. Das wollen wir vermeiden. Bitte wechsle auf die Tor-Variante - siehe Anleitung unten.
+  </div>
+
+  <h2>1. Tor Browser installieren</h2>
+
+  <div class="step">
+    <div class="step-num">A</div>
+    <div class="step-body">
+      <strong>iPhone / iPad</strong>
+      <p><a href="https://apps.apple.com/de/app/onion-browser/id519296448" target="_blank" rel="noopener">„Onion Browser" im App Store</a> (gratis, von Tor Project empfohlen)</p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">B</div>
+    <div class="step-body">
+      <strong>Android</strong>
+      <p><a href="https://play.google.com/store/apps/details?id=org.torproject.torbrowser" target="_blank" rel="noopener">„Tor Browser" im Play Store</a></p>
+    </div>
+  </div>
+
+  <div class="step">
+    <div class="step-num">C</div>
+    <div class="step-body">
+      <strong>Mac / Windows / Linux</strong>
+      <p><a href="https://www.torproject.org/download/" target="_blank" rel="noopener">torproject.org/download</a></p>
+    </div>
+  </div>
+
+  <h2>2. Onion-Adresse oeffnen</h2>
+
+  <div class="onion-box">
+    <div class="onion-label">Onion-Adresse von mesh</div>
+    <div class="onion-addr" id="onion-addr">http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion</div>
+    <div class="btn-row">
+      <button id="btn-copy">Adresse kopieren</button>
+      <a class="btn ghost" id="btn-open" href="http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion">Im aktuellen Browser oeffnen</a>
+    </div>
+  </div>
+
+  <p style="color:var(--text-dim);font-size:13px;text-align:center;margin:18px 0 8px">
+    Oder QR-Code mit dem Tor Browser scannen:
+  </p>
+  <div class="qr-wrap">
+    <div class="qr">
+      <img src="https://api.qrserver.com/v1/create-qr-code/?size=220x220&margin=0&data=http%3A%2F%2F35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion" alt="QR zur Onion-Adresse" />
+    </div>
+  </div>
+
+  <div class="why">
+    <h2>Warum dieser Umweg?</h2>
+    <p><strong>Tor</strong> verschleiert deine echte IP-Adresse, indem alle Anfragen ueber drei zufaellige Server weltweit geroutet werden. Niemand auf der Strecke sieht gleichzeitig Absender UND Ziel.</p>
+    <p>Bei der <strong>Onion-Adresse</strong> (<code>.onion</code>) bleibt der Traffic sogar komplett im Tor-Netz. Cloudflare und unser Server sehen NICHTS von dir, nicht mal welcher Tor-Exit du nutzt.</p>
+    <p>Ohne Tor: deine IP -&gt; Cloudflare -&gt; Hetzner. Beide koennten theoretisch loggen wer wann wo hier war. Mit Tor: technisch unmoeglich.</p>
+    <p><strong>Was wir schon machen:</strong> Backend speichert KEINE IP, KEINEN Zeitstempel auf Sekunden-Ebene, KEINEN Username. Nur kryptografische Adressen + verschluesselte Pakete. Tor-Zugang ist das letzte Stueck damit es wirklich anonym ist.</p>
+  </div>
+
+  <div class="repo-link">
+    Code ist Open Source - <a href="https://github.com/aliecommerce123-web/lehno-mesh" target="_blank" rel="noopener">github.com/aliecommerce123-web/lehno-mesh</a><br>
+    Jede Aenderung ist dort sichtbar. Auch der Admin kann nichts heimlich anpassen.
+  </div>
+</div>
+
+<script>
+document.getElementById("btn-copy").addEventListener("click", () => {
+  const txt = document.getElementById("onion-addr").textContent;
+  navigator.clipboard.writeText(txt).then(() => {
+    const b = document.getElementById("btn-copy");
+    const orig = b.textContent;
+    b.textContent = "Kopiert!";
+    setTimeout(() => b.textContent = orig, 1500);
+  });
+});
+// Auto-Heuristik: wenn der Browser bereits eine .onion-Adresse aufgerufen hat,
+// braucht der User die Anleitung nicht mehr. Detection per location.host.
+if (location.host.endsWith(".onion")) {
+  location.href = "/app";  // direkt zur App
+}
+</script>
+</body>
+</html>

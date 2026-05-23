@@ -16,9 +16,11 @@ Aenderungen ggue Phase 1:
 import asyncio
 import base64
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -44,6 +46,44 @@ UPLOADS.mkdir(exist_ok=True)
 JWT_SECRET = os.environ.get("LEHNO_MESH_JWT_SECRET") or secrets.token_hex(32)
 JWT_ALGO   = "HS256"
 JWT_TTL    = 60 * 60 * 24 * 30
+
+# Hardcoded Admin-Lock. Wer das auf False stellt, muss neuen Code in das public
+# GitHub-Repo pushen - jede Aenderung ist dort sichtbar.
+ADMIN_API_DISABLED = True
+
+
+# ---------------------------------------------------------------------------
+# Tamper-Evident Self-Hash-Check
+# Beim Service-Start werden alle kritischen Files gegen die im Repo committete
+# EXPECTED_HASHES.json verglichen. Mismatch -> Service startet nicht.
+# Das schuetzt nicht gegen Root-Zugriff (Root kann auch die Hash-Datei aendern),
+# ABER: jede Aenderung muss ins public Repo, wo sie sichtbar wird.
+# ---------------------------------------------------------------------------
+def check_integrity():
+    expected_path = BASE_DIR / "EXPECTED_HASHES.json"
+    if not expected_path.exists():
+        print("WARNING: EXPECTED_HASHES.json missing - integrity check skipped", file=sys.stderr)
+        return
+    try:
+        expected = json.loads(expected_path.read_text())
+    except Exception as e:
+        print(f"FATAL: cannot read EXPECTED_HASHES.json: {e}", file=sys.stderr)
+        sys.exit(1)
+    for rel_path, expected_hash in expected.items():
+        actual_path = BASE_DIR / rel_path
+        if not actual_path.exists():
+            print(f"FATAL: file missing: {rel_path}", file=sys.stderr)
+            sys.exit(1)
+        h = hashlib.sha256(actual_path.read_bytes()).hexdigest()
+        if h != expected_hash:
+            print(f"FATAL: tamper detected in {rel_path}", file=sys.stderr)
+            print(f"  expected: {expected_hash}", file=sys.stderr)
+            print(f"  actual:   {h}", file=sys.stderr)
+            sys.exit(1)
+    print(f"integrity OK ({len(expected)} files verified)", file=sys.stderr)
+
+
+check_integrity()
 
 # Address-Format: base58 von sha256(identity_pub_raw)[:24] = 24 bytes = ca 33 Zeichen
 ADDR_RE = r"^[1-9A-HJ-NP-Za-km-z]{30,50}$"
@@ -521,10 +561,25 @@ async def websocket_endpoint(ws: WebSocket, token: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# Static + Index
+# Static + Index (Host-basiertes Routing - .onion sieht App, Clearnet sieht Tor-Anleitung)
 # ---------------------------------------------------------------------------
+def _is_onion(request: Request) -> bool:
+    host = request.headers.get("host", "").lower()
+    return host.endswith(".onion")
+
+
 @app.get("/")
-async def index():
+async def index(request: Request):
+    if _is_onion(request):
+        return FileResponse(STATIC / "index.html")
+    return FileResponse(STATIC / "landing.html")
+
+
+@app.get("/app")
+async def app_force(request: Request):
+    """Optionaler Direkt-Einstieg zur App. Nur ueber .onion erreichbar."""
+    if not _is_onion(request):
+        return FileResponse(STATIC / "landing.html")
     return FileResponse(STATIC / "index.html")
 
 

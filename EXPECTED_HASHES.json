@@ -1,0 +1,11 @@
+{
+  "app.py": "31d9bdbb86ea289c2f0e2941507572089ff04fa1acb0ed34e8e97201bcca4e8c",
+  "static/app.js": "cf0910c9ed62c114427d49fa0c1774640aa66b7ff8da213263c459cf1d53b534",
+  "static/bip39.js": "d0fe4ee23c53549f1ca6066e2c06355bbce827db6d2d7ffc105a14376e8b6c9a",
+  "static/crypto.js": "fc1c1d741685b3a092dfa78afdac3bca1aa1d54fe30fd1d3bf152de46ec4b0bc",
+  "static/index.html": "8ee28d74b00858e11b859e5a978ccaa3ea3e8123f28bb4eee769e8dc0c608c8c",
+  "static/landing.html": "4bc6a296d2920c4aef89f2d3cf71bf70e9eb9871d8fc730106e50d44ce42c5a4",
+  "static/manifest.json": "5209c6ec1aa9e2f09c5607f7e18e6bd62b12c6da4952ac00cb8858c08aac4acb",
+  "static/style.css": "cdad462b7ab8fffde573a4c30f365b2725110c75fcc3256206fd1af7ee227920",
+  "static/sw.js": "a03328c7500bd1142adb6b82ef34c7e01c15435c5140eb36509ab162eab24956"
+}

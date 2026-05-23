@@ -3,8 +3,8 @@
 Anonymes, Ende-zu-Ende verschlüsseltes Messaging.
 
 Live unter:
-- `https://mesh.lehno.de` (Cloudflare-Proxy, Caddy, Hetzner)
-- `http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion` (Tor Hidden Service)
+- `https://mesh.lehno.de` (Clearnet-Zugang, leitet Nicht-Tor-User auf eine Anleitung)
+- `http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion` (Tor Hidden Service - empfohlen)
 
 ## Was es ist
 
@@ -17,7 +17,7 @@ Ein selbstgehostetes E2EE-Messaging das so wenig wie möglich über seine User w
 - **Auto-Delete.** Nachrichten werden nach Abholung sofort vom Server gelöscht. Nicht abgeholte Nachrichten verfallen nach 30 Tagen.
 - **Keine Admin-Macht.** Kein Sperr-Endpoint, kein User-Listing. Wer Server-Root hat kann natürlich technisch alles, aber die API exponiert nichts davon.
 - **Keine Server-Logs.** Caddy + uvicorn Access-Logs sind deaktiviert.
-- **Tor Hidden Service.** Wer über Tor Browser kommt, ist auch vor Cloudflare und Hetzner unsichtbar.
+- **Tor Hidden Service.** Wer über Tor Browser kommt, ist auch vor allen Zwischenstellen im Netz unsichtbar.
 
 ## Krypto
 
@@ -76,7 +76,7 @@ Beim Login fragt der Server `argon2id(auth_key)` ab und gibt bei Match `salt`, `
 - Sender einer Nachricht (sealed sender)
 - Wer mit wem chattet (kein from-Feld, recipient_address steht da aber sagt nichts darüber WER schickt)
 - User-Namen (es gibt keine)
-- IP-Adressen (Cloudflare-Proxy + Tor verstecken die)
+- IP-Adressen (werden vor dem Backend gestrippt + Tor versteckt sie netzseitig)
 
 ## Was der Server SEHEN kann (Trade-offs)
 
@@ -88,16 +88,16 @@ Beim Login fragt der Server `argon2id(auth_key)` ab und gibt bei Match `salt`, `
 ## Bekannte Trust-Issues
 
 - **Frontend-Vertrauen:** Wer den Server kontrolliert kann theoretisch ein boeses Frontend pushen das Passwörter mitschickt. Schutz dagegen: Open-Source-Repo + reproducible builds + clientseitige Verifikation. Phase 3.
-- **Server-Hoster:** Hetzner sehen Tor-Traffic, Cloudflare-Traffic. Sehen aber den Inhalt nicht. Wirklich unsichtbar nur über Tor-Browser-Connection.
+- **Server-Hoster:** Auf der Clearnet-Strecke sehen Zwischenstellen Verbindungsmetadaten (IP-zu-Server, Zeit, Paketgrößen). Inhalt sehen sie nicht. Wirklich unsichtbar nur über Tor-Browser-Connection zur .onion-Adresse.
 - **TOFU bei erstem Kontakt:** Erste Anfrage von einer Adresse hat noch keine Out-of-Band-Verifikation. Phase 2: Fingerprint-Vergleich + QR-Scan.
 
 ## Stack
 
 - Backend: Python 3.12 + FastAPI + uvicorn + SQLite (aiosqlite)
 - Frontend: Vanilla JS, WebCrypto, BIP39, PWA-Manifest, Service Worker
-- Reverse-Proxy: Caddy mit Cloudflare-Origin-Cert
+- Reverse-Proxy: Caddy mit Origin-Cert
 - Hidden Service: Tor v3 (`HiddenServiceVersion 3`)
-- Hosting: Hetzner Cloud (CX21 oder ähnlich)
+- Hosting: Standard-VPS in der EU
 
 ## Lizenz
 

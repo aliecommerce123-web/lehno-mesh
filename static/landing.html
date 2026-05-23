@@ -171,7 +171,7 @@
 
   <div class="warn-banner">
     <strong>Du kommst gerade über Clearnet (ohne Tor) hier an.</strong><br>
-    Damit wären deine IP-Adresse und der Zeitpunkt deiner Anfrage für Cloudflare und unseren Hoster sichtbar. Das wollen wir vermeiden. Bitte wechsle auf die Tor-Variante - siehe Anleitung unten.
+    Damit wären deine IP-Adresse und der Zeitpunkt deiner Anfrage für Zwischenstellen im Netz sichtbar. Das wollen wir vermeiden. Bitte wechsle auf die Tor-Variante - siehe Anleitung unten.
   </div>
 
   <h2>1. Tor Browser installieren</h2>
@@ -222,10 +222,10 @@
 
   <div class="why">
     <h2>Warum dieser Umweg?</h2>
-    <p><strong>Tor</strong> verschleiert deine echte IP-Adresse, indem alle Anfragen über drei zufaellige Server weltweit geroutet werden. Niemand auf der Strecke sieht gleichzeitig Absender UND Ziel.</p>
-    <p>Bei der <strong>Onion-Adresse</strong> (<code>.onion</code>) bleibt der Traffic sogar komplett im Tor-Netz. Cloudflare und unser Server sehen NICHTS von dir, nicht mal welcher Tor-Exit du nutzt.</p>
-    <p>Ohne Tor: deine IP -&gt; Cloudflare -&gt; Hetzner. Beide könnten theoretisch loggen wer wann wo hier war. Mit Tor: technisch unmöglich.</p>
-    <p><strong>Was wir schon machen:</strong> Backend speichert KEINE IP, KEINEN Zeitstempel auf Sekunden-Ebene, KEINEN Username. Nur kryptografische Adressen + verschlüsselte Pakete. Tor-Zugang ist das letzte Stueck damit es wirklich anonym ist.</p>
+    <p><strong>Tor</strong> verschleiert deine echte IP-Adresse, indem alle Anfragen über drei zufällige Server weltweit geroutet werden. Niemand auf der Strecke sieht gleichzeitig Absender UND Ziel.</p>
+    <p>Bei der <strong>Onion-Adresse</strong> (<code>.onion</code>) bleibt der Traffic komplett im Tor-Netz. Nichts und niemand auf dem Weg sieht etwas von dir, nicht mal welcher Tor-Exit du nutzt.</p>
+    <p>Ohne Tor läuft dein Traffic über mehrere Zwischenstellen, die deine IP-Adresse und den Zeitpunkt deiner Anfrage theoretisch loggen könnten. Mit Tor: technisch unmöglich.</p>
+    <p><strong>Was wir schon machen:</strong> Der Server speichert KEINE IP, KEINEN Zeitstempel auf Sekunden-Ebene, KEINEN Username. Nur kryptografische Adressen + verschlüsselte Pakete. Tor-Zugang ist das letzte Stück damit es wirklich anonym ist.</p>
   </div>
 
   <div class="repo-link">

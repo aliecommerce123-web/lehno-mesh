@@ -1,14 +1,14 @@
-"""lehno-mesh Phase 1.5 - Anonymes E2E-verschluesseltes Messaging (Port 8985).
+"""lehno-mesh Phase 1.5 - Anonymes E2E-verschlüsseltes Messaging (Port 8985).
 
-Aenderungen ggue Phase 1:
+Änderungen ggue Phase 1:
 - KEINE Usernames mehr. Stattdessen: kryptografische Adresse = base58(sha256(identity_pub)),
   also deterministisch aus dem Public-Key abgeleitet. User waehlt nichts aus, alles random.
 - SEALED-SENDER komplett. messages-Tabelle hat KEIN from_address-Feld mehr. Server
-  sieht nur "Paket fuer Inbox X", weiss nicht wer Sender ist (Sender steckt im
-  verschluesselten Body).
+  sieht nur "Paket für Inbox X", weiß nicht wer Sender ist (Sender steckt im
+  verschlüsselten Body).
 - KEIN /api/contacts (User-Listing entfernt), KEIN User-Count, KEINE Admin-Endpoints.
 - Contact-Request-Flag: erste Nachricht von neuem Sender hat `is_contact_request=1`,
-  Empfaenger akzeptiert/lehnt clientseitig ab. Server traegt nur das Flag.
+  Empfänger akzeptiert/lehnt clientseitig ab. Server traegt nur das Flag.
 - Auto-Delete nach Abholung (per packets DELETE-Endpoint).
 - Login per Adresse, nicht per Username.
 - Tor-Onion-Service zusaetzlich erreichbar (mesh.onion-Adresse via Caddy oder direkt).
@@ -48,7 +48,7 @@ JWT_ALGO   = "HS256"
 JWT_TTL    = 60 * 60 * 24 * 30
 
 # Hardcoded Admin-Lock. Wer das auf False stellt, muss neuen Code in das public
-# GitHub-Repo pushen - jede Aenderung ist dort sichtbar.
+# GitHub-Repo pushen - jede Änderung ist dort sichtbar.
 ADMIN_API_DISABLED = True
 
 
@@ -56,8 +56,8 @@ ADMIN_API_DISABLED = True
 # Tamper-Evident Self-Hash-Check
 # Beim Service-Start werden alle kritischen Files gegen die im Repo committete
 # EXPECTED_HASHES.json verglichen. Mismatch -> Service startet nicht.
-# Das schuetzt nicht gegen Root-Zugriff (Root kann auch die Hash-Datei aendern),
-# ABER: jede Aenderung muss ins public Repo, wo sie sichtbar wird.
+# Das schuetzt nicht gegen Root-Zugriff (Root kann auch die Hash-Datei ändern),
+# ABER: jede Änderung muss ins public Repo, wo sie sichtbar wird.
 # ---------------------------------------------------------------------------
 def check_integrity():
     expected_path = BASE_DIR / "EXPECTED_HASHES.json"
@@ -194,7 +194,7 @@ async def db():
 
 
 # ---------------------------------------------------------------------------
-# Auth helpers - JWT enthaelt nur die Adresse, keinen Klartext-Username
+# Auth helpers - JWT enthält nur die Adresse, keinen Klartext-Username
 # ---------------------------------------------------------------------------
 def make_jwt(address: str) -> str:
     payload = {
@@ -263,12 +263,12 @@ class SendPacketReq(BaseModel):
 # ---------------------------------------------------------------------------
 @app.post("/api/register")
 async def register(req: RegisterReq, con: aiosqlite.Connection = Depends(db)):
-    # Adresse wird deterministisch aus identity_pub abgeleitet, nicht vom User gewaehlt
+    # Adresse wird deterministisch aus identity_pub abgeleitet, nicht vom User gewählt
     address = address_from_identity_pub(req.identity_pub_b64)
 
     cur = await con.execute("SELECT 1 FROM users WHERE address=?", (address,))
     if await cur.fetchone():
-        # Address collision (praktisch unmoeglich) - 409
+        # Address collision (praktisch unmöglich) - 409
         raise HTTPException(409, "address collision")
 
     auth_hash = ph.hash(req.auth_key_b64)
@@ -326,7 +326,7 @@ async def login(req: LoginReq, con: aiosqlite.Connection = Depends(db)):
 
 
 # ---------------------------------------------------------------------------
-# Public-Key-Lookup per Adresse (oeffentlich, weil Krypto)
+# Public-Key-Lookup per Adresse (öffentlich, weil Krypto)
 # ---------------------------------------------------------------------------
 @app.get("/api/keys/{address}")
 async def fetch_keys(address: str, con: aiosqlite.Connection = Depends(db),
@@ -352,7 +352,7 @@ async def fetch_keys(address: str, con: aiosqlite.Connection = Depends(db),
 async def send_packet(req: SendPacketReq, con: aiosqlite.Connection = Depends(db),
                      me: str = Depends(current_address)):
     # Auth-Token bestaetigt nur "ich existiere", nicht "ich bin der Sender dieses Pakets".
-    # Sender-Identitaet steckt im verschluesselten Body.
+    # Sender-Identität steckt im verschlüsselten Body.
     cur = await con.execute("SELECT 1 FROM users WHERE address=?", (req.recipient_address,))
     if not await cur.fetchone():
         raise HTTPException(404, "recipient not found")
@@ -377,7 +377,7 @@ async def send_packet(req: SendPacketReq, con: aiosqlite.Connection = Depends(db
 async def inbox(since_id: int = 0,
                 con: aiosqlite.Connection = Depends(db),
                 me: str = Depends(current_address)):
-    """Eigene Inbox abrufen. Server prueft JWT-Adresse = recipient_address."""
+    """Eigene Inbox abrufen. Server prüft JWT-Adresse = recipient_address."""
     cur = await con.execute(
         "SELECT id, ephemeral_pub_b64, nonce_b64, ciphertext_b64, signature_b64, "
         "       msg_type, is_contact_request, attachment_id, created_day "
@@ -406,7 +406,7 @@ async def inbox(since_id: int = 0,
 @app.delete("/api/packets/{packet_id}")
 async def delete_packet(packet_id: int, con: aiosqlite.Connection = Depends(db),
                        me: str = Depends(current_address)):
-    """User loescht selbst Pakete aus seiner Inbox (nach Abholung+Entschluesselung)."""
+    """User löscht selbst Pakete aus seiner Inbox (nach Abholung+Entschluesselung)."""
     cur = await con.execute(
         "DELETE FROM packets WHERE id=? AND recipient_address=?",
         (packet_id, me),
@@ -418,7 +418,7 @@ async def delete_packet(packet_id: int, con: aiosqlite.Connection = Depends(db),
 @app.post("/api/packets/ack")
 async def ack_packets(packet_ids: list[int], con: aiosqlite.Connection = Depends(db),
                      me: str = Depends(current_address)):
-    """Batch-Delete fuer abgeholte Pakete."""
+    """Batch-Delete für abgeholte Pakete."""
     if not packet_ids:
         return {"deleted": 0}
     placeholders = ",".join("?" * len(packet_ids))
@@ -441,7 +441,7 @@ async def delete_account(con: aiosqlite.Connection = Depends(db),
 
 
 # ---------------------------------------------------------------------------
-# Attachments (encrypted blobs, Server entschluesselt nicht)
+# Attachments (encrypted blobs, Server entschlüsselt nicht)
 # ---------------------------------------------------------------------------
 ATTACHMENT_TTL_DAYS = 30
 
@@ -480,7 +480,7 @@ async def get_attachment(att_id: int, con: aiosqlite.Connection = Depends(db),
 # Background: Auto-Cleanup
 # ---------------------------------------------------------------------------
 async def cleanup_loop():
-    """Loescht abgelaufene Attachments + Pakete aelter als 30 Tage falls nie abgeholt."""
+    """Löscht abgelaufene Attachments + Pakete aelter als 30 Tage falls nie abgeholt."""
     await asyncio.sleep(60)
     while True:
         try:
@@ -577,7 +577,7 @@ async def index(request: Request):
 
 @app.get("/app")
 async def app_force(request: Request):
-    """Optionaler Direkt-Einstieg zur App. Nur ueber .onion erreichbar."""
+    """Optionaler Direkt-Einstieg zur App. Nur über .onion erreichbar."""
     if not _is_onion(request):
         return FileResponse(STATIC / "landing.html")
     return FileResponse(STATIC / "index.html")

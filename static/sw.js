@@ -1,6 +1,6 @@
 // lehno-mesh Service Worker
-// Minimal: nur als Marker fuer PWA-Installation. Kein offline caching von API-Daten
-// (das waere bei E2EE eh sinnlos, da Schluessel im Speicher sind).
+// Minimal: nur als Marker für PWA-Installation. Kein offline caching von API-Daten
+// (das wäre bei E2EE eh sinnlos, da Schlüssel im Speicher sind).
 const CACHE = "lehno-mesh-v1";
 const SHELL = ["/", "/s/style.css", "/s/app.js", "/s/crypto.js", "/s/bip39.js", "/manifest.json"];
 

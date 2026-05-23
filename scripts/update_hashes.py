@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Berechnet SHA-256 fuer alle kritischen Files und schreibt EXPECTED_HASHES.json.
+"""Berechnet SHA-256 für alle kritischen Files und schreibt EXPECTED_HASHES.json.
 
-Nach jeder legitimen Code-Aenderung musst du dieses Skript laufen lassen und das
+Nach jeder legitimen Code-Änderung musst du dieses Skript laufen lassen und das
 neue EXPECTED_HASHES.json mit-committen, sonst startet der Service nicht mehr.
 
-Das ist Absicht: jede Aenderung muss im public Repo sichtbar werden.
+Das ist Absicht: jede Änderung muss im public Repo sichtbar werden.
 """
 import hashlib
 import json
@@ -12,7 +12,7 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Files die immer mit-versioniert sind und sich nie unangekuendigt aendern duerfen
+# Files die immer mit-versioniert sind und sich nie unangekuendigt ändern dürfen
 PROTECTED = [
     "app.py",
     "static/index.html",

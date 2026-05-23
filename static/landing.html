@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0a0e1a" />
-  <title>mesh - nur ueber Tor erreichbar</title>
+  <title>mesh - nur über Tor erreichbar</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d4a8'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Em%3C/text%3E%3C/svg%3E" />
   <style>
     :root {
@@ -167,11 +167,11 @@
     <div class="brand-dot"></div>
     <h1>mesh</h1>
   </div>
-  <p class="lead">Anonymes Ende-zu-Ende verschluesseltes Messaging.</p>
+  <p class="lead">Anonymes Ende-zu-Ende verschlüsseltes Messaging.</p>
 
   <div class="warn-banner">
-    <strong>Du kommst gerade ueber Clearnet (ohne Tor) hier an.</strong><br>
-    Damit waeren deine IP-Adresse und der Zeitpunkt deiner Anfrage fuer Cloudflare und unseren Hoster sichtbar. Das wollen wir vermeiden. Bitte wechsle auf die Tor-Variante - siehe Anleitung unten.
+    <strong>Du kommst gerade über Clearnet (ohne Tor) hier an.</strong><br>
+    Damit wären deine IP-Adresse und der Zeitpunkt deiner Anfrage für Cloudflare und unseren Hoster sichtbar. Das wollen wir vermeiden. Bitte wechsle auf die Tor-Variante - siehe Anleitung unten.
   </div>
 
   <h2>1. Tor Browser installieren</h2>
@@ -200,14 +200,14 @@
     </div>
   </div>
 
-  <h2>2. Onion-Adresse oeffnen</h2>
+  <h2>2. Onion-Adresse öffnen</h2>
 
   <div class="onion-box">
     <div class="onion-label">Onion-Adresse von mesh</div>
     <div class="onion-addr" id="onion-addr">http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion</div>
     <div class="btn-row">
       <button id="btn-copy">Adresse kopieren</button>
-      <a class="btn ghost" id="btn-open" href="http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion">Im aktuellen Browser oeffnen</a>
+      <a class="btn ghost" id="btn-open" href="http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion">Im aktuellen Browser öffnen</a>
     </div>
   </div>
 
@@ -222,15 +222,15 @@
 
   <div class="why">
     <h2>Warum dieser Umweg?</h2>
-    <p><strong>Tor</strong> verschleiert deine echte IP-Adresse, indem alle Anfragen ueber drei zufaellige Server weltweit geroutet werden. Niemand auf der Strecke sieht gleichzeitig Absender UND Ziel.</p>
+    <p><strong>Tor</strong> verschleiert deine echte IP-Adresse, indem alle Anfragen über drei zufaellige Server weltweit geroutet werden. Niemand auf der Strecke sieht gleichzeitig Absender UND Ziel.</p>
     <p>Bei der <strong>Onion-Adresse</strong> (<code>.onion</code>) bleibt der Traffic sogar komplett im Tor-Netz. Cloudflare und unser Server sehen NICHTS von dir, nicht mal welcher Tor-Exit du nutzt.</p>
-    <p>Ohne Tor: deine IP -&gt; Cloudflare -&gt; Hetzner. Beide koennten theoretisch loggen wer wann wo hier war. Mit Tor: technisch unmoeglich.</p>
-    <p><strong>Was wir schon machen:</strong> Backend speichert KEINE IP, KEINEN Zeitstempel auf Sekunden-Ebene, KEINEN Username. Nur kryptografische Adressen + verschluesselte Pakete. Tor-Zugang ist das letzte Stueck damit es wirklich anonym ist.</p>
+    <p>Ohne Tor: deine IP -&gt; Cloudflare -&gt; Hetzner. Beide könnten theoretisch loggen wer wann wo hier war. Mit Tor: technisch unmöglich.</p>
+    <p><strong>Was wir schon machen:</strong> Backend speichert KEINE IP, KEINEN Zeitstempel auf Sekunden-Ebene, KEINEN Username. Nur kryptografische Adressen + verschlüsselte Pakete. Tor-Zugang ist das letzte Stueck damit es wirklich anonym ist.</p>
   </div>
 
   <div class="repo-link">
     Code ist Open Source - <a href="https://github.com/aliecommerce123-web/lehno-mesh" target="_blank" rel="noopener">github.com/aliecommerce123-web/lehno-mesh</a><br>
-    Jede Aenderung ist dort sichtbar. Auch der Admin kann nichts heimlich anpassen.
+    Jede Änderung ist dort sichtbar. Auch der Admin kann nichts heimlich anpassen.
   </div>
 </div>
 

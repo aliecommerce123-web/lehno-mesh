@@ -1,7 +1,7 @@
 {
   "name": "mesh",
   "short_name": "mesh",
-  "description": "Ende-zu-Ende verschluesseltes Messaging",
+  "description": "Ende-zu-Ende verschlüsseltes Messaging",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#0a0e1a",

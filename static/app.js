@@ -172,7 +172,7 @@ async function doLogin(address, password) {
     identityPriv: live.identityPriv,
     signingPriv: live.signingPriv,
   };
-  // pubkeys von uns selbst nachfragen damit sender_signing_pub_b64 verfuegbar ist
+  // pubkeys von uns selbst nachfragen damit sender_signing_pub_b64 verfügbar ist
   const my = await API.get("/api/keys/" + encodeURIComponent(resp.address));
   STATE.me.identity_pub_b64 = my.identity_pub_b64;
   STATE.me.signing_pub_b64 = my.signing_pub_b64;
@@ -230,9 +230,9 @@ async function pollInbox() {
         const senderAddr = body.sender_address;
         if (!senderAddr) continue;
 
-        // Sender-Adress-Konsistenz pruefen: muss matchen mit address_from(sender_identity_pub)
+        // Sender-Adress-Konsistenz prüfen: muss matchen mit address_from(sender_identity_pub)
         // (wir verifizieren das nicht hier weil wir den identity_pub des Senders nicht haben,
-        //  aber signature_pub haben wir aus body, und Signatur ueber ephemeral wurde schon
+        //  aber signature_pub haben wir aus body, und Signatur über ephemeral wurde schon
         //  verifiziert in decryptMessage)
 
         if (declined.has(senderAddr)) {
@@ -272,7 +272,7 @@ async function pollInbox() {
           ackIds.push(p.id);  // bekannt -> sofort acked + Server-Delete
         } else {
           // Unbekannter Sender, kein contact_request flag -> ignoriere (oder behandle als request)
-          // Fuer Phase 1.5: behandle es als request
+          // Für Phase 1.5: behandle es als request
           if (!STATE.requests.find(r => r.address === senderAddr)) {
             STATE.requests.push({
               address: senderAddr,
@@ -292,7 +292,7 @@ async function pollInbox() {
       }
     }
 
-    // Bekannte Nachrichten von Server loeschen (Auto-Delete)
+    // Bekannte Nachrichten von Server löschen (Auto-Delete)
     if (ackIds.length) {
       try { await API.post("/api/packets/ack", ackIds); } catch(e) {}
     }
@@ -313,7 +313,7 @@ async function acceptRequest(addr) {
     STATE.contacts.unshift({ address: addr, last_at: new Date().toISOString() });
     saveAcceptedContacts();
   }
-  // Alle pending requests fuer diese Adresse acken (auf Server loeschen) - die
+  // Alle pending requests für diese Adresse acken (auf Server löschen) - die
   // Nachrichten sind ja schon lokal gespeichert
   const reqs = STATE.requests.filter(r => r.address === addr);
   STATE.requests = STATE.requests.filter(r => r.address !== addr);
@@ -580,7 +580,7 @@ async function sendText(text) {
 
 async function sendMedia(blob, mime, msgType, caption="") {
   if (!STATE.activeChat) return;
-  toast("Verschluesseln + senden...");
+  toast("Verschlüsseln + senden...");
   const fileBytes = new Uint8Array(await blob.arrayBuffer());
   const enc = await LehnoCrypto.encryptFile(fileBytes);
   const up = await API.uploadAttachment(new Blob([enc.ciphertext], { type: "application/octet-stream" }));
@@ -709,10 +709,10 @@ function bindUI() {
     const p = e.target.password.value;
     const p2 = e.target.password2.value;
     if (p !== p2) {
-      $("#auth-msg").textContent = "Passwoerter stimmen nicht ueberein";
+      $("#auth-msg").textContent = "Passwörter stimmen nicht überein";
       return;
     }
-    $("#auth-msg").textContent = "Schluessel werden generiert...";
+    $("#auth-msg").textContent = "Schlüssel werden generiert...";
     try {
       await doRegister(p);
     } catch(err) {

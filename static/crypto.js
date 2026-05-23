@@ -34,7 +34,7 @@ function randomBytes(n) { return crypto.getRandomValues(new Uint8Array(n)); }
 // ---------- Hash ----------
 async function sha256(buf) { return await crypto.subtle.digest("SHA-256", buf); }
 
-// ---------- Salt fuer Username (deterministisch) ----------
+// ---------- Salt für Username (deterministisch) ----------
 async function saltForUsername(username) {
   const h = await sha256(utf8(SALT_PREFIX + username.toLowerCase()));
   return new Uint8Array(h).slice(0, 16);
@@ -51,8 +51,8 @@ async function deriveFromPassword(password, salt) {
   );
   const all = new Uint8Array(bits);
   return {
-    auth_key: all.slice(0, 32),  // wird ueber TLS zum Server geschickt
-    pdk:      all.slice(32, 64), // bleibt LOKAL, verschluesselt KEK
+    auth_key: all.slice(0, 32),  // wird über TLS zum Server geschickt
+    pdk:      all.slice(32, 64), // bleibt LOKAL, verschlüsselt KEK
   };
 }
 
@@ -158,7 +158,7 @@ async function hkdf(rawSecret, infoString) {
   return new Uint8Array(bits);
 }
 
-// ---------- Base58 (Bitcoin-Alphabet) - fuer Adressen ----------
+// ---------- Base58 (Bitcoin-Alphabet) - für Adressen ----------
 const B58_ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58encode(bytes) {
   let n = 0n;
@@ -182,7 +182,7 @@ async function addressFromIdentityPubB64(identityPubB64) {
   return "mesh:" + b58encode(hash);
 }
 
-// Salt fuer Account: leiten aus der eigenen Adresse ab (nicht aus Username
+// Salt für Account: leiten aus der eigenen Adresse ab (nicht aus Username
 // weil es keinen mehr gibt). Beim Register zufaellig, beim Login bekommen wir
 // das salt_b64 vom Server.
 function randomSalt() { return randomBytes(16); }
@@ -256,10 +256,10 @@ async function unlockAccount(password, loginResponse) {
   };
 }
 
-// ---------- High-Level: Nachricht verschluesseln (Sealed Sender) ----------
+// ---------- High-Level: Nachricht verschlüsseln (Sealed Sender) ----------
 // Body wird als JSON serialisiert mit { sender_address, sender_identity_pub_b64,
-// sender_signing_pub_b64, content }. Damit kann Empfaenger die Sender-Adresse
-// pruefen ohne dass der Server sie sieht.
+// sender_signing_pub_b64, content }. Damit kann Empfänger die Sender-Adresse
+// prüfen ohne dass der Server sie sieht.
 async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
   const recipientPub = await importEcdhPub(unb64(recipientIdentityPubB64));
   const ephemeral = await generateEcdhKeypair();
@@ -268,7 +268,7 @@ async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
   const shared = await ecdhDerive(ephemeral.privateKey, recipientPub);
   const msgKey = await hkdf(shared, "lehno-mesh-msg-v1");
 
-  // Sender-Identitaet IM VERSCHLUESSELTEN Body (sealed sender)
+  // Sender-Identität IM VERSCHLUESSELTEN Body (sealed sender)
   const payload = utf8(JSON.stringify({
     sender_address: myState.address,
     sender_signing_pub_b64: myState.signing_pub_b64,
@@ -277,7 +277,7 @@ async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
 
   const { ct, iv } = await aesGcmEncrypt(msgKey, payload);
 
-  // Signatur ueber ephemeral || nonce || ciphertext
+  // Signatur über ephemeral || nonce || ciphertext
   const ctBytes = new Uint8Array(ct);
   const sigData = concatBytes(ephemeralPub, iv, ctBytes);
   const sig = await ecdsaSign(myState.signingPriv, sigData);
@@ -290,8 +290,8 @@ async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
   };
 }
 
-// ---------- High-Level: Nachricht entschluesseln ----------
-// Gibt {sender_address, sender_signing_pub_b64, content} zurueck.
+// ---------- High-Level: Nachricht entschlüsseln ----------
+// Gibt {sender_address, sender_signing_pub_b64, content} zurück.
 // Verifiziert ZUSAETZLICH dass sender_address == address_from(sender_identity_pub).
 async function decryptMessage(myState, encryptedMsg) {
   const ephemeralPubBytes = unb64(encryptedMsg.ephemeral_pub_b64);
@@ -310,7 +310,7 @@ async function decryptMessage(myState, encryptedMsg) {
     throw new Error("malformed payload");
   }
 
-  // Signatur verifizieren mit der Sender-PubKey aus dem verschluesselten Body
+  // Signatur verifizieren mit der Sender-PubKey aus dem verschlüsselten Body
   const senderSign = await importEcdsaPub(unb64(body.sender_signing_pub_b64));
   const sigData = concatBytes(ephemeralPubBytes, iv, ct);
   const sigOk = await ecdsaVerify(senderSign, sig, sigData);
@@ -319,8 +319,8 @@ async function decryptMessage(myState, encryptedMsg) {
   return body;  // { sender_address, sender_signing_pub_b64, content }
 }
 
-// ---------- High-Level: Datei verschluesseln (Bild / Audio / Video) ----------
-// File-Key wird random gewaehlt und im Message-Body verschluesselt mitgeliefert.
+// ---------- High-Level: Datei verschlüsseln (Bild / Audio / Video) ----------
+// File-Key wird random gewählt und im Message-Body verschlüsselt mitgeliefert.
 async function encryptFile(fileBytes) {
   const fileKey = randomBytes(32);
   const iv = randomBytes(12);

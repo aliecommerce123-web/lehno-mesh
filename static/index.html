@@ -61,18 +61,21 @@
     <div class="addr-box">
       <div class="addr-label">Deine Adresse</div>
       <div class="addr-value" id="my-address-display"></div>
-      <button class="ghost small" id="btn-copy-addr">Adresse kopieren</button>
+      <div class="btn-row">
+        <button class="ghost small" id="btn-copy-addr">Adresse kopieren</button>
+        <button class="ghost small" id="btn-download-backup">Backup-Datei herunterladen</button>
+      </div>
     </div>
 
-    <h3>Backup-Code</h3>
-    <p>Diese 24 Wörter sind das EINZIGE was deinen Account wiederherstellt, falls du das Passwort vergisst.
-       <strong>Schreib sie OFFLINE auf Papier. Niemals als Foto, niemals in der Cloud.</strong></p>
+    <h3>24-Wort-Backup-Code</h3>
+    <p>Diese 24 Wörter sind das EINZIGE was deinen Account wiederherstellt, falls du das Passwort vergisst oder ein neues Gerät nutzt.
+       <strong>Lade die Backup-Datei jetzt herunter. Oder schreib die Wörter offline auf Papier. Beides ist gut. Niemals als Foto in der Cloud speichern.</strong></p>
     <div id="mnemonic-grid" class="mnemonic-grid"></div>
     <label class="confirm-row">
       <input type="checkbox" id="mnemonic-confirm">
-      <span>Ich habe die 24 Wörter aufgeschrieben und sicher verstaut. Mir ist klar dass es keinen anderen Recovery-Weg gibt.</span>
+      <span>Ich habe die Backup-Datei gespeichert oder die 24 Wörter aufgeschrieben. Mir ist klar dass es keinen anderen Recovery-Weg gibt.</span>
     </label>
-    <button id="mnemonic-continue" class="primary" disabled>Weiter</button>
+    <button id="mnemonic-continue" class="primary" disabled>Weiter zum Chat</button>
   </div>
 </section>
 
@@ -143,8 +146,10 @@
   </div>
 </section>
 
-<script src="/s/bip39.js"></script>
-<script src="/s/crypto.js"></script>
-<script src="/s/app.js"></script>
+<!-- Cache-Busting: ?v=YYYYMMDDHHMM bei jedem Deploy aktualisiert -->
+<script>window.__MESH_VERSION = "20260520-2200";</script>
+<script src="/s/bip39.js?v=20260520-2200"></script>
+<script src="/s/crypto.js?v=20260520-2200"></script>
+<script src="/s/app.js?v=20260520-2200"></script>
 </body>
 </html>

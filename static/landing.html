@@ -235,6 +235,25 @@
 </div>
 
 <script>
+// 1) Alle alten Service Worker entladen + alle Caches loeschen.
+//    Verhindert dass ein User auf der Clearnet-Seite eine veraltete
+//    App-Version aus dem Cache sieht.
+(async () => {
+  if ("serviceWorker" in navigator) {
+    try {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map(r => r.unregister()));
+    } catch(e) {}
+  }
+  if (typeof caches !== "undefined") {
+    try {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    } catch(e) {}
+  }
+})();
+
+// 2) Copy-Button
 document.getElementById("btn-copy").addEventListener("click", () => {
   const txt = document.getElementById("onion-addr").textContent;
   navigator.clipboard.writeText(txt).then(() => {
@@ -244,10 +263,10 @@ document.getElementById("btn-copy").addEventListener("click", () => {
     setTimeout(() => b.textContent = orig, 1500);
   });
 });
-// Auto-Heuristik: wenn der Browser bereits eine .onion-Adresse aufgerufen hat,
-// braucht der User die Anleitung nicht mehr. Detection per location.host.
+
+// 3) Wenn schon .onion: direkt zur App (Host-Routing-Backup)
 if (location.host.endsWith(".onion")) {
-  location.href = "/app";  // direkt zur App
+  location.href = "/app";
 }
 </script>
 </body>

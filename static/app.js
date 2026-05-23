@@ -182,6 +182,7 @@ async function doLogin(address, password) {
 function showMnemonic(mnemonic, address) {
   show("mnemonic");
   $("#my-address-display").textContent = address;
+  setLastBackupData(address, mnemonic);
   const grid = $("#mnemonic-grid");
   grid.innerHTML = "";
   mnemonic.split(" ").forEach((w, i) => {
@@ -206,6 +207,7 @@ function logout() {
 }
 
 async function afterLogin() {
+  rememberAddress(STATE.me.address);
   $("#me-address-short").textContent = shortAddress(STATE.me.address);
   STATE.contacts = loadAcceptedContacts();
   show("chat");
@@ -730,6 +732,10 @@ function bindUI() {
     toast("Adresse kopiert", "ok");
   });
 
+  $("#btn-download-backup").addEventListener("click", () => {
+    downloadAccountBackup();
+  });
+
   $("#btn-logout").addEventListener("click", logout);
 
   $("#me-pill").addEventListener("click", () => {
@@ -791,6 +797,77 @@ function bindUI() {
 }
 
 // =========================================================================
+// BACKUP-DATEI DOWNLOAD
+// =========================================================================
+let _lastMnemonic = null;
+let _lastAddress = null;
+
+function setLastBackupData(addr, mnemonic) {
+  _lastAddress = addr;
+  _lastMnemonic = mnemonic;
+}
+
+function downloadAccountBackup() {
+  if (!_lastAddress || !_lastMnemonic) {
+    toast("Backup-Daten nicht verfügbar", "err");
+    return;
+  }
+  const date = new Date().toISOString().slice(0, 10);
+  const content = [
+    "mesh - Account-Backup",
+    "=" .repeat(60),
+    "",
+    "Erstellt: " + date,
+    "",
+    "DEINE ADRESSE (öffentlich, kannst du teilen):",
+    _lastAddress,
+    "",
+    "DEIN 24-WORT-BACKUP-CODE (GEHEIM, niemals teilen!):",
+    "",
+    _lastMnemonic.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"),
+    "",
+    "=" .repeat(60),
+    "WICHTIG:",
+    "",
+    "- Wer den 24-Wort-Code hat, hat vollen Zugriff auf deinen Account.",
+    "- Speichere diese Datei OFFLINE (USB-Stick, Papier-Ausdruck, sicherer Tresor).",
+    "- NIEMALS in der Cloud (iCloud, Google Drive, Dropbox, Email).",
+    "- NIEMALS als Foto/Screenshot.",
+    "- Vergisst du Passwort UND Backup-Code = Account fuer immer weg.",
+    "",
+    "Wiederherstellung: mesh - Login - 'Backup-Code' - Eingabe + neues Passwort.",
+    "",
+    "Open-Source-Code: github.com/aliecommerce123-web/lehno-mesh",
+  ].join("\n");
+
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `mesh-backup-${_lastAddress.replace(/^mesh:/, "").slice(0, 10)}-${date}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 100);
+  toast("Backup heruntergeladen", "ok");
+}
+
+// =========================================================================
+// LAST-ADDRESS-MEMORY (Login-Komfort)
+// Wir speichern nach erfolgreichem Login die Adresse lokal damit der User
+// beim naechsten Login nur das Passwort eintippen muss. Das Passwort wird
+// NIEMALS gespeichert.
+// =========================================================================
+function rememberAddress(addr) {
+  try { localStorage.setItem("lehno-mesh:last-address", addr); } catch(e) {}
+}
+function getRememberedAddress() {
+  try { return localStorage.getItem("lehno-mesh:last-address") || ""; } catch(e) { return ""; }
+}
+
+// =========================================================================
 // INIT
 // =========================================================================
 window.LehnoApp = { show, STATE };
@@ -798,7 +875,25 @@ window.LehnoApp = { show, STATE };
 document.addEventListener("DOMContentLoaded", () => {
   bindUI();
   show("auth");
+
+  // Adresse vom letzten Login vorausfuellen
+  const last = getRememberedAddress();
+  if (last) {
+    const el = $("#form-login input[name=address]");
+    if (el) el.value = last;
+  }
+
+  // Service Worker NUR auf .onion registrieren. Auf Clearnet wuerde ein SW
+  // nur Probleme machen (alte Cache-Versionen, Update-Lag).
   if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.register("/sw.js").catch(()=>{});
+    if (location.host.endsWith(".onion")) {
+      navigator.serviceWorker.register("/sw.js?v=" + (window.__MESH_VERSION || "0"))
+        .catch(()=>{});
+    } else {
+      // Defensiv: falls alter SW noch registriert ist (z.B. aus frueheren Versionen) -> killen
+      navigator.serviceWorker.getRegistrations().then(regs => {
+        regs.forEach(r => r.unregister());
+      }).catch(()=>{});
+    }
   }
 });

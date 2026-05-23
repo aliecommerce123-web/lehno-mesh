@@ -85,8 +85,19 @@ def check_integrity():
 
 check_integrity()
 
-# Address-Format: base58 von sha256(identity_pub_raw)[:24] = 24 bytes = ca 33 Zeichen
-ADDR_RE = r"^[1-9A-HJ-NP-Za-km-z]{30,50}$"
+# Address-Format: base58 von sha256(identity_pub_raw)[:24] = 24 bytes = ca 33 Zeichen.
+# Optionaler "mesh:" Prefix (kosmetisch, wird von User getippt/kopiert).
+ADDR_RE = r"^(mesh:)?[1-9A-HJ-NP-Za-km-z]{30,50}$"
+
+
+def normalize_address(addr: str) -> str:
+    """Strippt 'mesh:' Prefix damit DB-Lookups einheitlich sind."""
+    return addr[5:] if addr.startswith("mesh:") else addr
+
+
+def pretty_address(addr: str) -> str:
+    """Fuegt 'mesh:' Prefix hinzu fuer User-facing Returns."""
+    return addr if addr.startswith("mesh:") else f"mesh:{addr}"
 
 ph = PasswordHasher(time_cost=3, memory_cost=64 * 1024, parallelism=2)
 
@@ -263,12 +274,12 @@ class SendPacketReq(BaseModel):
 # ---------------------------------------------------------------------------
 @app.post("/api/register")
 async def register(req: RegisterReq, con: aiosqlite.Connection = Depends(db)):
-    # Adresse wird deterministisch aus identity_pub abgeleitet, nicht vom User gewählt
+    # Adresse wird deterministisch aus identity_pub abgeleitet, nicht vom User gewählt.
+    # DB-Storage immer ohne "mesh:" Prefix; API-Returns mit Prefix.
     address = address_from_identity_pub(req.identity_pub_b64)
 
     cur = await con.execute("SELECT 1 FROM users WHERE address=?", (address,))
     if await cur.fetchone():
-        # Address collision (praktisch unmöglich) - 409
         raise HTTPException(409, "address collision")
 
     auth_hash = ph.hash(req.auth_key_b64)
@@ -284,27 +295,30 @@ async def register(req: RegisterReq, con: aiosqlite.Connection = Depends(db)):
     )
     await con.commit()
 
-    return {"address": address, "jwt": make_jwt(address)}
+    pretty = pretty_address(address)
+    return {"address": pretty, "jwt": make_jwt(pretty)}
 
 
 @app.post("/api/login/init")
 async def login_init(req: LoginInitReq, con: aiosqlite.Connection = Depends(db)):
     """Salt-Lookup. Bei nicht existenten Adressen: deterministischer Fake-Salt
     damit Enumerieren keinen Info-Leak gibt."""
-    cur = await con.execute("SELECT salt_b64 FROM users WHERE address=?", (req.address,))
+    addr = normalize_address(req.address)
+    cur = await con.execute("SELECT salt_b64 FROM users WHERE address=?", (addr,))
     row = await cur.fetchone()
     if row:
         return {"salt_b64": row["salt_b64"]}
-    fake = hashlib.sha256(f"lehno-mesh-fake-salt-v1.5:{req.address}".encode()).digest()[:16]
+    fake = hashlib.sha256(f"lehno-mesh-fake-salt-v1.5:{addr}".encode()).digest()[:16]
     return {"salt_b64": base64.b64encode(fake).decode()}
 
 
 @app.post("/api/login")
 async def login(req: LoginReq, con: aiosqlite.Connection = Depends(db)):
+    addr = normalize_address(req.address)
     cur = await con.execute(
         "SELECT address, auth_hash, salt_b64, "
         "       keys_blob_b64, keys_nonce_b64, kek_blob_b64, kek_nonce_b64 "
-        "FROM users WHERE address=?", (req.address,)
+        "FROM users WHERE address=?", (addr,)
     )
     user = await cur.fetchone()
     if not user:
@@ -314,9 +328,10 @@ async def login(req: LoginReq, con: aiosqlite.Connection = Depends(db)):
     except VerifyMismatchError:
         raise HTTPException(401, "invalid credentials")
 
+    pretty = pretty_address(user["address"])
     return {
-        "address": user["address"],
-        "jwt": make_jwt(user["address"]),
+        "address": pretty,
+        "jwt": make_jwt(pretty),
         "salt_b64": user["salt_b64"],
         "keys_blob_b64": user["keys_blob_b64"],
         "keys_nonce_b64": user["keys_nonce_b64"],
@@ -328,18 +343,20 @@ async def login(req: LoginReq, con: aiosqlite.Connection = Depends(db)):
 # ---------------------------------------------------------------------------
 # Public-Key-Lookup per Adresse (öffentlich, weil Krypto)
 # ---------------------------------------------------------------------------
-@app.get("/api/keys/{address}")
+@app.get("/api/keys/{address:path}")
 async def fetch_keys(address: str, con: aiosqlite.Connection = Depends(db),
                     me: str = Depends(current_address)):
+    # Akzeptiert Adresse mit oder ohne "mesh:" Prefix, lookup einheitlich.
+    addr = normalize_address(address)
     cur = await con.execute(
         "SELECT identity_pub_b64, signing_pub_b64 FROM users WHERE address=?",
-        (address,),
+        (addr,),
     )
     row = await cur.fetchone()
     if not row:
         raise HTTPException(404, "address not found")
     return {
-        "address": address,
+        "address": pretty_address(addr),
         "identity_pub_b64": row["identity_pub_b64"],
         "signing_pub_b64": row["signing_pub_b64"],
     }
@@ -353,7 +370,8 @@ async def send_packet(req: SendPacketReq, con: aiosqlite.Connection = Depends(db
                      me: str = Depends(current_address)):
     # Auth-Token bestaetigt nur "ich existiere", nicht "ich bin der Sender dieses Pakets".
     # Sender-Identität steckt im verschlüsselten Body.
-    cur = await con.execute("SELECT 1 FROM users WHERE address=?", (req.recipient_address,))
+    recipient = normalize_address(req.recipient_address)
+    cur = await con.execute("SELECT 1 FROM users WHERE address=?", (recipient,))
     if not await cur.fetchone():
         raise HTTPException(404, "recipient not found")
 
@@ -361,7 +379,7 @@ async def send_packet(req: SendPacketReq, con: aiosqlite.Connection = Depends(db
         "INSERT INTO packets (recipient_address, ephemeral_pub_b64, nonce_b64, "
         " ciphertext_b64, signature_b64, msg_type, is_contact_request, attachment_id, created_day) "
         "VALUES (?,?,?,?,?,?,?,?,?)",
-        (req.recipient_address, req.ephemeral_pub_b64, req.nonce_b64,
+        (recipient, req.ephemeral_pub_b64, req.nonce_b64,
          req.ciphertext_b64, req.signature_b64, req.msg_type,
          1 if req.is_contact_request else 0, req.attachment_id,
          day_bucket(int(time.time()))),
@@ -369,7 +387,7 @@ async def send_packet(req: SendPacketReq, con: aiosqlite.Connection = Depends(db
     packet_id = cur.lastrowid
     await con.commit()
 
-    await ws_hub.notify(req.recipient_address, {"type": "new_packet", "packet_id": packet_id})
+    await ws_hub.notify(recipient, {"type": "new_packet", "packet_id": packet_id})
     return {"packet_id": packet_id}
 
 
@@ -378,11 +396,12 @@ async def inbox(since_id: int = 0,
                 con: aiosqlite.Connection = Depends(db),
                 me: str = Depends(current_address)):
     """Eigene Inbox abrufen. Server prüft JWT-Adresse = recipient_address."""
+    me_norm = normalize_address(me)
     cur = await con.execute(
         "SELECT id, ephemeral_pub_b64, nonce_b64, ciphertext_b64, signature_b64, "
         "       msg_type, is_contact_request, attachment_id, created_day "
         "FROM packets WHERE recipient_address=? AND id > ? ORDER BY id ASC",
-        (me, since_id),
+        (me_norm, since_id),
     )
     rows = await cur.fetchall()
     return {
@@ -409,7 +428,7 @@ async def delete_packet(packet_id: int, con: aiosqlite.Connection = Depends(db),
     """User löscht selbst Pakete aus seiner Inbox (nach Abholung+Entschluesselung)."""
     cur = await con.execute(
         "DELETE FROM packets WHERE id=? AND recipient_address=?",
-        (packet_id, me),
+        (packet_id, normalize_address(me)),
     )
     await con.commit()
     return {"deleted": cur.rowcount}
@@ -422,9 +441,10 @@ async def ack_packets(packet_ids: list[int], con: aiosqlite.Connection = Depends
     if not packet_ids:
         return {"deleted": 0}
     placeholders = ",".join("?" * len(packet_ids))
+    me_norm = normalize_address(me)
     cur = await con.execute(
         f"DELETE FROM packets WHERE recipient_address=? AND id IN ({placeholders})",
-        (me, *packet_ids),
+        (me_norm, *packet_ids),
     )
     await con.commit()
     return {"deleted": cur.rowcount}
@@ -434,8 +454,9 @@ async def ack_packets(packet_ids: list[int], con: aiosqlite.Connection = Depends
 async def delete_account(con: aiosqlite.Connection = Depends(db),
                         me: str = Depends(current_address)):
     """Komplettes Self-Delete. Account, eigene Pakete, encrypted_keys - weg."""
-    await con.execute("DELETE FROM users WHERE address=?", (me,))
-    await con.execute("DELETE FROM packets WHERE recipient_address=?", (me,))
+    me_norm = normalize_address(me)
+    await con.execute("DELETE FROM users WHERE address=?", (me_norm,))
+    await con.execute("DELETE FROM packets WHERE recipient_address=?", (me_norm,))
     await con.commit()
     return {"deleted": True}
 

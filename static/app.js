@@ -532,6 +532,7 @@ async function loadMediaInto(el) {
     const plain = await LehnoCrypto.decryptFile(new Uint8Array(fileKey), iv, enc);
     const blob = new Blob([plain], { type: el.dataset.mime });
     el.src = URL.createObjectURL(blob);
+    attachDownloadWarning(el);
   } catch (e) {
     el.alt = "[Fehler beim Entschluesseln]";
   }
@@ -644,30 +645,25 @@ function startWebSocket() {
 }
 
 // =========================================================================
-// MEDIA RECORDING
+// MEDIA-DOWNLOAD-WARNUNG
+// Wenn der User versucht ein Bild/Video durch Rechtsklick/Long-Press zu
+// speichern, zeigen wir eine Warnung. Innerhalb des Tools ist alles ent-
+// schluesselt + sichtbar; auf dem Geraet gespeichert waere es Klartext.
 // =========================================================================
-let mediaRecorder = null;
-let recordedChunks = [];
-async function startRecording() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-    recordedChunks = [];
-    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(recordedChunks, { type: "audio/webm" });
-      if (blob.size > 100) await sendMedia(blob, "audio/webm", "voice");
-    };
-    mediaRecorder.start();
-    $("#btn-record").classList.add("recording");
-  } catch (e) {
-    toast("Mikrofon-Zugriff verweigert", "err");
-  }
-}
-function stopRecording() {
-  if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
-  $("#btn-record").classList.remove("recording");
+function attachDownloadWarning(el) {
+  const warn = (e) => {
+    e.preventDefault();
+    if (confirm(
+      "ACHTUNG: Wenn du diese Datei jetzt speicherst, liegt sie ENTSCHLUESSELT auf deinem Geraet.\n\n" +
+      "Im mesh-Browser bleibt sie verschluesselt im Speicher und ist nur dir sichtbar.\n\n" +
+      "Trotzdem speichern? (Nur tun wenn du dem Speicherort vertraust)"
+    )) {
+      // Wenn der User wirklich speichern will: erlauben (Browser-Default-Action)
+      // Hier zeigen wir nur den Hinweis, downloaden ist Browser-Sache
+    }
+  };
+  el.addEventListener("contextmenu", warn);
+  el.addEventListener("dragstart", e => e.preventDefault());
 }
 
 // =========================================================================
@@ -785,12 +781,6 @@ function bindUI() {
       catch (err) { toast("Fehler: " + err.message, "err"); }
     }
     e.target.value = "";
-  });
-
-  let recording = false;
-  $("#btn-record").addEventListener("click", async () => {
-    if (recording) { stopRecording(); recording = false; }
-    else { await startRecording(); recording = true; }
   });
 
   $("#link-recover").addEventListener("click", e => { e.preventDefault(); show("recover"); });

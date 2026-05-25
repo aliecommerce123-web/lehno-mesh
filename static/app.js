@@ -1,12 +1,17 @@
-// lehno-mesh Phase 1.5 - Anonyme Adressen + Sealed-Sender + Contact-Requests.
+// lehno-mesh Phase 1.6 - Zero-Metadata Sealed-Sender + Mnemonic-Recovery +
+// Encrypted-Spitznamen-Sync + volle Adress-Anzeige.
 
 const STATE = {
-  me: null,                       // { address, jwt, identityPriv, signingPriv, identity_pub_b64, signing_pub_b64 }
+  me: null,                       // { address, jwt, identityPriv, signingPriv, kek, identity_pub_b64, signing_pub_b64 }
   pubKeyCache: {},                // address -> { identity_pub_b64, signing_pub_b64 }
-  contacts: [],                   // [{ address, last_at }] - lokal im localStorage gespeichert (akzeptierte)
-  requests: [],                   // [{ address, packet_id, content_preview }] - pending Contact-Requests
-  activeChat: null,               // address des aktuell geoeffneten Chats
-  messagesByContact: {},          // address -> [{ id, isMe, plain, msg_type, ts, attachment_id }]
+  contacts: [],                   // [{ address, last_at }] - aus encrypted userdata blob
+  nicknames: {},                  // address -> spitzname (lokaler Klartext, sync via blob)
+  declined: [],                   // [address] - aus encrypted userdata blob
+  userdataVersion: 0,             // optimistic concurrency
+  userdataDirty: false,
+  requests: [],                   // [{ address, packet_id, content_preview }]
+  activeChat: null,
+  messagesByContact: {},          // address -> [{ id, isMe, body, msg_type, attachment_token, ts }]
   ws: null,
   lastInboxId: 0,
 };
@@ -27,24 +32,34 @@ function toast(text, kind="") {
   setTimeout(() => t.classList.remove("show"), 2400);
 }
 
-function shortAddress(addr) {
+// Anzeige-Name: Spitzname wenn gesetzt, sonst volle Adresse.
+function displayName(addr) {
   if (!addr) return "";
-  const a = addr.replace(/^mesh:/, "");
-  return "mesh:" + a.slice(0, 8) + "…" + a.slice(-4);
+  const nick = STATE.nicknames[addr];
+  return nick && nick.trim() ? nick : addr;
+}
+
+// Avatar-Initialen: aus Spitzname (1-2 Buchstaben) oder Adress-Praefix (2 Zeichen).
+function avatarLabel(addr) {
+  if (!addr) return "??";
+  const nick = STATE.nicknames[addr];
+  if (nick && nick.trim()) {
+    const parts = nick.trim().split(/\s+/);
+    if (parts.length >= 2) {
+      return (parts[0][0] + parts[1][0]).toUpperCase();
+    }
+    // Einzelnes Wort: 2 Buchstaben statt 1 fuer Konsistenz
+    return parts[0].slice(0, 2).toUpperCase();
+  }
+  return addr.replace(/^mesh:/, "").slice(0, 2).toUpperCase();
 }
 
 // =========================================================================
-// LOCAL STORAGE (akzeptierte Kontakte + ausgehender Nachrichten-Cache)
+// LOCAL STORAGE (nur ausgehender Nachrichten-Cache + last-address)
+// Kontakte/Spitznamen/declined liegen in encrypted userdata-Blob auf dem Server.
 // =========================================================================
 function storageKey(suffix) {
   return `lehno-mesh:${STATE.me?.address || "anon"}:${suffix}`;
-}
-function loadAcceptedContacts() {
-  try { return JSON.parse(localStorage.getItem(storageKey("contacts")) || "[]"); }
-  catch { return []; }
-}
-function saveAcceptedContacts() {
-  localStorage.setItem(storageKey("contacts"), JSON.stringify(STATE.contacts));
 }
 function loadOutgoing(peer) {
   try { return JSON.parse(localStorage.getItem(storageKey("out:" + peer)) || "[]"); }
@@ -55,13 +70,6 @@ function appendOutgoing(peer, msg) {
   list.push(msg);
   if (list.length > 1000) list.splice(0, list.length - 1000);
   localStorage.setItem(storageKey("out:" + peer), JSON.stringify(list));
-}
-function loadDeclined() {
-  try { return JSON.parse(localStorage.getItem(storageKey("declined")) || "[]"); }
-  catch { return []; }
-}
-function saveDeclined(list) {
-  localStorage.setItem(storageKey("declined"), JSON.stringify(list));
 }
 
 // =========================================================================
@@ -75,6 +83,18 @@ const API = {
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
       throw new Error(err.detail || r.statusText);
+    }
+    return r.json();
+  },
+  async put(path, body) {
+    const headers = { "content-type": "application/json" };
+    if (STATE.me?.jwt) headers["authorization"] = "Bearer " + STATE.me.jwt;
+    const r = await fetch(path, { method: "PUT", headers, body: JSON.stringify(body) });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      const ex = new Error(err.detail || r.statusText);
+      ex.status = r.status;
+      throw ex;
     }
     return r.json();
   },
@@ -102,16 +122,95 @@ const API = {
       body: fd,
     });
     if (!r.ok) throw new Error("upload failed");
-    return r.json();
+    return r.json();   // { token, size_bytes }
   },
-  async fetchAttachment(id) {
-    const r = await fetch("/api/attachments/" + id, {
+  async fetchAttachment(token) {
+    const r = await fetch("/api/attachments/" + encodeURIComponent(token), {
       headers: { "authorization": "Bearer " + STATE.me.jwt },
     });
     if (!r.ok) throw new Error("download failed");
     return new Uint8Array(await r.arrayBuffer());
   },
 };
+
+// =========================================================================
+// ENCRYPTED USERDATA SYNC
+// Format des klartext-Userdata-Objekts:
+//   { contacts: [{address, last_at}], nicknames: {address: name}, declined: [address] }
+// =========================================================================
+async function loadUserdata() {
+  try {
+    const resp = await API.get("/api/userdata");
+    STATE.userdataVersion = resp.version || 0;
+    if (!resp.ciphertext_b64) {
+      STATE.contacts = [];
+      STATE.nicknames = {};
+      STATE.declined = [];
+      return;
+    }
+    const data = await LehnoCrypto.decryptUserdata(STATE.me.kek, resp);
+    STATE.contacts = Array.isArray(data?.contacts) ? data.contacts : [];
+    STATE.nicknames = (data?.nicknames && typeof data.nicknames === "object") ? data.nicknames : {};
+    STATE.declined = Array.isArray(data?.declined) ? data.declined : [];
+  } catch (e) {
+    console.warn("loadUserdata failed", e);
+    STATE.contacts = [];
+    STATE.nicknames = {};
+    STATE.declined = [];
+  }
+}
+
+let _saveTimer = null;
+function scheduleUserdataSave() {
+  STATE.userdataDirty = true;
+  if (_saveTimer) clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(saveUserdata, 400);
+}
+
+async function saveUserdata() {
+  if (!STATE.me?.kek) return;
+  _saveTimer = null;
+  STATE.userdataDirty = false;
+  const data = {
+    contacts: STATE.contacts,
+    nicknames: STATE.nicknames,
+    declined: STATE.declined,
+  };
+  try {
+    const enc = await LehnoCrypto.encryptUserdata(STATE.me.kek, data);
+    const resp = await API.put("/api/userdata", {
+      ...enc,
+      expected_version: STATE.userdataVersion,
+    });
+    STATE.userdataVersion = resp.version;
+  } catch (e) {
+    if (e.status === 409) {
+      // anderes Geraet hat schneller geschrieben -> reload + merge unsere Aenderungen
+      const before = { contacts: [...STATE.contacts], nicknames: {...STATE.nicknames}, declined: [...STATE.declined] };
+      await loadUserdata();
+      // Merge: lokale Spitznamen/Kontakte/declined haben Vorrang
+      for (const c of before.contacts) {
+        if (!STATE.contacts.find(x => x.address === c.address)) STATE.contacts.unshift(c);
+      }
+      Object.assign(STATE.nicknames, before.nicknames);
+      for (const a of before.declined) {
+        if (!STATE.declined.includes(a)) STATE.declined.push(a);
+      }
+      // Retry mit neuer Version
+      try {
+        const enc = await LehnoCrypto.encryptUserdata(STATE.me.kek, {
+          contacts: STATE.contacts, nicknames: STATE.nicknames, declined: STATE.declined,
+        });
+        const resp = await API.put("/api/userdata", { ...enc, expected_version: STATE.userdataVersion });
+        STATE.userdataVersion = resp.version;
+      } catch (e2) {
+        console.warn("userdata save retry failed", e2);
+      }
+    } else {
+      console.warn("userdata save failed", e);
+    }
+  }
+}
 
 // =========================================================================
 // REGISTER / LOGIN
@@ -135,18 +234,17 @@ async function doRegister(password) {
     jwt: resp.jwt,
     identityPriv: null,
     signingPriv: null,
+    kek: setup.kek_for_backup,
     identity_pub_b64: setup.identity_pub_b64,
     signing_pub_b64: setup.signing_pub_b64,
   };
-  await unlockAfterRegister(password, setup);
+  await unlockAfterRegister(password);
 
   const mnemonic = await LehnoBip39.bytesToMnemonic(setup.kek_for_backup);
   showMnemonic(mnemonic, resp.address);
 }
 
-async function unlockAfterRegister(password, setup) {
-  // Wir haben die priv keys schon im Speicher (setup.identityPriv exportiert als jwk),
-  // aber zur Konsistenz: re-fetch + re-unlock damit wir CryptoKey-Objekte haben.
+async function unlockAfterRegister(password) {
   const init = await API.post("/api/login/init", { address: STATE.me.address });
   const salt = LehnoCrypto.unb64(init.salt_b64);
   const { auth_key } = await LehnoCrypto.deriveFromPassword(password, salt);
@@ -156,6 +254,7 @@ async function unlockAfterRegister(password, setup) {
     ...STATE.me,
     identityPriv: live.identityPriv,
     signingPriv: live.signingPriv,
+    kek: live.kek,
     jwt: live.jwt,
   };
 }
@@ -171,12 +270,21 @@ async function doLogin(address, password) {
     jwt: resp.jwt,
     identityPriv: live.identityPriv,
     signingPriv: live.signingPriv,
+    kek: live.kek,
   };
-  // pubkeys von uns selbst nachfragen damit sender_signing_pub_b64 verfügbar ist
   const my = await API.get("/api/keys/" + encodeURIComponent(resp.address));
   STATE.me.identity_pub_b64 = my.identity_pub_b64;
   STATE.me.signing_pub_b64 = my.signing_pub_b64;
   await afterLogin();
+}
+
+async function doRecover(address, mnemonic, newPassword) {
+  if (!address.startsWith("mesh:")) address = "mesh:" + address;
+  const init = await API.post("/api/recover/init", { address });
+  const finalizePayload = await LehnoCrypto.recoverWithMnemonic(address, mnemonic, newPassword, init);
+  await API.post("/api/recover/finalize", finalizePayload);
+  // Direkt einloggen mit dem neuen Passwort
+  await doLogin(address, newPassword);
 }
 
 function showMnemonic(mnemonic, address) {
@@ -199,17 +307,20 @@ function logout() {
   if (STATE.ws) { try { STATE.ws.close(); } catch(e) {} }
   STATE.me = null;
   STATE.contacts = [];
+  STATE.nicknames = {};
+  STATE.declined = [];
   STATE.requests = [];
   STATE.messagesByContact = {};
   STATE.activeChat = null;
   STATE.lastInboxId = 0;
+  STATE.userdataVersion = 0;
   show("auth");
 }
 
 async function afterLogin() {
   rememberAddress(STATE.me.address);
-  $("#me-address-short").textContent = shortAddress(STATE.me.address);
-  STATE.contacts = loadAcceptedContacts();
+  $("#me-address-full").textContent = STATE.me.address;
+  await loadUserdata();
   show("chat");
   renderSidebar();
   startWebSocket();
@@ -223,7 +334,7 @@ async function pollInbox() {
   try {
     const r = await API.get("/api/packets/inbox?since_id=" + STATE.lastInboxId);
     const ackIds = [];
-    const declined = new Set(loadDeclined());
+    const declinedSet = new Set(STATE.declined);
 
     for (const p of r.packets) {
       STATE.lastInboxId = Math.max(STATE.lastInboxId, p.id);
@@ -232,74 +343,70 @@ async function pollInbox() {
         const senderAddr = body.sender_address;
         if (!senderAddr) continue;
 
-        // Sender-Adress-Konsistenz prüfen: muss matchen mit address_from(sender_identity_pub)
-        // (wir verifizieren das nicht hier weil wir den identity_pub des Senders nicht haben,
-        //  aber signature_pub haben wir aus body, und Signatur über ephemeral wurde schon
-        //  verifiziert in decryptMessage)
-
-        if (declined.has(senderAddr)) {
+        if (declinedSet.has(senderAddr)) {
           ackIds.push(p.id);
           continue;
         }
 
         const isKnown = STATE.contacts.find(c => c.address === senderAddr);
-        const msg_type = p.msg_type;
-        let plainContent = body.content;
+        const msg_type = body.msg_type || "text";
+        const isContactReq = !!body.is_contact_request;
 
-        if (p.is_contact_request && !isKnown) {
-          // In requests aufnehmen (nicht in contacts)
-          const existing = STATE.requests.find(r => r.address === senderAddr);
-          if (!existing) {
+        // Plain-Content fuer Anzeige aufbereiten
+        let displayPlain = body.text || "";
+        let mediaMeta = null;
+        if (msg_type !== "text") {
+          mediaMeta = {
+            caption: body.caption || "",
+            mime: body.mime || "",
+            file_key_b64: body.file_key_b64,
+            file_iv_b64: body.file_iv_b64,
+          };
+          displayPlain = JSON.stringify(mediaMeta);
+        }
+
+        const msgObj = {
+          id: p.id, server_id: p.id, isMe: false,
+          plain: displayPlain, msg_type,
+          attachment_token: body.attachment_token || null,
+          ts: new Date(p.created_day * 1000).toISOString(),
+        };
+
+        if (isContactReq && !isKnown) {
+          if (!STATE.requests.find(rr => rr.address === senderAddr)) {
             STATE.requests.push({
               address: senderAddr,
               packet_id: p.id,
-              preview: msg_type === "text" ? plainContent : "[" + msg_type + "]",
+              preview: msg_type === "text" ? (body.text || "") : "[" + msg_type + "]",
               ts: p.created_day,
             });
           }
-          // Speichere die Nachricht im Conversation-Cache, damit sie sichtbar ist nach Accept
-          (STATE.messagesByContact[senderAddr] ||= []).push({
-            id: p.id, server_id: p.id, isMe: false,
-            plain: plainContent, msg_type, attachment_id: p.attachment_id,
-            ts: new Date(p.created_day * 1000).toISOString(),
-          });
+          (STATE.messagesByContact[senderAddr] ||= []).push(msgObj);
         } else if (isKnown) {
-          (STATE.messagesByContact[senderAddr] ||= []).push({
-            id: p.id, server_id: p.id, isMe: false,
-            plain: plainContent, msg_type, attachment_id: p.attachment_id,
-            ts: new Date(p.created_day * 1000).toISOString(),
-          });
-          // Update last_at
+          (STATE.messagesByContact[senderAddr] ||= []).push(msgObj);
           isKnown.last_at = new Date().toISOString();
-          ackIds.push(p.id);  // bekannt -> sofort acked + Server-Delete
+          scheduleUserdataSave();
+          ackIds.push(p.id);
         } else {
-          // Unbekannter Sender, kein contact_request flag -> ignoriere (oder behandle als request)
-          // Für Phase 1.5: behandle es als request
-          if (!STATE.requests.find(r => r.address === senderAddr)) {
+          if (!STATE.requests.find(rr => rr.address === senderAddr)) {
             STATE.requests.push({
               address: senderAddr,
               packet_id: p.id,
-              preview: msg_type === "text" ? plainContent : "[" + msg_type + "]",
+              preview: msg_type === "text" ? (body.text || "") : "[" + msg_type + "]",
               ts: p.created_day,
             });
           }
-          (STATE.messagesByContact[senderAddr] ||= []).push({
-            id: p.id, server_id: p.id, isMe: false,
-            plain: plainContent, msg_type, attachment_id: p.attachment_id,
-            ts: new Date(p.created_day * 1000).toISOString(),
-          });
+          (STATE.messagesByContact[senderAddr] ||= []).push(msgObj);
         }
       } catch (e) {
         console.warn("decrypt failed for packet", p.id, e);
       }
     }
 
-    // Bekannte Nachrichten von Server löschen (Auto-Delete)
     if (ackIds.length) {
       try { await API.post("/api/packets/ack", ackIds); } catch(e) {}
     }
 
-    saveAcceptedContacts();
     renderSidebar();
     if (STATE.activeChat) renderChat();
   } catch(e) {
@@ -313,16 +420,13 @@ async function pollInbox() {
 async function acceptRequest(addr) {
   if (!STATE.contacts.find(c => c.address === addr)) {
     STATE.contacts.unshift({ address: addr, last_at: new Date().toISOString() });
-    saveAcceptedContacts();
+    scheduleUserdataSave();
   }
-  // Alle pending requests für diese Adresse acken (auf Server löschen) - die
-  // Nachrichten sind ja schon lokal gespeichert
   const reqs = STATE.requests.filter(r => r.address === addr);
   STATE.requests = STATE.requests.filter(r => r.address !== addr);
   if (reqs.length) {
     try { await API.post("/api/packets/ack", reqs.map(r => r.packet_id)); } catch(e) {}
   }
-  // Auch alle Folge-Nachrichten der gleichen Adresse aus inbox cleanen
   const followups = (STATE.messagesByContact[addr] || []).map(m => m.server_id).filter(Boolean);
   if (followups.length) {
     try { await API.post("/api/packets/ack", followups); } catch(e) {}
@@ -333,9 +437,8 @@ async function acceptRequest(addr) {
 }
 
 async function declineRequest(addr) {
-  const declined = new Set(loadDeclined());
-  declined.add(addr);
-  saveDeclined(Array.from(declined));
+  if (!STATE.declined.includes(addr)) STATE.declined.push(addr);
+  scheduleUserdataSave();
   const reqs = STATE.requests.filter(r => r.address === addr);
   STATE.requests = STATE.requests.filter(r => r.address !== addr);
   if (reqs.length) {
@@ -351,7 +454,27 @@ async function declineRequest(addr) {
 }
 
 // =========================================================================
-// SIDEBAR RENDERING (mit Tabs)
+// SPITZNAMEN
+// =========================================================================
+function setNickname(addr, nick) {
+  const trimmed = (nick || "").trim();
+  if (trimmed) STATE.nicknames[addr] = trimmed;
+  else delete STATE.nicknames[addr];
+  scheduleUserdataSave();
+  renderSidebar();
+  if (STATE.activeChat === addr) renderChat();
+}
+
+function promptNickname(addr) {
+  const current = STATE.nicknames[addr] || "";
+  const next = prompt(`Spitzname fuer ${addr}\n\n(verschluesselt, nur du siehst ihn)`, current);
+  if (next === null) return;  // Cancel
+  setNickname(addr, next);
+  toast(next.trim() ? "Spitzname gespeichert" : "Spitzname entfernt", "ok");
+}
+
+// =========================================================================
+// SIDEBAR RENDERING
 // =========================================================================
 let currentList = "chats";
 function renderSidebar() {
@@ -374,17 +497,22 @@ function renderContacts() {
   const list = $("#contact-list");
   list.innerHTML = "";
   if (!STATE.contacts.length) {
-    list.innerHTML = '<div style="padding:24px 14px; color:var(--text-dimmer); font-size:12.5px; text-align:center">Noch keine Chats.<br>Fuege oben eine Adresse hinzu.</div>';
+    list.innerHTML = '<div class="contact-empty">Noch keine Chats.<br>Fuege oben eine Adresse hinzu.</div>';
     return;
   }
   STATE.contacts.forEach(c => {
     const div = document.createElement("div");
     div.className = "contact" + (c.address === STATE.activeChat ? " active" : "");
-    const short = c.address.replace(/^mesh:/, "").slice(0, 2).toUpperCase();
+    const nick = STATE.nicknames[c.address];
+    const hasNick = !!(nick && nick.trim());
+    const nameClass = hasNick ? "name is-nick" : "name is-address";
+    const nameContent = hasNick
+      ? `${escapeHtml(nick)}<div class="sub-addr">${escapeHtml(c.address)}</div>`
+      : escapeHtml(c.address);
     div.innerHTML = `
-      <div class="avatar">${short}</div>
+      <div class="avatar">${escapeHtml(avatarLabel(c.address))}</div>
       <div class="meta">
-        <div class="name">${shortAddress(c.address)}</div>
+        <div class="${nameClass}" title="${escapeHtml(c.address)}">${nameContent}</div>
         <div class="last">${formatRelative(c.last_at)}</div>
       </div>`;
     div.addEventListener("click", () => openChat(c.address));
@@ -396,18 +524,17 @@ function renderRequests() {
   const list = $("#request-list");
   list.innerHTML = "";
   if (!STATE.requests.length) {
-    list.innerHTML = '<div style="padding:24px 14px; color:var(--text-dimmer); font-size:12.5px; text-align:center">Keine offenen Anfragen.</div>';
+    list.innerHTML = '<div class="contact-empty">Keine offenen Anfragen.</div>';
     return;
   }
   STATE.requests.forEach(r => {
     const div = document.createElement("div");
     div.className = "contact" + (r.address === STATE.activeChat ? " active" : "");
-    const short = r.address.replace(/^mesh:/, "").slice(0, 2).toUpperCase();
     div.innerHTML = `
-      <div class="avatar" style="background:linear-gradient(135deg,#a8741a,#ffb347)">${short}</div>
+      <div class="avatar req">${escapeHtml(avatarLabel(r.address))}</div>
       <div class="meta">
-        <div class="name">${shortAddress(r.address)}</div>
-        <div class="last" style="color:var(--warn)">Anfrage: ${escapeHtml((r.preview || "").slice(0, 32))}</div>
+        <div class="name is-address" title="${escapeHtml(r.address)}">${escapeHtml(r.address)}</div>
+        <div class="last warn">Anfrage: ${escapeHtml((r.preview || "").slice(0, 32))}</div>
       </div>`;
     div.addEventListener("click", () => openChat(r.address));
     list.appendChild(div);
@@ -459,22 +586,36 @@ function renderChat() {
   }
   const isRequest = STATE.requests.find(r => r.address === peer);
   const isContact = STATE.contacts.find(c => c.address === peer);
+  const nick = STATE.nicknames[peer] || "";
 
-  const short = peer.replace(/^mesh:/, "").slice(0, 2).toUpperCase();
+  const nickRow = nick
+    ? `<div class="head-name">${escapeHtml(nick)}</div>`
+    : "";
   header.innerHTML = `
-    <button class="ghost small back" id="btn-back">&larr;</button>
-    <div class="avatar">${short}</div>
-    <div class="name" title="${escapeHtml(peer)}">${shortAddress(peer)}</div>
-    <div class="lock"><span>&#x1F512;</span> Ende-zu-Ende</div>`;
+    <button class="ghost small back" id="btn-back" aria-label="Zurueck">&larr;</button>
+    <div class="avatar">${escapeHtml(avatarLabel(peer))}</div>
+    <div class="head-id">
+      ${nickRow}
+      <div class="head-addr" title="Adresse kopieren">${escapeHtml(peer)}</div>
+    </div>
+    <button class="ghost small head-action" id="btn-set-nickname" title="Spitzname setzen">
+      ${nick ? "Umbenennen" : "Spitzname"}
+    </button>
+    <div class="lock" title="Ende-zu-Ende verschluesselt">&#x1F512;</div>`;
+
   $("#btn-back").addEventListener("click", () => {
     $("#view-chat").classList.remove("peek-chat");
     STATE.activeChat = null;
     renderSidebar();
   });
+  $("#btn-set-nickname").addEventListener("click", () => promptNickname(peer));
+  $(".head-addr", header).addEventListener("click", () => {
+    navigator.clipboard.writeText(peer);
+    toast("Adresse kopiert", "ok");
+  });
 
   banner.style.display = (isRequest && !isContact) ? "flex" : "none";
 
-  // Merge incoming (im messagesByContact gespeichert) + outgoing (localStorage)
   const incoming = STATE.messagesByContact[peer] || [];
   const outgoing = loadOutgoing(peer);
   const all = [...incoming, ...outgoing].sort((a, b) => new Date(a.ts) - new Date(b.ts));
@@ -494,7 +635,6 @@ function renderChat() {
     if (m.msg_type === "text") {
       bubble.textContent = m.plain;
     } else {
-      // Mediennachricht: m.plain ist JSON-Meta
       try {
         const meta = JSON.parse(m.plain);
         const captionEl = meta.caption ? document.createElement("div") : null;
@@ -502,7 +642,7 @@ function renderChat() {
         const mediaEl = document.createElement(
           m.msg_type === "voice" ? "audio" : (m.msg_type === "video" ? "video" : "img")
         );
-        mediaEl.dataset.attId = m.attachment_id;
+        mediaEl.dataset.token = m.attachment_token || "";
         mediaEl.dataset.fileKey = meta.file_key_b64;
         mediaEl.dataset.fileIv = meta.file_iv_b64;
         mediaEl.dataset.mime = meta.mime || (m.msg_type === "voice" ? "audio/webm" : "image/jpeg");
@@ -526,7 +666,9 @@ function renderChat() {
 
 async function loadMediaInto(el) {
   try {
-    const enc = await API.fetchAttachment(el.dataset.attId);
+    const token = el.dataset.token;
+    if (!token) throw new Error("no attachment token");
+    const enc = await API.fetchAttachment(token);
     const fileKey = LehnoCrypto.unb64(el.dataset.fileKey);
     const iv = LehnoCrypto.unb64(el.dataset.fileIv);
     const plain = await LehnoCrypto.decryptFile(new Uint8Array(fileKey), iv, enc);
@@ -550,16 +692,19 @@ function formatTime(iso) {
 async function sendText(text) {
   if (!STATE.activeChat) return;
   const recipientKeys = await fetchPubKey(STATE.activeChat);
-  const enc = await LehnoCrypto.encryptMessage(STATE.me, recipientKeys.identity_pub_b64, text);
   const isContact = STATE.contacts.find(c => c.address === STATE.activeChat);
+  const body = {
+    msg_type: "text",
+    is_contact_request: !isContact,
+    text,
+  };
+  const enc = await LehnoCrypto.encryptMessage(STATE.me, recipientKeys.identity_pub_b64, body);
   const resp = await API.post("/api/packets", {
     recipient_address: STATE.activeChat,
     ephemeral_pub_b64: enc.ephemeral_pub_b64,
     nonce_b64: enc.nonce_b64,
     ciphertext_b64: enc.ciphertext_b64,
     signature_b64: enc.signature_b64,
-    msg_type: "text",
-    is_contact_request: !isContact,
   });
   const msg = {
     id: "out-" + resp.packet_id,
@@ -570,53 +715,57 @@ async function sendText(text) {
   };
   appendOutgoing(STATE.activeChat, msg);
   if (!isContact) {
-    // Wir senden an Adresse die wir noch nicht in Kontakten haben -> wir akzeptieren sie implicit
     STATE.contacts.unshift({ address: STATE.activeChat, last_at: new Date().toISOString() });
-    saveAcceptedContacts();
+    scheduleUserdataSave();
     renderSidebar();
   } else {
     isContact.last_at = new Date().toISOString();
-    saveAcceptedContacts();
+    scheduleUserdataSave();
   }
   renderChat();
 }
 
 async function sendMedia(blob, mime, msgType, caption="") {
   if (!STATE.activeChat) return;
-  toast("Verschlüsseln + senden...");
+  toast("Verschluesseln + senden...");
   const fileBytes = new Uint8Array(await blob.arrayBuffer());
   const enc = await LehnoCrypto.encryptFile(fileBytes);
   const up = await API.uploadAttachment(new Blob([enc.ciphertext], { type: "application/octet-stream" }));
-  const meta = {
-    caption, mime,
+  const isContact = STATE.contacts.find(c => c.address === STATE.activeChat);
+  const body = {
+    msg_type: msgType,
+    is_contact_request: !isContact,
+    attachment_token: up.token,
     file_key_b64: LehnoCrypto.b64(enc.fileKey),
     file_iv_b64: LehnoCrypto.b64(enc.iv),
+    mime,
+    caption,
   };
   const recipientKeys = await fetchPubKey(STATE.activeChat);
-  const encMsg = await LehnoCrypto.encryptMessage(STATE.me, recipientKeys.identity_pub_b64, JSON.stringify(meta));
-  const isContact = STATE.contacts.find(c => c.address === STATE.activeChat);
+  const encMsg = await LehnoCrypto.encryptMessage(STATE.me, recipientKeys.identity_pub_b64, body);
   const resp = await API.post("/api/packets", {
     recipient_address: STATE.activeChat,
     ephemeral_pub_b64: encMsg.ephemeral_pub_b64,
     nonce_b64: encMsg.nonce_b64,
     ciphertext_b64: encMsg.ciphertext_b64,
     signature_b64: encMsg.signature_b64,
-    msg_type: msgType,
-    is_contact_request: !isContact,
-    attachment_id: up.attachment_id,
   });
+  const meta = { caption, mime, file_key_b64: body.file_key_b64, file_iv_b64: body.file_iv_b64 };
   appendOutgoing(STATE.activeChat, {
     id: "out-" + resp.packet_id,
     isMe: true,
     plain: JSON.stringify(meta),
     msg_type: msgType,
-    attachment_id: up.attachment_id,
+    attachment_token: up.token,
     ts: new Date().toISOString(),
   });
   if (!isContact) {
     STATE.contacts.unshift({ address: STATE.activeChat, last_at: new Date().toISOString() });
-    saveAcceptedContacts();
+    scheduleUserdataSave();
     renderSidebar();
+  } else {
+    isContact.last_at = new Date().toISOString();
+    scheduleUserdataSave();
   }
   renderChat();
   toast("Gesendet", "ok");
@@ -646,9 +795,6 @@ function startWebSocket() {
 
 // =========================================================================
 // MEDIA-DOWNLOAD-WARNUNG
-// Wenn der User versucht ein Bild/Video durch Rechtsklick/Long-Press zu
-// speichern, zeigen wir eine Warnung. Innerhalb des Tools ist alles ent-
-// schluesselt + sichtbar; auf dem Geraet gespeichert waere es Klartext.
 // =========================================================================
 function attachDownloadWarning(el) {
   const warn = (e) => {
@@ -657,10 +803,7 @@ function attachDownloadWarning(el) {
       "ACHTUNG: Wenn du diese Datei jetzt speicherst, liegt sie ENTSCHLUESSELT auf deinem Geraet.\n\n" +
       "Im mesh-Browser bleibt sie verschluesselt im Speicher und ist nur dir sichtbar.\n\n" +
       "Trotzdem speichern? (Nur tun wenn du dem Speicherort vertraust)"
-    )) {
-      // Wenn der User wirklich speichern will: erlauben (Browser-Default-Action)
-      // Hier zeigen wir nur den Hinweis, downloaden ist Browser-Sache
-    }
+    )) { /* Browser-Default-Action */ }
   };
   el.addEventListener("contextmenu", warn);
   el.addEventListener("dragstart", e => e.preventDefault());
@@ -670,7 +813,6 @@ function attachDownloadWarning(el) {
 // UI BINDINGS
 // =========================================================================
 function bindUI() {
-  // Auth-Tabs
   $$("#view-auth .tab").forEach(t => t.addEventListener("click", () => {
     $$("#view-auth .tab").forEach(x => x.classList.remove("active"));
     t.classList.add("active");
@@ -679,7 +821,6 @@ function bindUI() {
     $("#auth-msg").textContent = "";
   }));
 
-  // Sidebar-Tabs (Chats / Anfragen)
   $$(".sidebar-tabs .tab").forEach(t => t.addEventListener("click", () => {
     $$(".sidebar-tabs .tab").forEach(x => x.classList.remove("active"));
     t.classList.add("active");
@@ -707,14 +848,41 @@ function bindUI() {
     const p = e.target.password.value;
     const p2 = e.target.password2.value;
     if (p !== p2) {
-      $("#auth-msg").textContent = "Passwörter stimmen nicht überein";
+      $("#auth-msg").textContent = "Passwoerter stimmen nicht ueberein";
       return;
     }
-    $("#auth-msg").textContent = "Schlüssel werden generiert...";
+    $("#auth-msg").textContent = "Schluessel werden generiert...";
     try {
       await doRegister(p);
     } catch(err) {
       $("#auth-msg").textContent = "Registrierung fehlgeschlagen: " + err.message;
+    }
+  });
+
+  $("#form-recover").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    let addr = e.target.address.value.trim();
+    if (!addr.startsWith("mesh:")) addr = "mesh:" + addr;
+    const mnemonic = e.target.mnemonic.value.trim().toLowerCase().replace(/\s+/g, " ");
+    const newPw = e.target.password.value;
+    const newPw2 = e.target.password2.value;
+    if (newPw !== newPw2) {
+      $("#recover-msg").textContent = "Passwoerter stimmen nicht ueberein";
+      return;
+    }
+    const wordCount = mnemonic ? mnemonic.split(" ").filter(Boolean).length : 0;
+    if (wordCount !== 24) {
+      $("#recover-msg").textContent = `Genau 24 Woerter noetig (du hast ${wordCount}).`;
+      return;
+    }
+    $("#recover-msg").textContent = "Wiederherstellen...";
+    $("#recover-msg").className = "msg";
+    try {
+      await doRecover(addr, mnemonic, newPw);
+      $("#recover-msg").textContent = "";
+      toast("Account wiederhergestellt", "ok");
+    } catch(err) {
+      $("#recover-msg").textContent = "Wiederherstellung fehlgeschlagen: " + err.message;
     }
   });
 
@@ -728,9 +896,7 @@ function bindUI() {
     toast("Adresse kopiert", "ok");
   });
 
-  $("#btn-download-backup").addEventListener("click", () => {
-    downloadAccountBackup();
-  });
+  $("#btn-download-backup").addEventListener("click", downloadAccountBackup);
 
   $("#btn-logout").addEventListener("click", logout);
 
@@ -784,6 +950,7 @@ function bindUI() {
   });
 
   $("#link-recover").addEventListener("click", e => { e.preventDefault(); show("recover"); });
+  $("#btn-back-to-auth").addEventListener("click", () => show("auth"));
 }
 
 // =========================================================================
@@ -799,24 +966,24 @@ function setLastBackupData(addr, mnemonic) {
 
 function downloadAccountBackup() {
   if (!_lastAddress || !_lastMnemonic) {
-    toast("Backup-Daten nicht verfügbar", "err");
+    toast("Backup-Daten nicht verfuegbar", "err");
     return;
   }
   const date = new Date().toISOString().slice(0, 10);
   const content = [
     "mesh - Account-Backup",
-    "=" .repeat(60),
+    "=".repeat(60),
     "",
     "Erstellt: " + date,
     "",
-    "DEINE ADRESSE (öffentlich, kannst du teilen):",
+    "DEINE ADRESSE (oeffentlich, kannst du teilen):",
     _lastAddress,
     "",
     "DEIN 24-WORT-BACKUP-CODE (GEHEIM, niemals teilen!):",
     "",
     _lastMnemonic.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"),
     "",
-    "=" .repeat(60),
+    "=".repeat(60),
     "WICHTIG:",
     "",
     "- Wer den 24-Wort-Code hat, hat vollen Zugriff auf deinen Account.",
@@ -846,9 +1013,6 @@ function downloadAccountBackup() {
 
 // =========================================================================
 // LAST-ADDRESS-MEMORY (Login-Komfort)
-// Wir speichern nach erfolgreichem Login die Adresse lokal damit der User
-// beim naechsten Login nur das Passwort eintippen muss. Das Passwort wird
-// NIEMALS gespeichert.
 // =========================================================================
 function rememberAddress(addr) {
   try { localStorage.setItem("lehno-mesh:last-address", addr); } catch(e) {}
@@ -866,21 +1030,19 @@ document.addEventListener("DOMContentLoaded", () => {
   bindUI();
   show("auth");
 
-  // Adresse vom letzten Login vorausfuellen
   const last = getRememberedAddress();
   if (last) {
     const el = $("#form-login input[name=address]");
     if (el) el.value = last;
+    const elR = $("#form-recover input[name=address]");
+    if (elR) elR.value = last;
   }
 
-  // Service Worker NUR auf .onion registrieren. Auf Clearnet wuerde ein SW
-  // nur Probleme machen (alte Cache-Versionen, Update-Lag).
   if ("serviceWorker" in navigator) {
     if (location.host.endsWith(".onion")) {
       navigator.serviceWorker.register("/sw.js?v=" + (window.__MESH_VERSION || "0"))
         .catch(()=>{});
     } else {
-      // Defensiv: falls alter SW noch registriert ist (z.B. aus frueheren Versionen) -> killen
       navigator.serviceWorker.getRegistrations().then(regs => {
         regs.forEach(r => r.unregister());
       }).catch(()=>{});

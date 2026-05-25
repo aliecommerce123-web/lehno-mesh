@@ -18,7 +18,7 @@
       <div class="brand-dot"></div>
       <h1>mesh</h1>
     </div>
-    <p class="tagline">Anonyme Adressen. Ende-zu-Ende verschlüsselt. Kein Server liest mit.</p>
+    <p class="tagline">Anonyme Adressen. Ende-zu-Ende verschluesselt. Der Server kennt weder Sender noch Nachrichtentyp.</p>
 
     <div class="tabs">
       <button class="tab active" data-tab="login">Login</button>
@@ -68,14 +68,45 @@
     </div>
 
     <h3>24-Wort-Backup-Code</h3>
-    <p>Diese 24 Wörter sind das EINZIGE was deinen Account wiederherstellt, falls du das Passwort vergisst oder ein neues Gerät nutzt.
-       <strong>Lade die Backup-Datei jetzt herunter. Oder schreib die Wörter offline auf Papier. Beides ist gut. Niemals als Foto in der Cloud speichern.</strong></p>
+    <p>Diese 24 Woerter sind das EINZIGE was deinen Account wiederherstellt, falls du das Passwort vergisst oder ein neues Geraet nutzt.
+       <strong>Lade die Backup-Datei jetzt herunter. Oder schreib die Woerter offline auf Papier. Beides ist gut. Niemals als Foto in der Cloud speichern.</strong></p>
     <div id="mnemonic-grid" class="mnemonic-grid"></div>
     <label class="confirm-row">
       <input type="checkbox" id="mnemonic-confirm">
-      <span>Ich habe die Backup-Datei gespeichert oder die 24 Wörter aufgeschrieben. Mir ist klar dass es keinen anderen Recovery-Weg gibt.</span>
+      <span>Ich habe die Backup-Datei gespeichert oder die 24 Woerter aufgeschrieben. Mir ist klar dass es keinen anderen Recovery-Weg gibt.</span>
     </label>
     <button id="mnemonic-continue" class="primary" disabled>Weiter zum Chat</button>
+  </div>
+</section>
+
+<!-- ================= RECOVER VIEW ================= -->
+<section id="view-recover" class="view">
+  <div class="auth-card">
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <h1>Account wiederherstellen</h1>
+    </div>
+    <p class="tagline">Gib deine Adresse, die 24 Backup-Woerter und ein neues Passwort ein. Damit wird dein Account neu entsperrt und mit dem neuen Passwort verschluesselt.</p>
+
+    <form id="form-recover" class="auth-form active">
+      <label>Adresse
+        <input name="address" autocomplete="off" required placeholder="mesh:..." />
+      </label>
+      <label>24-Wort-Backup-Code
+        <textarea name="mnemonic" rows="4" required placeholder="wort1 wort2 wort3 ... wort24" autocomplete="off" spellcheck="false"></textarea>
+        <small>Genau 24 Woerter, durch Leerzeichen getrennt. Gross-/Kleinschreibung egal.</small>
+      </label>
+      <label>Neues Passwort
+        <input name="password" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <label>Passwort wiederholen
+        <input name="password2" type="password" autocomplete="new-password" required minlength="8">
+      </label>
+      <button type="submit" class="primary">Wiederherstellen + Einloggen</button>
+    </form>
+
+    <button class="ghost small" id="btn-back-to-auth" style="margin-top:14px">Abbrechen</button>
+    <div id="recover-msg" class="msg"></div>
   </div>
 </section>
 
@@ -85,7 +116,7 @@
     <div class="sidebar-head">
       <div class="me-pill" id="me-pill" title="Adresse anzeigen">
         <div class="me-dot"></div>
-        <span id="me-address-short"></span>
+        <span id="me-address-full"></span>
       </div>
       <button id="btn-logout" class="ghost small">Logout</button>
     </div>
@@ -115,8 +146,8 @@
     </div>
 
     <form id="form-send" class="composer">
-      <button type="button" id="btn-attach" class="ghost circ" title="Bild, Video oder Datei verschluesselt senden">+</button>
-      <input type="file" id="file-input" accept="image/*,video/*,application/pdf,.txt,.zip,.docx,.xlsx" hidden multiple>
+      <button type="button" id="btn-attach" class="ghost circ" title="Bild oder Video verschluesselt senden">+</button>
+      <input type="file" id="file-input" accept="image/*,video/*" hidden multiple>
       <input id="msg-input" placeholder="Nachricht..." autocomplete="off" />
       <button type="submit" class="primary circ" title="Senden">&rarr;</button>
     </form>
@@ -136,19 +167,10 @@
   </div>
 </div>
 
-<!-- ================= RECOVER VIEW ================= -->
-<section id="view-recover" class="view">
-  <div class="auth-card">
-    <h2>Account wiederherstellen</h2>
-    <p>Gib deine 24 Backup-Wörter ein und ein neues Passwort. (Phase 2 - kommt bald.)</p>
-    <button class="ghost" onclick="LehnoApp.show('auth')">Zurück</button>
-  </div>
-</section>
-
 <!-- Cache-Busting: ?v=YYYYMMDDHHMM bei jedem Deploy aktualisiert -->
-<script>window.__MESH_VERSION = "20260523-1700";</script>
-<script src="/s/bip39.js?v=20260523-1700"></script>
-<script src="/s/crypto.js?v=20260523-1700"></script>
-<script src="/s/app.js?v=20260523-1700"></script>
+<script>window.__MESH_VERSION = "20260525-phase1.6";</script>
+<script src="/s/bip39.js?v=20260525-phase1.6"></script>
+<script src="/s/crypto.js?v=20260525-phase1.6"></script>
+<script src="/s/app.js?v=20260525-phase1.6"></script>
 </body>
 </html>

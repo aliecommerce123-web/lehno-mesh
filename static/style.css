@@ -143,15 +143,25 @@ button.primary.circ { font-size: 20px; }
   font-size: 13px;
   color: var(--text-dim);
 }
-.auth-form input {
+.auth-form input,
+.auth-form textarea {
   background: var(--bg-3);
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 11px 12px;
   color: var(--text);
   font-size: 15px;
+  font-family: inherit;
+  resize: vertical;
 }
-.auth-form input:focus {
+.auth-form textarea {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  min-height: 90px;
+}
+.auth-form input:focus,
+.auth-form textarea:focus {
   outline: none;
   border-color: var(--accent);
 }
@@ -248,11 +258,11 @@ button.primary.circ { font-size: 20px; }
   align-items: center;
   gap: 8px;
   background: var(--bg-3);
-  border-radius: 20px;
-  padding: 6px 14px;
-  font-size: 13px;
+  border-radius: 12px;
+  padding: 8px 12px;
+  font-size: 11px;
   flex: 1;
-  overflow: hidden;
+  min-width: 0;
 }
 .me-dot {
   width: 8px;
@@ -262,7 +272,15 @@ button.primary.circ { font-size: 20px; }
   flex-shrink: 0;
   box-shadow: 0 0 8px var(--accent);
 }
-#me-username { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#me-address-full {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--text-dim);
+  word-break: break-all;
+  flex: 1;
+  min-width: 0;
+}
 
 .new-chat-row {
   padding: 12px 14px;
@@ -316,16 +334,38 @@ button.primary.circ { font-size: 20px; }
   overflow: hidden;
 }
 .contact-list .meta .name {
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 500;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  line-height: 1.35;
+  color: var(--text);
+}
+.contact-list .meta .name.is-address {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+.contact-list .meta .name.is-nick .sub-addr {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  color: var(--text-dimmer);
+  font-weight: 400;
+  margin-top: 2px;
+  word-break: break-all;
+  line-height: 1.3;
 }
 .contact-list .meta .last {
-  font-size: 11.5px;
+  font-size: 11px;
   color: var(--text-dimmer);
-  margin-top: 2px;
+  margin-top: 4px;
+}
+.contact-list .meta .last.warn { color: var(--warn); }
+.contact-list .avatar.req { background: linear-gradient(135deg,#a8741a,#ffb347); }
+.contact-empty {
+  padding: 24px 14px;
+  color: var(--text-dimmer);
+  font-size: 12.5px;
+  text-align: center;
+  line-height: 1.5;
 }
 
 .chat-main {
@@ -338,9 +378,14 @@ button.primary.circ { font-size: 20px; }
   padding: 14px 18px;
   border-bottom: 1px solid var(--line);
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 12px;
   background: var(--bg-2);
+}
+@media (max-width: 480px) {
+  .chat-header { padding: 10px 12px; gap: 8px; }
+  .chat-header .head-action { font-size: 11.5px; padding: 5px 9px; }
 }
 .chat-header .back {
   display: none;
@@ -362,13 +407,40 @@ button.primary.circ { font-size: 20px; }
   color: #001b14;
 }
 .chat-header .name { font-weight: 600; font-size: 15px; }
-.chat-header .lock {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--accent);
+.chat-header .head-id {
+  flex: 1;
+  min-width: 0;
   display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chat-header .head-name {
+  font-weight: 600;
+  font-size: 15px;
+  line-height: 1.2;
+  color: var(--text);
+}
+.chat-header .head-addr {
+  font-family: ui-monospace, "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  word-break: break-all;
+  line-height: 1.3;
+  cursor: pointer;
+}
+.chat-header .head-addr:hover { color: var(--accent); }
+.chat-header .head-action {
+  margin-left: auto;
+  white-space: nowrap;
+}
+.chat-header .lock {
+  font-size: 12px;
+  color: var(--accent);
+  display: inline-flex;
   align-items: center;
   gap: 4px;
+  margin-left: 8px;
+  flex-shrink: 0;
 }
 
 .chat-stream {
@@ -567,4 +639,3 @@ button.primary.circ { font-size: 20px; }
 /* =================== ME PILL CLICKABLE =================== */
 .me-pill { cursor: pointer; }
 .me-pill:hover { background: var(--line); }
-#me-address-short { font-family: ui-monospace, monospace; font-size: 11.5px; }

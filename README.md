@@ -35,17 +35,24 @@ keinen einzigen Private-Key.
 | Address-Ableitung | base58(sha256(identity_pub)[:24]) |
 | Backup-Code | BIP39 Englisch, 24 Wörter (256 bits + 8 bit checksum) |
 
-### Sealed-Sender-Schema
+### Sealed-Sender-Schema (Phase 1.6)
 
 Pro Nachricht:
 1. Sender generiert ephemeren ECDH-Keypair.
 2. `shared = ECDH(ephemeral_priv, recipient_identity_pub)`.
 3. `msg_key = HKDF(shared, "lehno-mesh-msg-v1")`.
-4. Payload-JSON `{sender_address, sender_signing_pub_b64, content}` wird mit `msg_key` via AES-GCM verschlüsselt.
-5. Signatur via Ed25519/ECDSA über `ephemeral_pub || nonce || ciphertext` mit `sender_signing_priv`.
-6. Server speichert: `recipient_address, ephemeral_pub, nonce, ciphertext, signature, msg_type, is_contact_request, attachment_id, created_day`. Kein Sender-Feld.
+4. Payload-JSON `{sender_address, sender_identity_pub_b64, sender_signing_pub_b64, msg_type, is_contact_request, ...content_fields}` wird auf einen Padding-Bucket (4 KB oder 64 KB) gepadded und mit `msg_key` via AES-GCM verschlüsselt.
+5. Signatur via ECDSA P-256 über `ephemeral_pub || nonce || ciphertext` mit `sender_signing_priv`.
+6. Server speichert NUR: `recipient_address, ephemeral_pub, nonce, ciphertext, signature, created_day`. KEINE msg_type/is_contact_request/attachment-Spalten mehr.
 
-Empfänger leitet `shared = ECDH(identity_priv, ephemeral_pub)`, entschlüsselt, prüft Signatur mit dem Sender-Signing-Pub aus dem entschlüsselten Body.
+Empfänger leitet `shared = ECDH(identity_priv, ephemeral_pub)`, entschlüsselt, entfernt Padding, prüft Signatur mit dem `sender_signing_pub_b64` aus dem Body, **plus Sender-Impersonation-Schutz: `address_from(sender_identity_pub_b64)` muss `sender_address` ergeben** — sonst Reject.
+
+### Padding-Buckets (PFLICHT, Server-validiert)
+
+- **Messages:** Plaintext wird auf 4 KB oder 64 KB gepadded. Server prüft die b64-Länge des Ciphertexts und lehnt nicht-konforme Pakete ab.
+- **Attachments:** Plaintext-Datei wird auf 256 KB / 1 MB / 4 MB / 16 MB gepadded (vor AES-GCM). Server prüft die hochgeladene Blob-Größe.
+
+Damit kann der Server nicht mehr aus Paket- oder Datei-Größen auf Inhaltstyp (Text/Bild/Audio/Video) schließen.
 
 ### Account-Setup
 
@@ -64,9 +71,27 @@ mnemonic          = BIP39(KEK)   // 24 Wörter Backup
 
 Beim Login fragt der Server `argon2id(auth_key)` ab und gibt bei Match `salt`, `encrypted_keys`, `encrypted_kek` zurück. Der Browser leitet PDK und KEK lokal ab, entschlüsselt die Private-Keys, hält sie im RAM.
 
-### Recovery via Mnemonic
+### Recovery via Mnemonic (Phase 1.6)
 
-(Phase 2, noch nicht implementiert.) Mit den 24 Backup-Wörtern kann der KEK rekonstruiert werden, damit der User ein neues Passwort setzen kann. Ohne Mnemonic + ohne Passwort: Account weg.
+Mit den 24 Backup-Wörtern kann der KEK rekonstruiert werden. Ablauf:
+
+1. Client ruft `POST /api/recover/init {address}` → bekommt `keys_blob`, `keys_nonce`, `identity_pub`, `challenge_hex` (5 Min TTL).
+2. Client leitet KEK aus Mnemonic ab (BIP39), entschlüsselt damit das `keys_blob` → bekommt `signingPriv`.
+3. Client signiert `"lehno-mesh-recovery-v1:" + challenge_hex` mit `signingPriv`.
+4. Client leitet aus neuem Passwort frische `auth_key` und `pdk` ab, baut `encrypted_kek` mit dem neuen `pdk` neu.
+5. Client ruft `POST /api/recover/finalize {address, challenge_hex, signature_b64, new_auth_key, new_salt, new_kek_blob, new_kek_nonce}`.
+6. Server verifiziert die Signatur mit `signing_pub_b64` aus der `users`-Tabelle, updated `auth_hash`, `salt`, `kek_blob`, `kek_nonce` und setzt `jwt_min_iat = now()` — damit sind alle vorher ausgegebenen JWTs sofort ungültig (Schutz gegen geklautes Gerät).
+
+Ohne Mnemonic + ohne Passwort: Account weg.
+
+### Spitznamen-Sync via Encrypted-Userdata (Phase 1.6)
+
+Pro Account speichert der Server EINEN verschlüsselten Blob mit `{contacts, nicknames, declined}`. Schlüssel: `HKDF(KEK, "lehno-mesh-userdata-v1")`. Endpoints:
+
+- `GET /api/userdata` → `{version, nonce_b64, ciphertext_b64}`
+- `PUT /api/userdata {nonce_b64, ciphertext_b64, expected_version}` → optimistic concurrency, 409 bei Konflikt.
+
+Damit syncen Spitznamen + Kontakte zwischen Geräten — der Server sieht weder die Adressen noch die Namen.
 
 ## Was der Server NICHT sehen kann
 
@@ -81,9 +106,11 @@ Beim Login fragt der Server `argon2id(auth_key)` ab und gibt bei Match `salt`, `
 ## Was der Server SEHEN kann (Trade-offs)
 
 - Anzahl Pakete pro Empfänger-Adresse (zu welcher Adresse gerade was rein kam)
-- Paket-Größe (mitigierbar via Padding, noch nicht aktiv)
-- Tag (nicht Uhrzeit - `created_day` ist Tag-Bucket)
+- Paket-Bucket: 4 KB oder 64 KB Plaintext (1 von 2 Stufen, nicht die exakte Inhalts-Größe)
+- Attachment-Bucket: 256 KB / 1 MB / 4 MB / 16 MB (1 von 4 Stufen)
+- Tag (nicht Uhrzeit - `created_day` ist Tag-Bucket; bei Online-Empfängern via WebSocket-Push aber Echtzeit)
 - Wer mit dem Server verbunden ist via WebSocket (nicht-Tor-User: IP. Tor-User: nur Tor-Exit)
+- Wer wessen Public-Keys via `/api/keys` abfragt → Sozialgraph (TOFU-Limit)
 
 ## Bekannte Trust-Issues
 
@@ -105,17 +132,26 @@ MIT.
 
 ## Status
 
-Phase 1.5 (Mai 2026). Voll funktional für 1:1-Chat, Bilder, Sprachnachrichten, Tor.
+Phase 1.6 (Mai 2026). Voll funktional für 1:1-Chat, Bilder, Sprachnachrichten, Tor.
+
+Neu in Phase 1.6:
+- Zero-Metadata-Sealed-Sender: msg_type / is_contact_request / attachment_token sind komplett aus dem DB-Schema raus und liegen nur noch im verschlüsselten Body
+- Padding-Buckets für Messages (4 KB / 64 KB) und Attachments (256 KB / 1 MB / 4 MB / 16 MB) — Server kann nicht mehr aus Größen auf Inhaltstyp schließen
+- Mnemonic-Recovery (24-Wort-Code) via signierter Challenge — alte JWTs werden bei Recovery sofort invalidiert
+- Sender-Impersonation-Schutz: Empfänger verifiziert dass `address_from(identity_pub) == sender_address` im entschlüsselten Body
+- Encrypted Userdata-Blob für Spitznamen + Kontaktliste mit optimistic-concurrency Server-Sync
+- Volle Adress-Anzeige (keine Truncation mehr)
+
+HINWEIS für Phase-1.5-Nutzer: das Schema von packets + attachments wurde gewipt. Eure Adresse + Passwort funktionieren weiter, aber alte unzugestellte Nachrichten sind weg. Backup unter `mesh.db.phase15.bak.*`.
 
 Phase 2 (geplant):
-- 24-Wort-Mnemonic Recovery
-- X3DH + Double-Ratchet (volle Forward-Secrecy)
+- X3DH + Double-Ratchet (volle Forward-Secrecy auch bei Identity-Key-Kompromittierung)
 - Gruppen-Chats
 - 1:1 + Gruppen Audio/Video-Calls (WebRTC + coturn + LiveKit)
 - Native iOS + Android Apps (React Native)
-- Push-Notifications
-- Multi-Device-Sync
-- Fingerprint-Verifikation per QR
+- Push-Notifications (ohne Inhalt-Leak)
+- Fingerprint-Verifikation per QR (TOFU-Lösung)
+- Conflict-resistente Userdata-Sync (CRDT statt last-writer-wins)
 
 Phase 3 (laenger):
 - Reproducible Builds

@@ -1,9 +1,17 @@
-// lehno-mesh: alle Krypto-Operationen via WebCrypto API.
-// Curves: ECDH P-256 + ECDSA P-256 (universell unterstuetzt).
+// lehno-mesh Phase 1.6 - alle Krypto-Operationen via WebCrypto API.
+// Curves: ECDH P-256 + ECDSA P-256.
 // Symmetrisch: AES-256-GCM. KDF: PBKDF2-SHA256 (600k Iter) + HKDF-SHA256.
+// NEU in 1.6: Padding-Buckets, msg_type/is_contact_request/attachment_token im
+// verschluesselten Body, encrypted userdata blob fuer Spitznamen-Sync.
 
 const PBKDF2_ITER = 600000;
 const SALT_PREFIX = "lehno-mesh-v1:";
+
+// Padding-Buckets (PFLICHT - Server validiert die Ciphertext-Laenge gegen genau diese).
+// Plaintext wird auf eine dieser Groessen gepadded BEVOR encrypt.
+// Format vor encrypt: 4 bytes big-endian length || payload bytes || zero padding.
+const PAYLOAD_BUCKETS = [4096, 65536];
+const PAYLOAD_LEN_PREFIX = 4;
 
 // ---------- Base64 helpers ----------
 function b64(buf) {
@@ -34,12 +42,6 @@ function randomBytes(n) { return crypto.getRandomValues(new Uint8Array(n)); }
 // ---------- Hash ----------
 async function sha256(buf) { return await crypto.subtle.digest("SHA-256", buf); }
 
-// ---------- Salt für Username (deterministisch) ----------
-async function saltForUsername(username) {
-  const h = await sha256(utf8(SALT_PREFIX + username.toLowerCase()));
-  return new Uint8Array(h).slice(0, 16);
-}
-
 // ---------- PBKDF2: Passwort -> 64 bytes (auth_key 32 + pdk 32) ----------
 async function deriveFromPassword(password, salt) {
   const baseKey = await crypto.subtle.importKey(
@@ -51,8 +53,8 @@ async function deriveFromPassword(password, salt) {
   );
   const all = new Uint8Array(bits);
   return {
-    auth_key: all.slice(0, 32),  // wird über TLS zum Server geschickt
-    pdk:      all.slice(32, 64), // bleibt LOKAL, verschlüsselt KEK
+    auth_key: all.slice(0, 32),
+    pdk:      all.slice(32, 64),
   };
 }
 
@@ -72,7 +74,7 @@ async function aesGcmDecrypt(rawKey, iv, ct) {
   return await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
 }
 
-// ---------- ECDH P-256 (Identity-Keypair) ----------
+// ---------- ECDH P-256 ----------
 async function generateEcdhKeypair() {
   return await crypto.subtle.generateKey(
     { name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]
@@ -80,7 +82,6 @@ async function generateEcdhKeypair() {
 }
 
 async function exportPubKey(pubKey) {
-  // raw uncompressed: 65 bytes (0x04 || X(32) || Y(32))
   const raw = await crypto.subtle.exportKey("raw", pubKey);
   return new Uint8Array(raw);
 }
@@ -92,7 +93,6 @@ async function importEcdhPub(rawBytes) {
 }
 
 async function exportEcdhPriv(privKey) {
-  // pkcs8 ist serialisierbar, JWK auch (lesbarer)
   return await crypto.subtle.exportKey("jwk", privKey);
 }
 
@@ -108,7 +108,7 @@ async function ecdhDerive(myPriv, theirPub) {
   );
 }
 
-// ---------- ECDSA P-256 (Signing-Keypair) ----------
+// ---------- ECDSA P-256 ----------
 async function generateEcdsaKeypair() {
   return await crypto.subtle.generateKey(
     { name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]
@@ -144,7 +144,7 @@ async function ecdsaVerify(pub, signature, data) {
   return await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, pub, signature, data);
 }
 
-// ---------- HKDF: shared secret -> 32-byte message key ----------
+// ---------- HKDF ----------
 async function hkdf(rawSecret, infoString) {
   const baseKey = await crypto.subtle.importKey(
     "raw", rawSecret, "HKDF", false, ["deriveBits"]
@@ -158,7 +158,7 @@ async function hkdf(rawSecret, infoString) {
   return new Uint8Array(bits);
 }
 
-// ---------- Base58 (Bitcoin-Alphabet) - für Adressen ----------
+// ---------- Base58 (Adressen) ----------
 const B58_ALPH = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 function b58encode(bytes) {
   let n = 0n;
@@ -182,16 +182,9 @@ async function addressFromIdentityPubB64(identityPubB64) {
   return "mesh:" + b58encode(hash);
 }
 
-// Salt für Account: leiten aus der eigenen Adresse ab (nicht aus Username
-// weil es keinen mehr gibt). Beim Register zufaellig, beim Login bekommen wir
-// das salt_b64 vom Server.
 function randomSalt() { return randomBytes(16); }
 
-// ---------- High-Level: Account Setup ----------
-// Generiert: Identity (ECDH), Signing (ECDSA), KEK (random 32b),
-//            encrypted_keys = AES-GCM(JSON(priv keys), KEK),
-//            encrypted_kek  = AES-GCM(KEK, PDK).
-// Returns address (deterministisch aus identity_pub) + Mnemonic-Seed (= KEK).
+// ---------- Account Setup ----------
 async function setupAccount(password) {
   const identity = await generateEcdhKeypair();
   const signing  = await generateEcdsaKeypair();
@@ -227,18 +220,19 @@ async function setupAccount(password) {
   };
 }
 
-// ---------- High-Level: Login mit Passwort ----------
+// ---------- Login mit Passwort ----------
 async function unlockAccount(password, loginResponse) {
   const salt = unb64(loginResponse.salt_b64);
-  const { auth_key, pdk } = await deriveFromPassword(password, salt);
+  const { pdk } = await deriveFromPassword(password, salt);
 
-  const kek = await aesGcmDecrypt(
+  const kekBuf = await aesGcmDecrypt(
     pdk,
     unb64(loginResponse.kek_nonce_b64),
     unb64(loginResponse.kek_blob_b64),
   );
+  const kek = new Uint8Array(kekBuf);
   const privateBundleBytes = await aesGcmDecrypt(
-    new Uint8Array(kek),
+    kek,
     unb64(loginResponse.keys_nonce_b64),
     unb64(loginResponse.keys_blob_b64),
   );
@@ -252,15 +246,43 @@ async function unlockAccount(password, loginResponse) {
     jwt: loginResponse.jwt,
     identityPriv,
     signingPriv,
-    kek: new Uint8Array(kek),
+    kek,
   };
 }
 
-// ---------- High-Level: Nachricht verschlüsseln (Sealed Sender) ----------
-// Body wird als JSON serialisiert mit { sender_address, sender_identity_pub_b64,
-// sender_signing_pub_b64, content }. Damit kann Empfänger die Sender-Adresse
-// prüfen ohne dass der Server sie sieht.
-async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
+// ---------- Padding ----------
+function padToBucket(payloadBytes) {
+  const need = payloadBytes.byteLength + PAYLOAD_LEN_PREFIX;
+  let bucket = null;
+  for (const b of PAYLOAD_BUCKETS) {
+    if (need <= b) { bucket = b; break; }
+  }
+  if (bucket === null) throw new Error("payload too large for any bucket");
+  const out = new Uint8Array(bucket);
+  // Big-endian uint32 length prefix
+  new DataView(out.buffer).setUint32(0, payloadBytes.byteLength, false);
+  out.set(payloadBytes, PAYLOAD_LEN_PREFIX);
+  return out;
+}
+
+function unpadFromBucket(plainBytes) {
+  const arr = plainBytes instanceof Uint8Array ? plainBytes : new Uint8Array(plainBytes);
+  if (arr.byteLength < PAYLOAD_LEN_PREFIX) throw new Error("padded payload too short");
+  if (!PAYLOAD_BUCKETS.includes(arr.byteLength)) {
+    throw new Error("padded payload not in allowed bucket sizes");
+  }
+  const view = new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+  const actualLen = view.getUint32(0, false);
+  if (actualLen > arr.byteLength - PAYLOAD_LEN_PREFIX) throw new Error("invalid padded length");
+  return arr.slice(PAYLOAD_LEN_PREFIX, PAYLOAD_LEN_PREFIX + actualLen);
+}
+
+// ---------- Nachricht verschluesseln (Sealed Sender + Padding) ----------
+// bodyObject ist ein freies JSON-Objekt mit ALLEM was rein soll:
+//   { msg_type, is_contact_request, text?, attachment_token?, file_key_b64?,
+//     file_iv_b64?, mime?, caption? }
+// sender_address + sender_signing_pub_b64 werden automatisch ergaenzt.
+async function encryptMessage(myState, recipientIdentityPubB64, bodyObject) {
   const recipientPub = await importEcdhPub(unb64(recipientIdentityPubB64));
   const ephemeral = await generateEcdhKeypair();
   const ephemeralPub = await exportPubKey(ephemeral.publicKey);
@@ -268,16 +290,18 @@ async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
   const shared = await ecdhDerive(ephemeral.privateKey, recipientPub);
   const msgKey = await hkdf(shared, "lehno-mesh-msg-v1");
 
-  // Sender-Identität IM VERSCHLUESSELTEN Body (sealed sender)
-  const payload = utf8(JSON.stringify({
+  const fullBody = {
     sender_address: myState.address,
+    sender_identity_pub_b64: myState.identity_pub_b64,
     sender_signing_pub_b64: myState.signing_pub_b64,
-    content: contentString,
-  }));
+    ...bodyObject,
+  };
+  const payloadJson = JSON.stringify(fullBody);
+  const payloadBytes = utf8(payloadJson);
+  const padded = padToBucket(payloadBytes);
 
-  const { ct, iv } = await aesGcmEncrypt(msgKey, payload);
+  const { ct, iv } = await aesGcmEncrypt(msgKey, padded);
 
-  // Signatur über ephemeral || nonce || ciphertext
   const ctBytes = new Uint8Array(ct);
   const sigData = concatBytes(ephemeralPub, iv, ctBytes);
   const sig = await ecdsaSign(myState.signingPriv, sigData);
@@ -290,55 +314,176 @@ async function encryptMessage(myState, recipientIdentityPubB64, contentString) {
   };
 }
 
-// ---------- High-Level: Nachricht entschlüsseln ----------
-// Gibt {sender_address, sender_signing_pub_b64, content} zurück.
-// Verifiziert ZUSAETZLICH dass sender_address == address_from(sender_identity_pub).
+// ---------- Nachricht entschluesseln + Padding entfernen ----------
 async function decryptMessage(myState, encryptedMsg) {
   const ephemeralPubBytes = unb64(encryptedMsg.ephemeral_pub_b64);
   const iv = unb64(encryptedMsg.nonce_b64);
   const ct = unb64(encryptedMsg.ciphertext_b64);
   const sig = unb64(encryptedMsg.signature_b64);
 
-  // ECDH derive (geht ohne Sender-Info, weil nur unsere privKey + ephemeralPub gebraucht)
   const ephemeralPub = await importEcdhPub(ephemeralPubBytes);
   const shared = await ecdhDerive(myState.identityPriv, ephemeralPub);
   const msgKey = await hkdf(shared, "lehno-mesh-msg-v1");
 
-  const plainBytes = await aesGcmDecrypt(msgKey, iv, ct);
-  const body = JSON.parse(fromUtf8(plainBytes));
-  if (!body.sender_address || !body.sender_signing_pub_b64) {
+  const paddedBuf = await aesGcmDecrypt(msgKey, iv, ct);
+  const payloadBytes = unpadFromBucket(new Uint8Array(paddedBuf));
+  const body = JSON.parse(fromUtf8(payloadBytes));
+  if (!body.sender_address || !body.sender_signing_pub_b64 || !body.sender_identity_pub_b64) {
     throw new Error("malformed payload");
   }
 
-  // Signatur verifizieren mit der Sender-PubKey aus dem verschlüsselten Body
+  // Signatur ueber ephemeral||nonce||ct mit sender_signing_pub aus body verifizieren.
   const senderSign = await importEcdsaPub(unb64(body.sender_signing_pub_b64));
   const sigData = concatBytes(ephemeralPubBytes, iv, ct);
   const sigOk = await ecdsaVerify(senderSign, sig, sigData);
   if (!sigOk) throw new Error("signature invalid");
 
-  return body;  // { sender_address, sender_signing_pub_b64, content }
+  // Sender-Impersonation-Schutz: address muss deterministisch aus sender_identity_pub
+  // ableitbar sein. Sonst koennte ein Angreifer ein eigenes Keypair haben + behaupten
+  // er sei die Adresse XYZ. Mit dieser Pruefung scheitert er, weil
+  // address_from(seinem_identity_pub) != XYZ.
+  const derived = await addressFromIdentityPubB64(body.sender_identity_pub_b64);
+  if (derived !== body.sender_address) {
+    throw new Error("sender address does not match identity key");
+  }
+  return body;
 }
 
-// ---------- High-Level: Datei verschlüsseln (Bild / Audio / Video) ----------
-// File-Key wird random gewählt und im Message-Body verschlüsselt mitgeliefert.
+// ---------- Datei verschluesseln (mit Padding auf Buckets) ----------
+// Attachments werden auf eine der 4 Bucket-Groessen gepadded, damit der Server
+// nicht aus der File-Groesse auf Inhaltstyp (Foto/Audio/Video) schliessen kann.
+// AES-GCM haengt 16-byte Tag an, daher plaintext-size = bucket - 16 -> ct-size = bucket.
+// Format vor encrypt: 4 bytes BE length || file bytes || zero padding bis (bucket-16).
+// Server-validierte Bucket-Groessen MUESSEN mit ATTACHMENT_BUCKETS in app.py
+// uebereinstimmen (256 KB / 1 MB / 4 MB / 16 MB).
+const ATTACHMENT_BUCKETS = [262144, 1048576, 4194304, 16777216];
+const ATTACHMENT_LEN_PREFIX = 4;
+const ATTACHMENT_GCM_TAG = 16;
+
+function pickAttachmentBucket(fileLen) {
+  const need = fileLen + ATTACHMENT_LEN_PREFIX + ATTACHMENT_GCM_TAG;
+  for (const b of ATTACHMENT_BUCKETS) {
+    if (need <= b) return b;
+  }
+  throw new Error("attachment too large (>16 MB)");
+}
+
+function padAttachment(fileBytes, bucket) {
+  const plainSize = bucket - ATTACHMENT_GCM_TAG;
+  const out = new Uint8Array(plainSize);
+  new DataView(out.buffer).setUint32(0, fileBytes.byteLength, false);
+  out.set(fileBytes, ATTACHMENT_LEN_PREFIX);
+  return out;
+}
+
+function unpadAttachment(paddedBytes) {
+  const arr = paddedBytes instanceof Uint8Array ? paddedBytes : new Uint8Array(paddedBytes);
+  // padded plaintext-size = bucket - 16
+  const validSizes = ATTACHMENT_BUCKETS.map(b => b - ATTACHMENT_GCM_TAG);
+  if (!validSizes.includes(arr.byteLength)) {
+    throw new Error("attachment plaintext not in allowed bucket size");
+  }
+  const view = new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+  const actualLen = view.getUint32(0, false);
+  if (actualLen > arr.byteLength - ATTACHMENT_LEN_PREFIX) throw new Error("invalid attachment length");
+  return arr.slice(ATTACHMENT_LEN_PREFIX, ATTACHMENT_LEN_PREFIX + actualLen);
+}
+
 async function encryptFile(fileBytes) {
+  const bucket = pickAttachmentBucket(fileBytes.byteLength);
+  const padded = padAttachment(fileBytes, bucket);
   const fileKey = randomBytes(32);
   const iv = randomBytes(12);
   const key = await importAesKey(fileKey);
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, fileBytes);
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, padded);
+  // ct.byteLength === bucket (padded.length + 16 GCM tag), Server-Bucket-Check passt.
   return { ciphertext: new Uint8Array(ct), fileKey, iv };
 }
 
 async function decryptFile(fileKey, iv, ciphertext) {
   const key = await importAesKey(fileKey);
   const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ciphertext);
-  return new Uint8Array(plain);
+  // Padding entfernen: 4-byte length-prefix lesen, dann file-bytes ausschneiden
+  return unpadAttachment(new Uint8Array(plain));
+}
+
+// ---------- Encrypted Userdata (Spitznamen + Kontakte synced) ----------
+// Eigener Key abgeleitet aus KEK via HKDF, damit gleicher Account auf
+// mehreren Geraeten dieselben Spitznamen sieht.
+async function deriveUserdataKey(kek) {
+  return await hkdf(kek, "lehno-mesh-userdata-v1");
+}
+
+async function encryptUserdata(kek, dataObject) {
+  const dataKey = await deriveUserdataKey(kek);
+  const json = JSON.stringify(dataObject);
+  const { ct, iv } = await aesGcmEncrypt(dataKey, utf8(json));
+  return { nonce_b64: b64(iv), ciphertext_b64: b64(ct) };
+}
+
+async function decryptUserdata(kek, payload) {
+  if (!payload || !payload.nonce_b64 || !payload.ciphertext_b64) return null;
+  const dataKey = await deriveUserdataKey(kek);
+  const plain = await aesGcmDecrypt(dataKey, unb64(payload.nonce_b64), unb64(payload.ciphertext_b64));
+  return JSON.parse(fromUtf8(plain));
+}
+
+// ---------- Mnemonic-Recovery ----------
+// 1) GET /api/recover/init {address} -> {keys_blob_b64, keys_nonce_b64, identity_pub_b64, challenge_hex}
+// 2) recoverWithMnemonic(...) entschluesselt keys_blob mit KEK aus Mnemonic,
+//    signiert die Challenge mit dem privaten Signing-Key, baut neuen
+//    encrypted_kek (mit pdk aus neuem Passwort) und gibt das fertige
+//    Finalize-Payload zurueck.
+// 3) POST /api/recover/finalize <- diesen Payload.
+async function recoverWithMnemonic(address, mnemonic, newPassword, recoverInitResp) {
+  const kekBytes = await LehnoBip39.mnemonicToBytes(mnemonic);
+  const kek = new Uint8Array(kekBytes);
+
+  // keys_blob mit KEK entschluesseln - failt mit AES-GCM-Auth-Error wenn Mnemonic falsch
+  let bundle;
+  try {
+    const privBytes = await aesGcmDecrypt(
+      kek,
+      unb64(recoverInitResp.keys_nonce_b64),
+      unb64(recoverInitResp.keys_blob_b64),
+    );
+    bundle = JSON.parse(fromUtf8(privBytes));
+  } catch (e) {
+    throw new Error("Backup-Code falsch oder Adresse unbekannt");
+  }
+  if (!bundle.signingPriv) throw new Error("Backup ungueltig (kein signing key)");
+
+  // Plausibilitaet: identity_pub aus dem entschluesselten Bundle muss zur
+  // gemeldeten Adresse passen.
+  const identityPubServer = recoverInitResp.identity_pub_b64;
+
+  const signingPriv = await importEcdsaPriv(bundle.signingPriv);
+  const dataToSign = utf8("lehno-mesh-recovery-v1:" + recoverInitResp.challenge_hex);
+  const sig = await ecdsaSign(signingPriv, dataToSign);
+
+  const newSalt = randomSalt();
+  const { auth_key: newAuthKey, pdk: newPdk } = await deriveFromPassword(newPassword, newSalt);
+  const { ct: newKekBlob, iv: newKekIv } = await aesGcmEncrypt(newPdk, kek);
+
+  return {
+    address,
+    challenge_hex: recoverInitResp.challenge_hex,
+    signature_b64: b64(sig),
+    new_auth_key_b64: b64(newAuthKey),
+    new_salt_b64: b64(newSalt),
+    new_kek_blob_b64: b64(newKekBlob),
+    new_kek_nonce_b64: b64(newKekIv),
+  };
 }
 
 window.LehnoCrypto = {
   b64, unb64, utf8, fromUtf8, randomBytes,
-  setupAccount, unlockAccount, encryptMessage, decryptMessage,
+  setupAccount, unlockAccount,
+  encryptMessage, decryptMessage,
   encryptFile, decryptFile,
+  encryptUserdata, decryptUserdata,
+  recoverWithMnemonic,
   addressFromIdentityPubB64,
-  deriveFromPassword,  // damit app.js login-init nutzen kann
+  deriveFromPassword,
+  PAYLOAD_BUCKETS,
 };

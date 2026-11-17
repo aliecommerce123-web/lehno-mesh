@@ -5,3 +5,5 @@ uploads/
 __pycache__/
 .venv/
 .DS_Store
+attachments.db
+attachments.db-*

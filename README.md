@@ -1,160 +1,189 @@
-# mesh
+# chatmesh
 
-Anonymes, Ende-zu-Ende verschlüsseltes Messaging.
+Anonymer, Ende-zu-Ende verschlüsselter Messenger. Offener Quelltext von A bis Z: Server, App und Verschlüsselung liegen vollständig in diesem Verzeichnis.
 
-Live unter:
-- `https://mesh.lehno.de` (Clearnet-Zugang, leitet Nicht-Tor-User auf eine Anleitung)
-- `http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion` (Tor Hidden Service - empfohlen)
+Erreichbar unter:
+- `https://mesh.lehno.de` (normaler Browser)
+- `http://35m6ezqw2ugdqnsqhpxe4ccpnzvesfj24ile3xswvt4s5n6fyy5xfqqd.onion` (Tor Hidden Service, verbirgt zusätzlich die IP-Adresse gegenüber dem Netz)
+
+Unter beiden Adressen läuft dieselbe App. Der Server liest und speichert in keinem Fall eine IP-Adresse, eine Browser- oder Gerätekennung oder eine Uhrzeit.
+
+**Öffentlicher Beweis:** `/beweis` zeigt, was der laufende Server speichert: Bestand als Summen (Momentaufnahme alle 10 Minuten, damit niemand ablesen kann, wann ein Konto online ist), das Speicherformat und den laufenden Quelltext mit Prüfsummen. Jede Nachricht hat eine Beweis-Kennung, mit der ihr Absender nachsehen kann, was der Server zu ihr gespeichert hat und dass sie nach der Zustellung gelöscht ist. Eine Liste der Kennungen gibt es nicht.
 
 ## Was es ist
 
-Ein selbstgehostetes E2EE-Messaging das so wenig wie möglich über seine User weiß.
+Ein selbstgehostetes Messaging, das so wenig wie möglich über seine Nutzer weiß.
 
-- **Keine Usernames.** Jeder Account hat eine kryptografische Adresse die deterministisch aus dem Public-Key abgeleitet wird (`mesh:Base58...`). User können ihre Adresse teilen wie eine Krypto-Wallet.
-- **Sealed-Sender.** Der Server sieht beim Speichern eines Pakets nur die Empfänger-Adresse. Wer Sender ist, steckt nur im verschlüsselten Body.
-- **Keine User-Liste.** Keine Suche, kein Verzeichnis, kein Count-Endpoint. Wer dich kontaktieren will, muss deine Adresse direkt von dir bekommen.
-- **Contact-Requests.** Erste Nachricht von neuem Sender erscheint als Anfrage. Empfänger akzeptiert oder lehnt ab.
-- **Auto-Delete.** Nachrichten werden nach Abholung sofort vom Server gelöscht. Nicht abgeholte Nachrichten verfallen nach 30 Tagen.
-- **Keine Admin-Macht.** Kein Sperr-Endpoint, kein User-Listing. Wer Server-Root hat kann natürlich technisch alles, aber die API exponiert nichts davon.
-- **Keine Server-Logs.** Caddy + uvicorn Access-Logs sind deaktiviert.
-- **Tor Hidden Service.** Wer über Tor Browser kommt, ist auch vor allen Zwischenstellen im Netz unsichtbar.
+- **Keine Benutzernamen.** Jedes Konto hat eine kryptografische Adresse, die aus dem öffentlichen Schlüssel berechnet wird (`mesh:Base58...`). Man teilt sie wie eine Wallet-Adresse.
+- **Der Server kennt den Absender nicht.** Ein Paket enthält außen nur die Empfängeradresse und Geheimtext in Einheitsgröße. Eingeliefert wird ohne Konto-Token. Wer geschrieben hat, steht nur im verschlüsselten Teil.
+- **Absender nicht fälschbar.** Der Empfänger prüft kryptografisch, dass die Nachricht wirklich vom Inhaber der Absenderadresse stammt.
+- **Keine Nutzerliste.** Keine Suche, kein Verzeichnis. Wer dich erreichen will, braucht deine Adresse direkt von dir.
+- **Anfragen.** Die erste Nachricht einer unbekannten Adresse erscheint als Anfrage, die man annimmt oder ablehnt. Solange eine Adresse kein Kontakt ist, nimmt der Verlauf von ihr höchstens 20 gekürzte Nachrichten auf und lädt Medien erst nach Klick. So kann niemand mit Massenanfragen echte Nachrichten verdrängen.
+- **Vollständiger Verlauf, nur für dich lesbar.** Der Chat-Verlauf (gesendet und empfangen, in fester Reihenfolge) liegt als ein verschlüsselter Block je Konto auf dem Server. Der Schlüssel entsteht nur im Browser. So ist der Verlauf auf jedem Gerät und nach dem Schließen des Tor-Browsers wieder da.
+- **Zustellung ohne Verlust.** Ein Paket wird erst vom Server gelöscht, wenn die Nachricht sicher im verschlüsselten Verlauf des Empfängers liegt. Nicht abgeholte Pakete verfallen nach 5 bis 6 Wochen.
+- **Regeln je Chat.** Jeder legt für SEINE Nachrichten in einem Chat fest: Löschfrist (nach X Minuten bei beiden weg, egal ob gelesen) und Einmal-Ansicht (nach dem Verlassen des Chats weg). Jeder kann außerdem jede Nachricht eines Chats bei beiden löschen. Gelöschtes verschwindet spurlos, ohne Hinweis.
+- **Alles verschlüsselt.** Text, Bilder, Videos, Sprachnachrichten und beliebige Dateien (PDF usw.), dazu Dateiname, Art und Größe.
+- **Tarnverkehr.** Die App sendet in gleichmäßigem Takt gleich große Pakete, egal ob jemand schreibt. Anfragen und Antworten haben feste Größen und feste Mindestdauer. Das macht es im Netz dazwischen sehr schwer zu erkennen, ob oder wann jemand etwas sendet. Anhänge, sehr lange Texte und das Sichern des Verlaufs sind als größere Übertragungen sichtbar (deshalb sichert die App auch in zufälligen Takten ohne Anlass).
+- **Keine Zeitangaben.** Nachrichten tragen weder Uhrzeit noch Datum, und die Anzeige zeigt nur die Reihenfolge. Einzige Ausnahme: Wer eine Löschfrist setzt, dessen Nachricht trägt den Löschzeitpunkt, verschlüsselt. Der Server merkt sich allein für das Aufräumen die Kalenderwoche wartender Pakete und Anhänge, dazu für 5 Minuten den Ablauf einer laufenden Konto-Wiederherstellung. Konten, Verläufe und Kontaktlisten tragen keine Zeitangabe.
+- **Nichts auf dem Gerät.** Nach dem Abmelden bleibt im Browser nichts gespeichert. Nur wer „Adresse merken“ anhakt, speichert seine Adresse.
+- **Keine Admin-Macht in der Schnittstelle.** Kein Sperren, kein Auflisten, kein Mitlesen.
+- **Keine Protokolle.** Zugriffs- und Verbindungsprotokolle sind abgeschaltet.
 
 ## Krypto
 
-Alle Krypto-Operationen passieren im Browser via WebCrypto API. Der Server kennt
-keinen einzigen Private-Key.
+Alle Krypto-Operationen laufen im Browser über die WebCrypto-API. Der Server kennt keinen privaten Schlüssel.
 
-| Zweck | Algorithmus |
+| Zweck | Verfahren |
 |---|---|
-| Identity-Keypair (Schlüssel-Tausch) | ECDH P-256 |
-| Signing-Keypair | ECDSA P-256 (SHA-256) |
-| Symmetrische Verschlüsselung | AES-256-GCM mit 96-bit-IV |
-| Schlüssel aus Passwort | PBKDF2-SHA256, 600.000 Iterationen |
-| Shared-Secret -> Message-Key | HKDF-SHA256 |
-| Server-side Auth-Verifikation | Argon2id (t=3, m=64MB, p=2) |
-| Address-Ableitung | base58(sha256(identity_pub)[:24]) |
-| Backup-Code | BIP39 Englisch, 24 Wörter (256 bits + 8 bit checksum) |
+| Identitätsschlüssel (Schlüsseltausch, Absender-Nachweis) | ECDH P-256 |
+| Signaturschlüssel (nur für die Wiederherstellung) | ECDSA P-256 (SHA-256) |
+| Symmetrische Verschlüsselung | AES-256-GCM, 96-Bit-IV |
+| Schlüssel aus Passwort | PBKDF2-SHA256, 1.200.000 Runden, danach HKDF in zwei unabhängige Schlüssel |
+| Gemeinsames Geheimnis zu Nachrichtenschlüssel | HKDF-SHA256, gebunden an Einmal- und Empfängerschlüssel |
+| Absender-Nachweis | HMAC-SHA256 mit Schlüssel aus ECDH der beiden Identitätsschlüssel |
+| Prüfung der Anmeldung am Server | Argon2id (t=3, m=64 MB, p=2) |
+| Adresse | base58(sha256(identity_pub)[:24]) |
+| Backup-Code | BIP39 Englisch, 24 Wörter |
 
-### Sealed-Sender-Schema (Phase 1.6)
+### Nachricht (Phase 1.8)
 
-Pro Nachricht:
-1. Sender generiert ephemeren ECDH-Keypair.
-2. `shared = ECDH(ephemeral_priv, recipient_identity_pub)`.
-3. `msg_key = HKDF(shared, "lehno-mesh-msg-v1")`.
-4. Payload-JSON `{sender_address, sender_identity_pub_b64, sender_signing_pub_b64, msg_type, is_contact_request, ...content_fields}` wird auf einen Padding-Bucket (4 KB oder 64 KB) gepadded und mit `msg_key` via AES-GCM verschlüsselt.
-5. Signatur via ECDSA P-256 über `ephemeral_pub || nonce || ciphertext` mit `sender_signing_priv`.
-6. Server speichert NUR: `recipient_address, ephemeral_pub, nonce, ciphertext, signature, created_day`. KEINE msg_type/is_contact_request/attachment-Spalten mehr.
+1. Absender erzeugt ein Einmal-Schlüsselpaar `E`.
+2. `shared = ECDH(E_priv, empfänger_identity_pub)`
+3. `msg_key = HKDF(shared, "lehno-mesh-msg-v2|" || E_pub || empfänger_identity_pub)`
+4. `auth = HMAC(HKDF(ECDH(absender_identity_priv, empfänger_identity_pub), "lehno-mesh-sender-auth-v2"), E_pub || absender_identity_pub || empfänger_identity_pub)`
+5. Inhalt als JSON `{v, msg_id, sender_address, sender_identity_pub_b64, sender_auth_b64, msg_type, ...}` (ohne Zeitangabe) wird auf 4 KB oder 64 KB aufgefüllt und mit `msg_key` verschlüsselt.
+6. Der Server speichert nur: Empfängeradresse, `E_pub`, Nonce, Geheimtext, Kalenderwoche der Annahme, zufälliges Bestätigungs-Token.
 
-Empfänger leitet `shared = ECDH(identity_priv, ephemeral_pub)`, entschlüsselt, entfernt Padding, prüft Signatur mit dem `sender_signing_pub_b64` aus dem Body, **plus Sender-Impersonation-Schutz: `address_from(sender_identity_pub_b64)` muss `sender_address` ergeben** — sonst Reject.
+Der Empfänger entschlüsselt, prüft `address_from(sender_identity_pub) == sender_address` und rechnet den Absender-Nachweis mit seinem eigenen privaten Identitätsschlüssel nach. Ein Dritter kann den Nachweis nicht berechnen. Bewusst gibt es keine Unterschrift außen am Paket: Der Server kennt alle öffentlichen Signaturschlüssel und könnte sonst durch Ausprobieren den Absender finden.
 
-### Padding-Buckets (PFLICHT, Server-validiert)
+Vor dem Verschlüsseln prüft der Absender, dass der vom Server gelieferte Schlüssel des Empfängers wirklich zu dessen Adresse gehört. Ein Server kann keinen fremden Schlüssel unterschieben.
 
-- **Messages:** Plaintext wird auf 4 KB oder 64 KB gepadded. Server prüft die b64-Länge des Ciphertexts und lehnt nicht-konforme Pakete ab.
-- **Attachments:** Plaintext-Datei wird auf 256 KB / 1 MB / 4 MB / 16 MB gepadded (vor AES-GCM). Server prüft die hochgeladene Blob-Größe.
+### Einheitsgrößen (vom Server erzwungen)
 
-Damit kann der Server nicht mehr aus Paket- oder Datei-Größen auf Inhaltstyp (Text/Bild/Audio/Video) schließen.
+- **Nachrichten:** 4 KB oder 64 KB.
+- **Anhänge:** 256 KB, 1 MB, 4 MB oder 16 MB.
+- **Kontaktablage:** 2 KB, 8 KB, 32 KB oder 128 KB.
+- **Verlaufsablage:** 64 KB, 256 KB, 1 MB oder 4 MB.
 
-### Account-Setup
+Aus Größen lässt sich weder die Art des Inhalts noch die Zahl der Kontakte oder Nachrichten ablesen.
+
+### Konto
 
 ```
-salt              = random(16 bytes)
-PDK               = PBKDF2(password, salt, 600k, 32 bytes)
-auth_key          = PBKDF2(password, salt, 600k, weitere 32 bytes)
-identity_keypair  = ECDH P-256 generate
-signing_keypair   = ECDSA P-256 generate
-KEK               = random(32 bytes)
-encrypted_keys    = AES-GCM(JSON(identity_priv, signing_priv), key=KEK)
-encrypted_kek     = AES-GCM(KEK, key=PDK)
-address           = "mesh:" + base58(sha256(identity_pub_raw)[:24])
-mnemonic          = BIP39(KEK)   // 24 Wörter Backup
+salt             = random(16 Bytes)
+master           = PBKDF2(passwort, salt, 1.200.000, 32 Bytes)
+auth_key         = HKDF(master, "lehno-mesh-auth-v2")     -> geht an den Server, dort Argon2id
+PDK              = HKDF(master, "lehno-mesh-pdk-v2")      -> bleibt im Browser
+identity_keypair = ECDH P-256
+signing_keypair  = ECDSA P-256
+KEK              = random(32 Bytes)
+encrypted_keys   = AES-GCM(JSON(identity_priv, signing_priv), KEK)
+encrypted_kek    = AES-GCM(KEK, PDK)
+address          = "mesh:" + base58(sha256(identity_pub_raw)[:24])
+mnemonic         = BIP39(KEK)   // 24 Wörter
 ```
 
-Beim Login fragt der Server `argon2id(auth_key)` ab und gibt bei Match `salt`, `encrypted_keys`, `encrypted_kek` zurück. Der Browser leitet PDK und KEK lokal ab, entschlüsselt die Private-Keys, hält sie im RAM.
+Konten aus der Zeit vor Phase 1.8 nutzen das alte Verfahren (ein PBKDF2-Lauf mit 600.000 Runden und 64 Bytes Ausgabe) weiter, bis sie einmal über die 24 Wörter wiederhergestellt werden. Der Browser berechnet die eigenen öffentlichen Schlüssel aus dem entschlüsselten Bündel selbst und prüft, dass sie zur Adresse passen.
 
-### Recovery via Mnemonic (Phase 1.6)
+### Wiederherstellung mit den 24 Wörtern
 
-Mit den 24 Backup-Wörtern kann der KEK rekonstruiert werden. Ablauf:
+1. `POST /api/recover/init {address}` liefert `keys_blob`, `keys_nonce`, `challenge_hex` (5 Minuten gültig). Für unbekannte Adressen kommt eine gleich aussehende Attrappe.
+2. Der Browser leitet den KEK aus den 24 Wörtern ab, entschlüsselt das Bündel, prüft die Adresse und signiert `"lehno-mesh-recovery-v1:" + challenge_hex`.
+3. `POST /api/recover/finalize` setzt neues Passwort-Material. Alle bisher ausgegebenen Sitzungs-Token werden sofort ungültig, offene Verbindungen getrennt.
 
-1. Client ruft `POST /api/recover/init {address}` → bekommt `keys_blob`, `keys_nonce`, `identity_pub`, `challenge_hex` (5 Min TTL).
-2. Client leitet KEK aus Mnemonic ab (BIP39), entschlüsselt damit das `keys_blob` → bekommt `signingPriv`.
-3. Client signiert `"lehno-mesh-recovery-v1:" + challenge_hex` mit `signingPriv`.
-4. Client leitet aus neuem Passwort frische `auth_key` und `pdk` ab, baut `encrypted_kek` mit dem neuen `pdk` neu.
-5. Client ruft `POST /api/recover/finalize {address, challenge_hex, signature_b64, new_auth_key, new_salt, new_kek_blob, new_kek_nonce}`.
-6. Server verifiziert die Signatur mit `signing_pub_b64` aus der `users`-Tabelle, updated `auth_hash`, `salt`, `kek_blob`, `kek_nonce` und setzt `jwt_min_iat = now()` — damit sind alle vorher ausgegebenen JWTs sofort ungültig (Schutz gegen geklautes Gerät).
+Ohne Passwort und ohne die 24 Wörter ist das Konto verloren.
 
-Ohne Mnemonic + ohne Passwort: Account weg.
+### Verschlüsselte Ablagen
 
-### Spitznamen-Sync via Encrypted-Userdata (Phase 1.6)
+Je Konto zwei Blöcke, Schlüssel jeweils per HKDF aus dem KEK:
+- `userdata`: Kontakte, Spitznamen, abgelehnte Adressen (`/api/userdata`)
+- `history`: kompletter Chat-Verlauf samt gemerkter Kennungen gelöschter Nachrichten (`/api/history`)
 
-Pro Account speichert der Server EINEN verschlüsselten Blob mit `{contacts, nicknames, declined}`. Schlüssel: `HKDF(KEK, "lehno-mesh-userdata-v1")`. Endpoints:
+Geschrieben wird nur, wenn der Client den aktuellen Stand kennt (sonst Konflikt, dann zusammenführen). Die Versionsmarke ist eine Zufallszahl, kein Zähler.
 
-- `GET /api/userdata` → `{version, nonce_b64, ciphertext_b64}`
-- `PUT /api/userdata {nonce_b64, ciphertext_b64, expected_version}` → optimistic concurrency, 409 bei Konflikt.
+## Was auf dem Server liegt
 
-Damit syncen Spitznamen + Kontakte zwischen Geräten — der Server sieht weder die Adressen noch die Namen.
+- je Konto: Adresse, öffentliche Schlüssel, Salz, Argon2id-Hash des `auth_key`, die mit KEK bzw. Passwort verschlüsselten Schlüsselblöcke (keine Zeitangabe)
+- wartende Pakete: Empfängeradresse, Einmalschlüssel, Nonce, Geheimtext, Kalenderwoche
+- Anhänge: Geheimtext-Blöcke unter zufälligem Token, ohne Besitzer, in einer Datenbank (keine einzelnen Dateien, also keine Datei-Zeitstempel), 5 bis 6 Wochen
+- die zwei verschlüsselten Ablagen je Konto
 
-## Was der Server NICHT sehen kann
+## Was der Server nicht kann
 
-- Klartext-Nachrichten (alles E2EE)
-- Passwörter (kommen nie zum Server)
-- 24-Wort-Backup-Codes (sind clientseitig)
-- Sender einer Nachricht (sealed sender)
-- Wer mit wem chattet (kein from-Feld, recipient_address steht da aber sagt nichts darüber WER schickt)
-- User-Namen (es gibt keine)
-- IP-Adressen (werden vor dem Backend gestrippt + Tor versteckt sie netzseitig)
+- Nachrichten, Bilder, Kontakte, Spitznamen oder Verlauf lesen
+- Passwörter oder Backup-Wörter sehen
+- aus gespeicherten Daten ablesen, wer wem geschrieben hat
+- einen falschen Empfängerschlüssel unterschieben oder Nachrichten fälschen
 
-## Was der Server SEHEN kann (Trade-offs)
+## Was der Server sehen kann (ehrliche Grenzen)
 
-- Anzahl Pakete pro Empfänger-Adresse (zu welcher Adresse gerade was rein kam)
-- Paket-Bucket: 4 KB oder 64 KB Plaintext (1 von 2 Stufen, nicht die exakte Inhalts-Größe)
-- Attachment-Bucket: 256 KB / 1 MB / 4 MB / 16 MB (1 von 4 Stufen)
-- Tag (nicht Uhrzeit - `created_day` ist Tag-Bucket; bei Online-Empfängern via WebSocket-Push aber Echtzeit)
-- Wer mit dem Server verbunden ist via WebSocket (nicht-Tor-User: IP. Tor-User: nur Tor-Exit)
-- Wer wessen Public-Keys via `/api/keys` abfragt → Sozialgraph (TOFU-Limit)
+- wie viele Pakete für eine Adresse warten und in welcher Kalenderwoche sie ankamen (kein Tag, keine Uhrzeit)
+- die Größenstufe von Paketen, Anhängen und Ablagen
+- wann ein Konto angemeldet ist und Pakete abholt (im laufenden Betrieb, nichts davon wird gespeichert)
+- ein absichtlich veränderter Server könnte Verbindungen zeitlich zuordnen (wer liefert gerade ein, wer wird gerade benachrichtigt). Dagegen hilft nur Deckverkehr, siehe Ausblick.
+- im normalen Browser sehen der Internetanbieter und vorgeschaltete Netzdienste, dass ein Gerät mit chatmesh verbunden ist (IP-Adresse der Verbindung). Was, an wen und dank Tarnverkehr auch ob und wann geschrieben wird, sehen sie nicht. Der chatmesh-Server selbst bekommt die IP-Adresse nicht zu sehen. Wer auch die Verbindung selbst verbergen will, nutzt die Onion-Adresse.
+- größere Anhänge fallen im Netz als größere Übertragung auf (Inhalt bleibt unlesbar).
 
-## Bekannte Trust-Issues
+## Bekannte Grenzen
 
-- **Frontend-Vertrauen:** Wer den Server kontrolliert kann theoretisch ein boeses Frontend pushen das Passwörter mitschickt. Schutz dagegen: Open-Source-Repo + reproducible builds + clientseitige Verifikation. Phase 3.
-- **Server-Hoster:** Auf der Clearnet-Strecke sehen Zwischenstellen Verbindungsmetadaten (IP-zu-Server, Zeit, Paketgrößen). Inhalt sehen sie nicht. Wirklich unsichtbar nur über Tor-Browser-Connection zur .onion-Adresse.
-- **TOFU bei erstem Kontakt:** Erste Anfrage von einer Adresse hat noch keine Out-of-Band-Verifikation. Phase 2: Fingerprint-Vergleich + QR-Scan.
+- **Vertrauen in den ausgelieferten Code:** Die App kommt als Webseite vom Server. Wer den Server kontrolliert, könnte künftig veränderten Code ausliefern, der Passwörter abgreift. Gespeicherte Daten lassen sich damit nicht nachträglich öffnen, aber neue Anmeldungen wären betroffen. Schutz: offener Quelltext, Hash-Prüfung beim Start, langfristig eine eigenständige App.
+- **Passwortstärke:** Der Server hält den mit dem Passwort verschlüsselten KEK. Ein schwaches Passwort kann von jemandem mit Zugriff auf die Datenbank durch Ausprobieren gefunden werden. Mindestlänge ist 10 Zeichen, mehrere Wörter sind besser.
+- **Keine nachträgliche Sicherheit bei Schlüsselverlust:** Wird der private Identitätsschlüssel eines Kontos bekannt, lassen sich mitgeschnittene alte Pakete an dieses Konto öffnen (kein Double Ratchet).
+- **Löschen bei beiden braucht das Gegenüber:** Lösch-Aufträge und Fristen setzt die App des Gegenübers um. Eine unveränderte App tut das immer. Wer die App absichtlich umbaut oder vorher abfotografiert, kann Inhalte behalten, das kann kein Messenger verhindern.
+- **Medien einige Wochen:** Bilder und Videos werden nach 5 bis 6 Wochen vom Server gelöscht (bei vollem Speicher früher) und sind danach im Verlauf nicht mehr abrufbar.
+- **Verfügbarkeit:** Mengen- und Platzgrenzen schützen die Maschine, ein entschlossener Angreifer kann den Dienst aber zeitweise ausbremsen. Wer eine Adresse kennt und ununterbrochen falsche Anmeldungen schickt, kann die Anmeldung für diese Adresse in der Zeit behindern.
 
-## Stack
+## Schutz des Servers
 
-- Backend: Python 3.12 + FastAPI + uvicorn + SQLite (aiosqlite)
-- Frontend: Vanilla JS, WebCrypto, BIP39, PWA-Manifest, Service Worker
-- Reverse-Proxy: Caddy mit Origin-Cert
-- Hidden Service: Tor v3 (`HiddenServiceVersion 3`)
-- Hosting: Standard-VPS in der EU
+- App und Schnittstelle nur unter genau den zwei eigenen Namen (Onion-Adresse und mesh.lehno.de)
+- feste Längen für alle Felder, unbekannte Felder werden abgelehnt
+- Mengenbegrenzung, Begrenzung gleichzeitiger großer Anfragen, Platzgrenzen für Datenbank und Anhänge, Mindestfreiraum der Platte
+- Bremse nach Fehlanmeldungen (ein Versuch alle 3 Sekunden je Adresse, keine Dauersperre)
+- Anhänge werden in Stücken ausgeliefert, nicht abgeholte Downloads binden keinen Arbeitsspeicher
+- eigene Speichertöpfe für wartende Pakete, Verläufe und Anhänge; ist der Anhang-Topf voll, weichen die ältesten Anhänge von vor heute
+- strenge Content-Security-Policy, keine Inline-Skripte, Formulare können nirgendwohin senden
+- SQLite mit sicherem Löschen
+
+## Technik
+
+- Server: Python mit FastAPI und SQLite
+- App: reines JavaScript mit der WebCrypto-Schnittstelle des Browsers, BIP39
+- Zugang über Tor (Hidden Service) und über eine vorgeschaltete Schleuse im normalen Netz (ohne Protokoll, IP- und Geräte-Angaben werden vor der App entfernt)
+
+## Selbst betreiben und prüfen
+
+Nach jeder Änderung an `app.py` oder `static/` muss `scripts/update_hashes.py` laufen. Der Server startet nur, wenn die Prüfsummen in `EXPECTED_HASHES.json` zu den Dateien passen. Für einen lokalen Test die Umgebungsvariable `LEHNO_MESH_ALLOW_LOCAL=1` setzen.
 
 ## Lizenz
 
 MIT.
 
-## Status
+## Stand
 
-Phase 1.6 (Mai 2026). Voll funktional für 1:1-Chat, Bilder, Sprachnachrichten, Tor.
+Phase 1.9 (November 2026): 1:1-Chat mit Text, Bildern, Videos, Sprachnachrichten und Dateien, im normalen Browser und über Tor.
 
-Neu in Phase 1.6:
-- Zero-Metadata-Sealed-Sender: msg_type / is_contact_request / attachment_token sind komplett aus dem DB-Schema raus und liegen nur noch im verschlüsselten Body
-- Padding-Buckets für Messages (4 KB / 64 KB) und Attachments (256 KB / 1 MB / 4 MB / 16 MB) — Server kann nicht mehr aus Größen auf Inhaltstyp schließen
-- Mnemonic-Recovery (24-Wort-Code) via signierter Challenge — alte JWTs werden bei Recovery sofort invalidiert
-- Sender-Impersonation-Schutz: Empfänger verifiziert dass `address_from(identity_pub) == sender_address` im entschlüsselten Body
-- Encrypted Userdata-Blob für Spitznamen + Kontaktliste mit optimistic-concurrency Server-Sync
-- Volle Adress-Anzeige (keine Truncation mehr)
+Neu in Phase 1.9:
+- Regeln je Chat (Löschfrist, Einmal-Ansicht), Löschen bei beiden, spurlos
+- Sprachnachrichten und beliebige Dateien
+- Tarnverkehr und aufgefüllte Postfach-Antworten
+- öffentlicher Beweis-Bereich (`/beweis`, `/api/proof/*`) mit Beweis-Kennung je Nachricht
+- neues Aussehen, neuer Name chatmesh
 
-HINWEIS für Phase-1.5-Nutzer: das Schema von packets + attachments wurde gewipt. Eure Adresse + Passwort funktionieren weiter, aber alte unzugestellte Nachrichten sind weg. Backup unter `mesh.db.phase15.bak.*`.
+Neu in Phase 1.8:
+- vollständiger, verschlüsselter Chat-Verlauf in richtiger Reihenfolge, auf jedem Gerät, ohne jede Zeitangabe
+- Live-Zustellung repariert, zusätzlich regelmäßiger Abruf
+- Absender-Nachweis (vorher konnte sich ein Dritter als fremde Adresse ausgeben)
+- keine Unterschrift mehr außen am Paket, Einliefern und Anhänge ohne Konto-Token
+- Prüfung des Empfängerschlüssels gegen die Adresse
+- Sicherheits-Header, Mengen- und Platzgrenzen
+- zufällige Paket-Kennungen und Versionsmarken, Anhänge ohne Datei-Zeitstempel
+- nichts Lesbares mehr im Browser-Speicher, Konto löschen in der Oberfläche
 
-Phase 2 (geplant):
-- X3DH + Double-Ratchet (volle Forward-Secrecy auch bei Identity-Key-Kompromittierung)
+Hinweis für bestehende Konten: Adresse und Passwort funktionieren weiter. Nachrichten, die beim Update noch auf dem Server warteten, bleiben lesbar und sind als „Absender nicht geprüft“ markiert. Offene Tabs der alten Fassung müssen neu geladen werden.
+
+Ausblick:
+- X3DH und Double Ratchet
 - Gruppen-Chats
-- 1:1 + Gruppen Audio/Video-Calls (WebRTC + coturn + LiveKit)
-- Native iOS + Android Apps (React Native)
-- Push-Notifications (ohne Inhalt-Leak)
-- Fingerprint-Verifikation per QR (TOFU-Lösung)
-- Conflict-resistente Userdata-Sync (CRDT statt last-writer-wins)
-
-Phase 3 (laenger):
-- Reproducible Builds
-- Cover-Traffic (alle x Sekunden Dummy-Pakete um Timing-Analyse zu erschweren)
-- Mix-Network-Anbindung (SimpleX-Style oder eigene Cascade)
-- Native App ohne Browser-Vertrauensproblem
+- Vergleich von Sicherheitsnummern per QR
+- Deckverkehr gegen Zeit-Zuordnung
+- eigenständige App ohne Vertrauen in ausgelieferten Web-Code

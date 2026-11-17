@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b141c" />
+  <title>chatmesh: Beweis</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2323d5ab'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
+  <style>
+    :root { --bg:#0b141c; --bg2:#131d27; --bg3:#1b2835; --line:#22303e; --text:#eaf1f8; --dim:#8a9bb0; --dimmer:#5d6f84; --accent:#23d5ab; --blue:#3aa0ff; --warn:#ffb347; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif; }
+    a { color: var(--accent); }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 22px 14px 60px; }
+    header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), var(--blue)); box-shadow: 0 0 16px rgba(35,213,171,.7); }
+    h1 { font-size: 26px; margin: 0; letter-spacing: -0.5px; }
+    h2 { font-size: 18px; margin: 0 0 6px; }
+    h3 { font-size: 15px; margin: 16px 0 4px; }
+    .lead { color: var(--dim); margin: 10px 0 18px; max-width: 760px; }
+    .card { background: var(--bg2); border: 1px solid var(--line); border-radius: 18px; padding: 16px; margin: 14px 0; }
+    .card p { color: var(--dim); margin: 6px 0 10px; font-size: 14px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
+    .stat { background: var(--bg3); border-radius: 14px; padding: 12px; }
+    .stat b { display: block; font-size: 22px; }
+    .stat span { font-size: 12px; color: var(--dim); }
+    .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 12px; border: 1px solid var(--line); }
+    table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 420px; }
+    th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+    th { color: var(--dimmer); font-weight: 600; background: var(--bg3); }
+    pre, code, .mono { font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; }
+    pre { background: #0a1118; border: 1px solid var(--line); border-radius: 12px; padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.45; color: #cfe6ff; white-space: pre; margin: 8px 0; max-height: 420px; }
+    .tails { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+    .tails span { font-family: ui-monospace, monospace; font-size: 12.5px; background: var(--bg3); border-radius: 8px; padding: 3px 8px; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input { flex: 1; min-width: 200px; background: var(--bg3); border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; color: var(--text); font: inherit; font-size: 16px; }
+    button { background: linear-gradient(135deg, var(--accent), #2bb7d6); color: #021a14; border: 0; border-radius: 12px; padding: 11px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+    .ok { color: var(--accent); } .warn { color: var(--warn); }
+    .pill { display: inline-block; font-size: 11.5px; padding: 2px 9px; border-radius: 999px; border: 1px solid rgba(35,213,171,.4); color: var(--accent); margin-left: 6px; font-weight: 500; }
+    ul { color: var(--dim); font-size: 14px; padding-left: 20px; }
+    li { margin: 6px 0; }
+    li b { color: var(--text); }
+    .small { font-size: 12.5px; color: var(--dimmer); }
+    .files a { font-family: ui-monospace, monospace; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="dot"></div>
+    <h1>chatmesh: Beweis</h1>
+    <a href="/" style="margin-left:auto">Zur App</a>
+  </header>
+  <p class="lead">Hier kann jeder nachprüfen, was dieser Server speichert und wie. Nichts auf dieser Seite ist von Hand geschrieben: Zahlen, Speicherformat und Quelltext liest der laufende Server selbst aus seiner echten Datenbank und seinen echten Dateien.</p>
+
+  <div class="card">
+    <h2>1. Was auf dem Server liegt <span class="pill" id="live-pill">Momentaufnahme</span></h2>
+    <p>Das ist der komplette Bestand, als Summen. Mehr gibt es nicht: keine Namen, keine Nummern, keine E-Mail, keine IP-Adressen, keine Gerätekennungen, keine Absender.</p>
+    <p class="small">Die Zahlen werden alle 10 Minuten neu gelesen und absichtlich nur als Summen gezeigt. Würden wir sie sekundengenau und je Konto zeigen, könnte jeder ablesen, wann jemand online ist. Genau das soll niemand können.</p>
+    <div class="grid" id="stats"></div>
+
+    <h3>Konten</h3>
+    <p>Ein Konto ist nur eine zufällige Adresse mit verschlüsselten Schlüsseln. Hier stehen die letzten 4 Zeichen jeder Adresse. Wann ein Konto angelegt wurde, speichern wir nicht: Die Zeitmarke ist bei allen Konten gleich.</p>
+    <div class="tails" id="tails"></div>
+    <p class="small" id="markers"></p>
+
+    <h3>Was in welcher Größe gespeichert ist</h3>
+    <p>Alles liegt als unlesbarer Geheimtext in wenigen festen Größen vor. So lässt sich nicht einmal an der Größe ablesen, was oder wie viel jemand schreibt.</p>
+    <div class="scroll"><table id="t-sizes"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>2. Eine eigene Nachricht nachprüfen</h2>
+    <p>Jede Nachricht hat eine Beweis-Kennung. In der App: eigene Nachricht antippen, „Beweis ansehen“. Wartet die Nachricht bei der letzten Momentaufnahme noch auf Abholung, siehst du hier genau, was der Server dazu gespeichert hat: unlesbarer Geheimtext, kein Absender. Ist sie abgeholt, ist sie vom Server gelöscht, und auch das siehst du hier. Eine Liste aller Kennungen gibt es nicht, niemand kann fremde Nachrichten durchsehen.</p>
+    <div class="row">
+      <input id="pid" placeholder="Beweis-Kennung (24 Zeichen)" autocomplete="off" spellcheck="false" />
+      <button id="btn-check">Prüfen</button>
+    </div>
+    <div id="check-out"></div>
+  </div>
+
+  <div class="card">
+    <h2>3. So speichert der Server (Speicherformat)</h2>
+    <p>Das ist der echte Bauplan der Datenbank, aus ihr selbst ausgelesen. Jede Spalte, die es gibt, steht hier. Es gibt keine Spalte für Absender, IP-Adresse oder Gerät.</p>
+    <p class="small" id="schema-facts"></p>
+    <pre id="schema">lädt …</pre>
+    <p class="small">Zeitangaben, ehrlich aufgezählt: Wartende Nachrichten und Anhänge tragen nur die Kalenderwoche (zum Aufräumen nach einigen Wochen). Eine laufende Konto-Wiederherstellung trägt für 5 Minuten ihren Ablaufzeitpunkt. Sonst gibt es keine Zeitangaben. Legt jemand in der App eine Löschfrist fest, steht der Löschzeitpunkt nur verschlüsselt in der Nachricht und im verschlüsselten Verlauf.</p>
+  </div>
+
+  <div class="card">
+    <h2>4. Der Quelltext, der gerade läuft</h2>
+    <p>Die komplette Technik ist offen, von A bis Z: Server, App und Verschlüsselung. Unten steht jede Datei mit ihrer Prüfsumme (SHA-256). Ein Klick zeigt die Datei so, wie sie gerade läuft. Dieselben Dateien liegen im öffentlichen <a id="repo" href="#" target="_blank" rel="noopener">Quelltext-Verzeichnis</a>, dort kann jeder die Prüfsummen vergleichen. Der Server startet nur, wenn seine Dateien zu den hinterlegten Prüfsummen passen.</p>
+    <div class="scroll"><table id="t-files" class="files"></table></div>
+  </div>
+
+  <div class="card">
+    <h2>5. Was mit deiner IP-Adresse passiert</h2>
+    <p>Anfragen aus dem normalen Internet laufen durch eine Schleuse, bevor sie die App erreichen. Laut der echten Einstellung dieser Schleuse (vom Server ausgelesen) werden dort diese Angaben entfernt:</p>
+    <pre id="proxy">lädt …</pre>
+    <p class="small">Die App selbst liest an keiner Stelle eine IP-Adresse oder Gerätekennung aus. Das lässt sich im Quelltext oben nachprüfen.</p>
+  </div>
+
+  <div class="card">
+    <h2>6. Wer sieht was?</h2>
+    <ul>
+      <li><b>Wir als Betreiber:</b> sehen nur das, was oben unter 1 steht. Nachrichten, Bilder, Sprachnachrichten, Dateien, Kontakte und Verläufe können wir nicht öffnen, weil die Schlüssel nie auf dem Server sind. Passwörter sehen wir nie, sie verlassen dein Gerät nicht.</li>
+      <li><b>Dein Internetanbieter:</b> sieht, dass dein Gerät mit chatmesh verbunden ist. Die Verbindung ist verschlüsselt, er sieht also nicht, was du schreibst oder an wen. Der Tarnverkehr sendet in gleichmäßigem Takt gleich große Pakete, egal ob du schreibst. Das macht es von außen sehr schwer zu erkennen, ob und wann du eine Nachricht sendest. Bilder, Videos, Dateien und sehr lange Texte fallen als größere Übertragung auf, ihr Inhalt bleibt unlesbar.</li>
+      <li><b>Netzdienste zwischen dir und uns:</b> Im normalen Internet läuft die Verbindung über einen vorgeschalteten Netzdienst. Er sieht deine IP-Adresse und die verschlüsselten Pakete, aber keine Inhalte. Wer das ausschließen will, nutzt den Tor-Browser.</li>
+      <li><b>Mit dem Tor-Browser:</b> sieht nicht einmal dein Internetanbieter, dass du chatmesh nutzt, und kein Netzdienst sieht deine IP-Adresse. <a href="/tor">Anleitung</a></li>
+      <li><b>Dein Gegenüber:</b> sieht deine Nachrichten und deine Adresse, sonst nichts über dich.</li>
+    </ul>
+    <p class="small">Ehrliche Grenzen: Die App kommt als Webseite von diesem Server. Deshalb ist der Quelltext oben offen und mit Prüfsummen versehen, damit jeder kontrollieren kann, was ausgeliefert wird. Und: Löschfristen und „bei beiden löschen“ setzt die App deines Gegenübers um. Wer vorher ein Bildschirmfoto macht, behält den Inhalt, das kann kein Messenger verhindern.</p>
+  </div>
+</div>
+<script src="/s/proof.js?v=20261117-phase1.9"></script>
+</body>
+</html>

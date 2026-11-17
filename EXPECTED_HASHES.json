@@ -1,15 +1,15 @@
 {
   "app.py": "0c09f37be62e0283e378b72f3d1c6f4165bf08060a7789ed0875e997466364d9",
-  "static/app.js": "f7a667bcd43f8faedf60f6e8f03139f44294a92e64ed26a1952ed222b28cda12",
+  "static/app.js": "a36292a8d6f9cd6994c9a688bd7126e69d20608f2cd8efc4eaf2277cd2a9b0b9",
   "static/bip39.js": "d0fe4ee23c53549f1ca6066e2c06355bbce827db6d2d7ffc105a14376e8b6c9a",
   "static/crypto.js": "7935591aaccee78a1a94bdc03af81cbe556f85bb6d01b31208d737c0918b2fad",
-  "static/index.html": "5a90c72379e530817456ab5b39346133c5bbb756d35c8faca7fe8511b3744f23",
+  "static/index.html": "f8f772e2eaf30b33d1b1a99f6af280c9f6df406d48dec18a6aae65568eecd80e",
   "static/landing.html": "d69849fa8b2a8e4a3d94bfc01630bf4b9deffe36f211abc0444c44908b104701",
   "static/landing.js": "c4f04880e45d7d68437112b39cf603611bec4a200ab76230c8b94181bfba14e7",
   "static/manifest.json": "b866f157dec1f411c0fe0b89700d35b9e01b1953f738877c377b68844eb3c7ef",
   "static/onion-qr.png": "d39501ded94ced352341d691d7613d7ebe8e25d697e542560973c8675b7a3b0b",
-  "static/proof.html": "fbc827d534ba8c8ce02c5c1319deb40326e40c963d33f19a58c9a777bdfe3361",
+  "static/proof.html": "23871b22bdd4ba556fa6b38a672e55c1b6326b7a8ff152d2bbbd2baf923e305b",
   "static/proof.js": "42affefa85bb06904e0a274d5555fdeb7c085385864dab6dec19364e2bba82bc",
-  "static/style.css": "1a72772b1a928e4d65f4a899d45b4d10985d287642f7bdf4631d215fb1ba04d0",
+  "static/style.css": "09fa614dd337839c48f525a55c3c1423beef7db6e6e62cf8720550cc51b8b81c",
   "static/sw.js": "2522fda7e0a44b94bae2793a6229942b092c9e0658d9cb28ce3dca05fbb154ac"
 }

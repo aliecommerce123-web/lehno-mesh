@@ -250,7 +250,7 @@ function applyUserdata(data) {
   }
   STATE.declined = (Array.isArray(data?.declined) ? data.declined : []).filter(a => typeof a === "string" && ADDR_RE.test(a));
   STATE.userdataCount = Number.isFinite(data?._n) ? data._n : 0;
-  STATE.cover = data?.cover === false ? false : true;
+  STATE.cover = true;       // Tarnverkehr ist immer an, es gibt keinen Schalter
 }
 
 async function loadUserdata() {
@@ -292,7 +292,7 @@ async function doSaveUserdata() {
   if (!STATE.me?.kek || !_userdataLoaded) return false;
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
-      const data = { contacts: STATE.contacts, nicknames: STATE.nicknames, declined: STATE.declined, cover: STATE.cover, _n: STATE.userdataCount + 1 };
+      const data = { contacts: STATE.contacts, nicknames: STATE.nicknames, declined: STATE.declined, _n: STATE.userdataCount + 1 };
       const enc = await LehnoCrypto.encryptUserdata(STATE.me.kek, data);
       const resp = await API.put("/api/userdata", { ...enc, expected_version: STATE.userdataVersion });
       if (sid !== STATE.sid) return false;
@@ -319,7 +319,7 @@ async function reloadUserdataMerging() {
   const before = { contacts: [...STATE.contacts], nicknames: { ...STATE.nicknames }, declined: [...STATE.declined], cover: STATE.cover };
   await loadUserdata();
   if (sid !== STATE.sid) return;
-  STATE.cover = before.cover;
+  STATE.cover = true;
   for (const a of before.declined) {
     if (!STATE.declined.includes(a)) STATE.declined.push(a);
   }
@@ -1013,12 +1013,13 @@ function logout(message) {
   _lastFailed = null;
   _sendChain = Promise.resolve();
   for (const id of ["#chat-stream", "#chat-header", "#contact-list", "#request-list",
-                    "#me-address-full", "#popup-my-address", "#my-address-display"]) {
+                    "#me-address-full", "#my-address-display"]) {
     $(id).textContent = "";
   }
   $("#msg-input").value = "";
   $("#new-chat-address").value = "";
-  $("#addr-popup").style.display = "none";
+  hideMyAddress();
+  $("#view-chat").classList.remove("sidebar-collapsed");
   $("#view-chat").classList.remove("peek-chat");
   clearSensitiveInputs();
   const remembered = getRememberedAddress();
@@ -1034,7 +1035,7 @@ function logout(message) {
 
 async function afterLogin() {
   const sid = STATE.sid;
-  $("#me-address-full").textContent = STATE.me.address;
+  hideMyAddress();
   clearSensitiveInputs();
   let loadProblem = false;
   try { await loadUserdata(); } catch (e) { console.warn("loadUserdata failed", e); loadProblem = true; }
@@ -1595,37 +1596,45 @@ function openMessageMenu(peer, m) {
   openSheet(null, items);
 }
 
-function openMainMenu() {
-  const wrap = document.createElement("div");
-  wrap.className = "sheet-info";
-  const row = document.createElement("label");
-  row.className = "switch-row";
-  const cb = document.createElement("input");
-  cb.type = "checkbox";
-  cb.checked = STATE.cover;
-  cb.id = "cover-toggle";
-  const txt = document.createElement("span");
-  txt.textContent = "Tarnverkehr: gleichmäßiger Strom gleich großer Pakete. Macht es im Netz dazwischen sehr schwer zu erkennen, ob und wann du schreibst. Braucht mehr Datenvolumen (grob 20 bis 30 MB pro Stunde bei geöffneter App), Nachrichten gehen im nächsten Takt raus (wenige Sekunden).";
-  row.appendChild(cb);
-  row.appendChild(txt);
-  wrap.appendChild(row);
-  cb.addEventListener("change", () => {
-    STATE.cover = cb.checked;
-    scheduleUserdataSave();
-    if (STATE.cover) {
-      const ws = STATE.ws; STATE.ws = null;
-      if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
-    } else {
-      startWebSocket();
-    }
-    toast(STATE.cover ? "Tarnverkehr an" : "Tarnverkehr aus", "ok");
-  });
-  openSheet(APP_NAME, [
-    { label: "Meine Adresse anzeigen", onClick: () => { $("#popup-my-address").textContent = STATE.me.address; $("#addr-popup").style.display = "flex"; } },
-    { node: wrap },
-    { label: "Beweis: was der Server speichert", sub: "Öffentliche Seite mit Live-Verzeichnis, Speicherformat und Quelltext.", onClick: () => window.open("/beweis", "_blank", "noopener") },
-    { label: "Abmelden", onClick: () => $("#btn-logout").click() },
-  ]);
+// Linke Leiste ein- und ausklappen (Knopf oben links). Am Rechner bleibt dann
+// nur der Chat. Am Handy sind Liste und Chat ohnehin getrennte Ansichten: dort
+// wechselt der Knopf in den offenen Chat.
+function toggleSidebar() {
+  const view = $("#view-chat");
+  if (window.matchMedia("(max-width: 720px)").matches) {
+    if (STATE.activeChat) view.classList.add("peek-chat");
+    else toast("Wähle erst einen Chat aus.");
+    return;
+  }
+  view.classList.toggle("sidebar-collapsed");
+}
+
+// Eigene Adresse: steht nicht dauerhaft da, sondern wird auf Wunsch für
+// 10 Sekunden eingeblendet (mit Kopieren und Ausblenden).
+const ADDR_SHOW_MS = 10000;
+let _addrTimer = null;
+
+function hideMyAddress() {
+  if (_addrTimer) { clearTimeout(_addrTimer); _addrTimer = null; }
+  const bar = $("#addr-reveal");
+  bar.hidden = true;
+  $("#me-address-full").textContent = "";
+  bar.classList.remove("counting");
+  $("#me-address-label").textContent = "Adresse anzeigen";
+}
+
+function showMyAddress() {
+  if (!STATE.me) return;
+  const bar = $("#addr-reveal");
+  $("#me-address-full").textContent = STATE.me.address;
+  bar.hidden = false;
+  $("#me-address-label").textContent = "Adresse ausblenden";
+  // Fortschrittsbalken neu starten
+  bar.classList.remove("counting");
+  void bar.offsetWidth;
+  bar.classList.add("counting");
+  if (_addrTimer) clearTimeout(_addrTimer);
+  _addrTimer = setTimeout(hideMyAddress, ADDR_SHOW_MS);
 }
 
 // =========================================================================
@@ -2376,13 +2385,13 @@ function bindUI() {
   });
 
   $("#me-pill").addEventListener("click", () => {
-    $("#popup-my-address").textContent = STATE.me.address;
-    $("#addr-popup").style.display = "flex";
+    if ($("#addr-reveal").hidden) showMyAddress(); else hideMyAddress();
   });
-  $("#btn-popup-close").addEventListener("click", () => $("#addr-popup").style.display = "none");
-  $("#btn-popup-copy").addEventListener("click", () => {
-    navigator.clipboard.writeText(STATE.me.address).then(() => toast("Adresse kopiert", "ok")).catch(() => {});
+  $("#btn-addr-copy").addEventListener("click", () => {
+    if (!STATE.me) return;
+    navigator.clipboard.writeText(STATE.me.address).then(() => toast("Adresse kopiert", "ok")).catch(() => toast("Kopieren nicht möglich", "err"));
   });
+  $("#btn-addr-hide").addEventListener("click", hideMyAddress);
   $("#btn-delete-account").addEventListener("click", deleteAccount);
 
   $("#btn-new-chat").addEventListener("click", async () => {
@@ -2459,7 +2468,8 @@ function bindUI() {
   $("#btn-record-send").addEventListener("click", () => stopRecording(false));
 
   // Menüs
-  $("#btn-main-menu").addEventListener("click", openMainMenu);
+  $("#btn-main-menu").addEventListener("click", toggleSidebar);
+  $("#btn-sidebar-open").addEventListener("click", toggleSidebar);
   $("#sheet-bg").addEventListener("click", (e) => { if (e.target.id === "sheet-bg") closeSheet(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSheet(); });
 

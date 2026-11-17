@@ -7,7 +7,7 @@
   <title>chatmesh</title>
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d4a8'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Em%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/s/style.css?v=20261117-phase1.9" />
+  <link rel="stylesheet" href="/s/style.css?v=20261117-phase1.9b" />
 </head>
 <body>
 <noscript>
@@ -130,14 +130,22 @@
 <section id="view-chat" class="view">
   <aside class="sidebar">
     <div class="sidebar-head">
-      <button type="button" class="icon-btn" id="btn-main-menu" aria-label="Menü">
+      <button type="button" class="icon-btn" id="btn-main-menu" aria-label="Leiste einklappen" title="Leiste einklappen">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
       </button>
-      <div class="me-pill" id="me-pill" title="Meine Adresse anzeigen">
-        <div class="me-dot"></div>
-        <span id="me-address-full"></span>
-      </div>
+      <button type="button" class="me-pill" id="me-pill" title="Meine Adresse für 10 Sekunden einblenden">
+        <span class="me-dot"></span>
+        <span id="me-address-label">Adresse anzeigen</span>
+      </button>
       <button id="btn-logout" class="ghost small">Abmelden</button>
+    </div>
+    <div id="addr-reveal" class="addr-reveal" hidden>
+      <div class="addr-reveal-text" id="me-address-full"></div>
+      <div class="addr-reveal-row">
+        <button type="button" class="primary small" id="btn-addr-copy">Kopieren</button>
+        <button type="button" class="ghost small" id="btn-addr-hide">Ausblenden</button>
+      </div>
+      <div class="addr-reveal-bar"><span></span></div>
     </div>
 
     <div class="new-chat-row">
@@ -152,9 +160,16 @@
 
     <div id="contact-list" class="contact-list"></div>
     <div id="request-list" class="contact-list" style="display:none"></div>
+    <div class="sidebar-foot">
+      <a href="/beweis" target="_blank" rel="noopener">Beweis: was der Server speichert</a>
+      <button type="button" class="link-btn danger" id="btn-delete-account">Konto löschen</button>
+    </div>
   </aside>
 
   <main class="chat-main">
+    <button type="button" class="icon-btn sidebar-open" id="btn-sidebar-open" aria-label="Leiste ausklappen" title="Leiste ausklappen">
+      <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
     <div id="chat-header" class="chat-header"></div>
     <div id="rules-bar" class="rules-bar" hidden></div>
     <div id="chat-stream" class="chat-stream"></div>
@@ -193,26 +208,9 @@
   <div id="sheet" class="sheet"></div>
 </div>
 
-<!-- ================= ADDRESS POPUP ================= -->
-<div id="addr-popup" class="popup-bg" style="display:none">
-  <div class="popup">
-    <h3>Deine Adresse</h3>
-    <p class="hint">Teile sie mit Leuten, denen du erlaubst, dich zu kontaktieren. Niemand kann dich ohne diese Adresse finden.</p>
-    <div class="addr-value" id="popup-my-address"></div>
-    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">
-      <button class="ghost small" id="btn-popup-copy">Kopieren</button>
-      <button class="primary small" id="btn-popup-close">OK</button>
-    </div>
-    <div class="danger-zone">
-      <p class="hint">Konto samt Kontakten, Verlauf und wartenden Nachrichten endgültig vom Server löschen.</p>
-      <button class="ghost small danger" id="btn-delete-account">Konto löschen</button>
-    </div>
-  </div>
-</div>
-
 <!-- Cache-Busting: ?v=... bei jedem Deploy aktualisieren. Kein Inline-Script (strenge CSP). -->
-<script src="/s/bip39.js?v=20261117-phase1.9"></script>
-<script src="/s/crypto.js?v=20261117-phase1.9"></script>
-<script src="/s/app.js?v=20261117-phase1.9"></script>
+<script src="/s/bip39.js?v=20261117-phase1.9b"></script>
+<script src="/s/crypto.js?v=20261117-phase1.9b"></script>
+<script src="/s/app.js?v=20261117-phase1.9b"></script>
 </body>
 </html>

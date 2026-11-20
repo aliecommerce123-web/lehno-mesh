@@ -3,166 +3,112 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0a0e1a" />
+  <meta name="theme-color" content="#0b141c" />
+  <meta name="referrer" content="no-referrer" />
   <title>chatmesh</title>
   <link rel="manifest" href="/manifest.json" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d4a8'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Em%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/s/style.css?v=20261117-phase1.9b" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2323d5ab'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/s/style.css?v=4" />
 </head>
 <body>
 <noscript>
   <div class="noscript-box">chatmesh braucht JavaScript, weil die gesamte Verschlüsselung in deinem Browser stattfindet. Stelle die Sicherheitsstufe im Tor-Browser auf „Standard“ oder „Sicherer“ und lade die Seite neu. Gib ohne JavaScript nichts ein.</div>
 </noscript>
 
-<!-- ================= AUTH VIEW ================= -->
+<!-- ================= ANMELDEN ================= -->
 <section id="view-auth" class="view active">
   <div class="auth-card">
     <div class="brand">
       <div class="brand-dot"></div>
       <h1>chatmesh</h1>
     </div>
-    <p class="tagline">Anonymer Messenger. Kein Name, keine Nummer, keine E-Mail. Alles ist Ende-zu-Ende verschlüsselt, der Server kennt weder Absender noch Inhalt. <a href="/beweis">Beweis ansehen</a></p>
+    <p class="tagline">Anonymer Messenger. Kein Name, keine Nummer, keine E-Mail, keine Adresse. Nachrichten verschwinden von selbst, wie ein Gespräch im echten Leben. <a href="/beweis">Beweis ansehen</a></p>
 
     <div class="tabs">
-      <button class="tab active" data-tab="login">Login</button>
+      <button class="tab active" data-tab="login">Anmelden</button>
       <button class="tab" data-tab="register">Neu hier</button>
     </div>
 
     <form id="form-login" class="auth-form active">
-      <label>Adresse
-        <input name="address" autocomplete="off" spellcheck="false" required placeholder="mesh:..." />
-        <small>Deine kryptografische Adresse aus der Registrierung.</small>
+      <label>Deine 12 Wörter
+        <textarea name="words" rows="3" required autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" placeholder="wort1 wort2 … wort12"></textarea>
+        <small>12 englische Wörter, durch Leerzeichen getrennt. Sie sind Konto und Schlüssel in einem.</small>
       </label>
-      <label>Passwort
-        <input name="password" type="password" autocomplete="current-password" required minlength="8">
-      </label>
-      <label class="check-row">
-        <input type="checkbox" id="remember-address">
-        <span>Adresse auf diesem Gerät merken (sonst bleibt hier nichts gespeichert)</span>
-      </label>
-      <button type="submit" class="primary" data-needs-js disabled>Einloggen</button>
-      <div class="hint">Passwort vergessen? Verwende den 24-Wort-Backup-Code <a href="#" id="link-recover">hier</a>.</div>
+      <button type="submit" class="primary" data-needs-js disabled>Anmelden</button>
     </form>
 
     <form id="form-register" class="auth-form">
-      <label>Passwort
-        <input name="password" type="password" autocomplete="new-password" required minlength="10">
-        <small>Mindestens 10 Zeichen, am besten mehrere Wörter. Je stärker das Passwort, desto sicherer sind deine Schlüssel. Es gibt KEINE E-Mail-Wiederherstellung und KEINEN Benutzernamen. Nur dein 24-Wort-Backup-Code rettet dich, falls du das Passwort vergisst.</small>
-      </label>
-      <label>Passwort wiederholen
-        <input name="password2" type="password" autocomplete="new-password" required minlength="10">
-      </label>
-      <p class="hint">Dein Account hat keinen Namen. Beim Anlegen bekommst du eine kryptografische Adresse (wie eine Krypto-Wallet). Niemand kann dich „suchen“ oder „durchsehen“. Wer dich kontaktieren will, braucht deine Adresse direkt von dir.</p>
-      <button type="submit" class="primary" data-needs-js disabled>Anonymen Account anlegen</button>
+      <p class="hint">Dein Konto hat keinen Namen und kein Passwort. Du bekommst zweimal 12 Wörter:</p>
+      <ul class="plain-list">
+        <li><b>12 Anmeldewörter:</b> damit meldest du dich an.</li>
+        <li><b>12 Löschwörter:</b> Gibst du sie bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, bei dir und bei deinen Gegenübern. Ohne Rückfrage. Es sieht danach so aus, als hätte es das Konto nie gegeben.</li>
+      </ul>
+      <p class="hint">Es gibt keine Wiederherstellung. Wer die Wörter verliert, verliert das Konto. Ein Konto, das ein Jahr lang nicht benutzt wird, wird vom Server entfernt.</p>
+      <button type="submit" class="primary" data-needs-js disabled>Anonymes Konto anlegen</button>
     </form>
 
     <div id="auth-msg" class="msg"></div>
     <div class="hint tor-hint" id="tor-hint" hidden>
       <strong>Was sieht wer?</strong>
       <ul>
-        <li><b>Unser Server:</b> speichert keine IP-Adresse, keine Gerätekennung, keine Uhrzeit. Er sieht nur verschlüsselte Blöcke.</li>
-        <li><b>Dein Internetanbieter:</b> sieht, dass dein Gerät mit chatmesh verbunden ist. Nicht was du schreibst und nicht an wen. Der Tarnverkehr (gleichmäßiger Strom gleich großer Pakete) macht es sehr schwer zu erkennen, ob und wann du etwas sendest. Bilder, Videos und Dateien fallen als größere Übertragung auf, ihr Inhalt bleibt unlesbar.</li>
-        <li><b>Im Tor-Browser:</b> sieht nicht einmal dein Internetanbieter, dass du chatmesh nutzt, und kein Netzdienst dazwischen sieht deine IP-Adresse. <a href="/tor">Anleitung</a></li>
-        <li><a href="/beweis">Alles nachprüfen: Beweis-Seite</a></li>
+        <li><b>Unser Server:</b> speichert keine IP-Adresse, keine Gerätekennung, keine Uhrzeit, keinen Absender und keinen Empfänger. Bei ihm liegt nur ein Haufen gleich aussehender verschlüsselter Blöcke.</li>
+        <li><b>Dein Internetanbieter:</b> sieht, dass dein Gerät mit chatmesh verbunden ist. Nicht was du schreibst, nicht an wen. Die App sendet und holt ständig Schein-Blöcke, die wie echte aussehen. Das macht es sehr schwer zu erkennen, ob und wann du wirklich etwas sendest.</li>
+        <li><b>Im Tor-Browser:</b> sieht nicht einmal dein Internetanbieter, dass du chatmesh nutzt. <a href="/tor">Anleitung</a></li>
       </ul>
     </div>
   </div>
 </section>
 
-<!-- ================= MNEMONIC VIEW ================= -->
-<section id="view-mnemonic" class="view">
+<!-- ================= WÖRTER NACH DEM ANLEGEN ================= -->
+<section id="view-words" class="view">
   <div class="mnemonic-card">
-    <h2>Dein Account</h2>
+    <h2>Deine zwei Wort-Sätze</h2>
+    <p>Schreib beide auf Papier oder lade die Datei herunter und bewahre sie offline auf. Niemals als Foto oder in einer Cloud speichern. Wir kennen diese Wörter nicht und können sie nicht wiederherstellen. Die Wörter sind englisch, weil das die weltweit übliche Liste ist.</p>
 
-    <div class="addr-box">
-      <div class="addr-label">Deine Adresse</div>
-      <div class="addr-value" id="my-address-display"></div>
-      <div class="btn-row">
-        <button class="ghost small" id="btn-copy-addr">Adresse kopieren</button>
-        <button class="ghost small" id="btn-download-backup">Backup-Datei herunterladen</button>
-      </div>
+    <h3 class="words-title">1. Anmeldewörter</h3>
+    <p class="small-note">Damit meldest du dich an.</p>
+    <div id="words-login" class="mnemonic-grid"></div>
+
+    <h3 class="words-title danger-text">2. Löschwörter</h3>
+    <p class="small-note">Gibst du diese Wörter bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, ohne Rückfrage. Es gibt dafür keinen eigenen Knopf. Nicht mit den Anmeldewörtern verwechseln.</p>
+    <div id="words-wipe" class="mnemonic-grid wipe"></div>
+
+    <div class="btn-row">
+      <button class="ghost small" id="btn-download-words">Datei herunterladen</button>
     </div>
-
-    <h3>24-Wort-Backup-Code</h3>
-    <p>Diese 24 Wörter sind das EINZIGE, was deinen Account wiederherstellt, falls du das Passwort vergisst.
-       <strong>Lade die Backup-Datei jetzt herunter. Oder schreib die Wörter offline auf Papier. Beides ist gut. Niemals als Foto in der Cloud speichern.</strong></p>
-    <div id="mnemonic-grid" class="mnemonic-grid"></div>
     <label class="confirm-row">
-      <input type="checkbox" id="mnemonic-confirm">
-      <span>Ich habe die Backup-Datei gespeichert oder die 24 Wörter aufgeschrieben. Mir ist klar, dass es keinen anderen Weg zur Wiederherstellung gibt.</span>
+      <input type="checkbox" id="words-confirm">
+      <span>Ich habe beide Wort-Sätze gesichert. Mir ist klar, dass es keinen anderen Weg zurück ins Konto gibt.</span>
     </label>
-    <button id="mnemonic-continue" class="primary" disabled>Weiter zum Chat</button>
+    <button id="words-continue" class="primary" disabled>Weiter</button>
   </div>
 </section>
 
-<!-- ================= RECOVER VIEW ================= -->
-<section id="view-recover" class="view">
-  <div class="auth-card">
-    <div class="brand">
-      <div class="brand-dot"></div>
-      <h1>Account wiederherstellen</h1>
-    </div>
-    <p class="tagline">Gib deine Adresse, die 24 Backup-Wörter und ein neues Passwort ein. Damit wird dein Account neu entsperrt und mit dem neuen Passwort verschlüsselt.</p>
-
-    <form id="form-recover" class="auth-form active">
-      <label>Adresse
-        <input name="address" autocomplete="off" required placeholder="mesh:..." />
-      </label>
-      <label>24-Wort-Backup-Code
-        <textarea name="mnemonic" rows="4" required placeholder="wort1 wort2 wort3 ... wort24" autocomplete="off" spellcheck="false"></textarea>
-        <small>Genau 24 Wörter, durch Leerzeichen getrennt. Groß-/Kleinschreibung egal.</small>
-      </label>
-      <label>Neues Passwort
-        <input name="password" type="password" autocomplete="new-password" required minlength="10">
-      </label>
-      <label>Passwort wiederholen
-        <input name="password2" type="password" autocomplete="new-password" required minlength="10">
-      </label>
-      <button type="submit" class="primary" data-needs-js disabled>Wiederherstellen + Einloggen</button>
-    </form>
-
-    <button class="ghost small" id="btn-back-to-auth" style="margin-top:14px">Abbrechen</button>
-    <div id="recover-msg" class="msg"></div>
-  </div>
-</section>
-
-<!-- ================= CHAT VIEW ================= -->
+<!-- ================= APP ================= -->
 <section id="view-chat" class="view">
   <aside class="sidebar">
     <div class="sidebar-head">
       <button type="button" class="icon-btn" id="btn-main-menu" aria-label="Leiste einklappen" title="Leiste einklappen">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
       </button>
-      <button type="button" class="me-pill" id="me-pill" title="Meine Adresse für 10 Sekunden einblenden">
-        <span class="me-dot"></span>
-        <span id="me-address-label">Adresse anzeigen</span>
+      <div class="side-title">chatmesh</div>
+      <button type="button" class="icon-btn" id="btn-settings" aria-label="Einstellungen" title="Einstellungen">
+        <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h.1a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v.1a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>
       </button>
       <button id="btn-logout" class="ghost small">Abmelden</button>
     </div>
-    <div id="addr-reveal" class="addr-reveal" hidden>
-      <div class="addr-reveal-text" id="me-address-full"></div>
-      <div class="addr-reveal-row">
-        <button type="button" class="primary small" id="btn-addr-copy">Kopieren</button>
-        <button type="button" class="ghost small" id="btn-addr-hide">Ausblenden</button>
-      </div>
-      <div class="addr-reveal-bar"><span></span></div>
+
+    <div class="side-actions">
+      <button type="button" class="primary small" id="btn-new-channel">Neuer Kanal</button>
+      <button type="button" class="ghost small" id="btn-join-channel">Kanal beitreten</button>
     </div>
 
-    <div class="new-chat-row">
-      <input id="new-chat-address" placeholder="Neuer Chat: Adresse einfügen (mesh:…)" autocomplete="off" spellcheck="false" />
-      <button id="btn-new-chat" class="primary small" aria-label="Chat öffnen">+</button>
-    </div>
+    <div id="notes" class="notes"></div>
+    <div id="channel-list" class="contact-list"></div>
 
-    <div class="tabs sidebar-tabs">
-      <button class="tab active" data-list="chats">Chats</button>
-      <button class="tab" data-list="requests">Anfragen <span id="req-count" class="badge"></span></button>
-    </div>
-
-    <div id="contact-list" class="contact-list"></div>
-    <div id="request-list" class="contact-list" style="display:none"></div>
     <div class="sidebar-foot">
       <a href="/beweis" target="_blank" rel="noopener">Beweis: was der Server speichert</a>
-      <button type="button" class="link-btn danger" id="btn-delete-account">Konto löschen</button>
+      <span id="sync-state" class="sync-state"></span>
     </div>
   </aside>
 
@@ -171,14 +117,9 @@
       <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
     </button>
     <div id="chat-header" class="chat-header"></div>
-    <div id="rules-bar" class="rules-bar" hidden></div>
+    <div id="info-bar" class="rules-bar" hidden></div>
     <div id="chat-stream" class="chat-stream"></div>
-
-    <div id="request-banner" class="request-banner" style="display:none">
-      <span>Diese Adresse hat dir zum ersten Mal geschrieben. Anfrage akzeptieren?</span>
-      <button class="primary small" id="btn-accept">Akzeptieren</button>
-      <button class="ghost small" id="btn-decline">Ablehnen</button>
-    </div>
+    <div id="shield" class="shield" hidden>Inhalt ausgeblendet</div>
 
     <div id="record-bar" class="record-bar" hidden>
       <span class="rec-dot"></span>
@@ -192,7 +133,7 @@
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5l-8.6 8.6a5.5 5.5 0 0 1-7.8-7.8l9-9a3.7 3.7 0 0 1 5.2 5.2l-9 9a1.8 1.8 0 0 1-2.6-2.6l8.3-8.3"/></svg>
       </button>
       <input type="file" id="file-input" hidden multiple>
-      <input id="msg-input" placeholder="Nachricht" autocomplete="off" maxlength="60000" />
+      <input id="msg-input" placeholder="Nachricht" autocomplete="off" autocorrect="off" spellcheck="false" maxlength="60000" />
       <button type="button" id="btn-record" class="icon-btn" title="Sprachnachricht aufnehmen" aria-label="Sprachnachricht">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>
       </button>
@@ -203,14 +144,17 @@
   </main>
 </section>
 
-<!-- ================= AUSKLAPP-MENÜ ================= -->
+<!-- ================= FENSTER / MENÜS ================= -->
 <div id="sheet-bg" class="sheet-bg" style="display:none">
   <div id="sheet" class="sheet"></div>
 </div>
 
-<!-- Cache-Busting: ?v=... bei jedem Deploy aktualisieren. Kein Inline-Script (strenge CSP). -->
-<script src="/s/bip39.js?v=20261117-phase1.9b"></script>
-<script src="/s/crypto.js?v=20261117-phase1.9b"></script>
-<script src="/s/app.js?v=20261117-phase1.9b"></script>
+<!-- Kein Inline-Script (strenge CSP). -->
+<script src="/s/vendor/qrcode.js?v=4"></script>
+<script src="/s/vendor/jsqr.js?v=4"></script>
+<script src="/s/bip39.js?v=4"></script>
+<script src="/s/crypto.js?v=4"></script>
+<script src="/s/media.js?v=4"></script>
+<script src="/s/app.js?v=4"></script>
 </body>
 </html>

@@ -15,6 +15,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Files die immer mit-versioniert sind und sich nie unangekuendigt ändern dürfen
 PROTECTED = [
     "app.py",
+    "bots.py",
+    "README.md",
+    "scripts/update_hashes.py",
     "static/index.html",
     "static/landing.html",
     "static/landing.js",
@@ -24,9 +27,11 @@ PROTECTED = [
     "static/style.css",
     "static/app.js",
     "static/crypto.js",
+    "static/media.js",
     "static/bip39.js",
     "static/manifest.json",
-    "static/sw.js",
+    "static/vendor/jsqr.js",
+    "static/vendor/qrcode.js",
 ]
 
 result = {}

@@ -1,2093 +1,2131 @@
-// chatmesh (lehno-mesh) Phase 1.9 - anonymer Ende-zu-Ende-Messenger.
-// Verschlüsselter Verlauf, Regeln je Chat (Löschfrist, Einmal-Ansicht, Löschen
-// bei beiden), Sprachnachrichten und Dateien, Tarnverkehr.
+// chatmesh Phase 2 - anonymer Messenger ohne Adressen.
 //
 // Grundsätze dieser Datei:
-// - Der komplette Chat-Verlauf (eingehend UND ausgehend) liegt in einer
-//   verschlüsselten Ablage auf dem Server. Der Schlüssel entsteht nur hier im
-//   Browser. Auf dem Gerät selbst bleibt nach dem Abmelden nichts lesbar zurück.
-// - Ein Paket wird erst dann vom Server gelöscht (bestätigt), wenn die Nachricht
-//   sicher im verschlüsselten Verlauf gespeichert ist. So geht nichts verloren.
-// - Jede Nachricht hat eine eigene Kennung, doppelte Zustellung wird erkannt.
-// - Es gibt KEINE Uhrzeiten und kein Datum: weder in der Nachricht noch im
-//   Verlauf noch in der Anzeige. Nachrichten haben nur eine Reihenfolge-Nummer.
-// - Senden, Schlüsselabruf und Anhänge laufen OHNE Konto-Token: der Server
-//   erfährt nicht, welches Konto an wen sendet.
-
-const MESH_VERSION = "20261117-phase1.9";
+// - Ein Konto besteht nur aus 12 Anmeldewörtern. Dazu gibt es 12 Löschwörter.
+// - Kanäle entstehen über einen Einmal-Code (9 Wörter oder QR-Code). Jeder
+//   Kanal hat ein eigenes Passwort. Ohne dieses Passwort lassen sich auch mit
+//   den 12 Anmeldewörtern keine Nachrichten lesen, senden oder löschen.
+// - Jede Nachricht liegt als namenloser Block unter einer neuen Zufallsmarke
+//   auf dem gemeinsamen Haufen. Dieses Gerät lädt den ganzen Haufen und findet
+//   seine Blöcke selbst. Der Server bekommt keine Angabe, für wen ein Block ist.
+// - Standard: Nachrichten werden beim Öffnen vom Server gelöscht, sind nur im
+//   Arbeitsspeicher sichtbar und verschwinden nach der eingestellten Zeit oder
+//   sofort beim Verlassen des Chats. Verlauf behalten nur, wenn beide zustimmen.
+// - Es gibt nirgends Uhrzeiten. Nichts wird auf dem Gerät gespeichert.
+// - Schein-Verkehr: Abrufe und Schein-Blöcke in unregelmäßigen Abständen.
+(function () {
+"use strict";
+const C = window.CM;
 const APP_NAME = "chatmesh";
-const DECOY_ADDRESS = "mesh:" + "1".repeat(33);
-const ADDR_RE = /^mesh:[1-9A-HJ-NP-Za-km-z]{30,50}$/;
-const TOKEN_RE = /^[0-9a-f]{32}$/;
-const MIN_PASSWORD = 10;
-const SHOW_STEP = 200;                 // so viele Nachrichten je Chat auf einmal anzeigen
-const GONE_MAX = 5000;                 // gemerkte Kennungen gelöschter Nachrichten je Chat
-// Schutz vor Zumüllen durch Fremde: solange eine Adresse kein Kontakt ist,
-// nimmt der Verlauf von ihr nur wenig auf. So kann niemand mit vielen großen
-// Anfragen echte Nachrichten aus dem Verlauf drängen.
-const REQ_MAX_MSGS = 20;               // Nachrichten je Anfrage-Chat
-const REQ_MAX_TEXT = 2000;             // Zeichen je Anfrage-Nachricht
-const REQ_MAX_CHATS = 100;             // offene Anfragen insgesamt
-const MEDIA_MIMES = {
+const WINDOW_BACK = 32, WINDOW_AHEAD = 256, RESERVE = 8;
+const LIM = { keep: 6000, bytes: 24 * 1024 * 1024 };         // nicht zugeordnete Blöcke im Arbeitsspeicher
+const VIEW_MIN = 5, VIEW_MAX = 30 * 86400, VIEW_DEFAULT = 600;
+const INVITE_SECONDS = 24 * 3600;
+const HIST_BYTES = 200000;              // Verlauf je Kanal (verschlüsselt im Konto)
+const PW_MIN = 6;
+const MIMES = {
   image: ["image/jpeg", "image/png", "image/gif", "image/webp"],
+  video: ["video/mp4", "video/webm", "video/quicktime"],
+  voice: ["audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav"],
+};
+const SHOW_MIMES = {
+  image: ["image/jpeg", "image/png", "image/webp"],
   video: ["video/mp4", "video/webm"],
   voice: ["audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav"],
 };
-// Arten von Nachrichten. "file" = beliebige Datei (z. B. PDF), wird nie im
-// Browser dargestellt, sondern nur nach Klick entschlüsselt und gespeichert.
-const KINDS = ["text", "image", "video", "voice", "file"];
-const TTL_MAX_MIN = 60 * 24 * 30;      // längste Löschfrist: 30 Tage
-const CTL_MAX = 200;                   // wartende Lösch-Aufträge an Gegenüber
-const LS_LAST = "lehno-mesh:last-address";
-const LS_SEEN = "lehno-mesh:seen";
 
-const STATE = {
-  me: null,                       // { address, jwt, identityPriv, signingPriv, kek, identity_pub_b64, signing_pub_b64 }
-  sid: 0,                         // Sitzungszähler: ändert sich bei jedem An- und Abmelden
-  pubKeyCache: {},                // address -> identity_pub_b64 (geprüft)
-  contacts: [],                   // [{ address }] - aus verschlüsselter Userdata-Ablage
-  nicknames: {},                  // address -> Spitzname
-  declined: [],                   // [address]
-  userdataVersion: 0,
-  userdataCount: 0,               // Zähler IN der verschlüsselten Ablage (Schutz vor altem Stand)
-  userdataDirty: false,
-  history: { v: 1, chats: {}, ctl: [] },   // chats[address] = { msgs: [...], gone: [...], read, rules }
-  historyVersion: 0,
-  historyCount: 0,
-  historyLoaded: false,           // nur wenn true darf gespeichert werden (sonst würden wir Daten überschreiben)
-  historyDirty: false,
-  activeChat: null,
-  showCount: SHOW_STEP,
-  mediaAllowed: new Set(),        // Chats von Nicht-Kontakten, in denen Medien per Klick freigegeben wurden
-  drafts: {},                     // address -> angefangener Text (nur im Arbeitsspeicher)
-  cover: true,                    // Tarnverkehr an (Einstellung liegt in der verschlüsselten Kontaktablage)
-  outQueue: [],                   // fertig verschlüsselte Pakete, die auf den nächsten Takt warten
-  ws: null,
-  wsRetry: 0,
-  timers: [],
-  lastOrder: 0,
+const S = {
+  me: null,            // { id, token, encKey }
+  sid: 0,              // Sitzungszähler: ändert sich bei jedem An- und Abmelden
+  acct: null,          // entschlüsselter Konto-Inhalt
+  version: 0,
+  dirty: false,
+  urgent: false,
+  blobLen: 0,
+  blobClass: 0,
+  work: { pile: [12, 16], delete: 8, account: [17, 19, 21, 23, 25], account_wipe_extra: 2, upload: [16, 18, 20, 22] },
+  wipeBig: false,
+  pile: new Map(),     // Marke -> Block (noch nicht zugeordnet)
+  pileBytes: 0,
+  cursor: 0,
+  synced: false,
+  expect: new Map(),   // Marke -> { id, kind, lane, n }
+  run: {},             // Kanal-ID -> Laufzeitdaten (nur Arbeitsspeicher)
+  active: null,        // gerade offener Kanal
+  timers: new Set(),
+  lastInput: 0,
 };
 
-const MEDIA_URLS = new Map();     // token -> Promise<objectURL> (nur im Arbeitsspeicher)
-
-const $ = (sel, root=document) => root.querySelector(sel);
-const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
-
-function show(viewName) {
-  $$(".view").forEach(v => v.classList.remove("active"));
-  $("#view-" + viewName).classList.add("active");
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function randInt(n) { const r = new Uint32Array(1); crypto.getRandomValues(r); return r[0] % n; }
+function randBetween(a, b) { return a + randInt(Math.max(1, b - a)); }
+function randExp(mean, lo, hi) {
+  const r = new Uint32Array(1); crypto.getRandomValues(r);
+  const u = (r[0] + 1) / 4294967297;
+  return Math.max(lo, Math.min(hi, -Math.log(u) * mean));
 }
+const nowSec = () => Math.floor(Date.now() / 1000);
 
+function show(view) {
+  $$(".view").forEach(v => v.classList.remove("active"));
+  $("#view-" + view).classList.add("active");
+}
 let _toastTimer = null;
-function toast(text, kind="") {
+function toast(text, kind = "") {
   let t = $(".toast");
   if (!t) { t = document.createElement("div"); t.className = "toast"; document.body.appendChild(t); }
   t.textContent = text;
   t.className = "toast show " + kind;
   if (_toastTimer) clearTimeout(_toastTimer);
-  _toastTimer = setTimeout(() => t.classList.remove("show"), kind === "err" ? 6000 : 2400);
+  _toastTimer = setTimeout(() => t.classList.remove("show"), kind === "err" ? 6000 : 2600);
 }
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, m => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m]));
-}
-
-function normalizeAddressInput(raw) {
-  let addr = String(raw || "").trim();
-  if (!addr) return null;
-  if (!addr.startsWith("mesh:")) addr = "mesh:" + addr;
-  return ADDR_RE.test(addr) ? addr : null;
-}
-
-// Avatar-Initialen: aus Spitzname (1-2 Buchstaben) oder Adress-Präfix (2 Zeichen).
-function avatarLabel(addr) {
-  if (!addr) return "??";
-  const nick = STATE.nicknames[addr];
-  if (nick && nick.trim()) {
-    const parts = nick.trim().split(/\s+/);
-    if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
-    return parts[0].slice(0, 2).toUpperCase();
-  }
-  return addr.replace(/^mesh:/, "").slice(0, 2).toUpperCase();
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
 }
 
 // =========================================================================
-// REIHENFOLGE (statt Zeit)
+// SERVER-AUFRUFE
 // =========================================================================
-// Jede Nachricht bekommt beim Eintragen die nächste laufende Nummer. Das ist
-// ein reiner Zähler ohne Bezug zu Uhr oder Datum.
-function nextOrder() {
-  STATE.lastOrder = STATE.lastOrder + 1;
-  return STATE.lastOrder;
-}
+class ApiError extends Error { constructor(m, status) { super(m); this.status = status; } }
 
-// =========================================================================
-// API
-// =========================================================================
-class ApiError extends Error {
-  constructor(message, status) { super(message); this.status = status; }
-}
-
-// anon: true = ohne Konto-Token (Senden, Schlüsselabruf, Anhänge).
-async function apiFetch(method, path, { json, body, raw, anon } = {}) {
-  const headers = {};
-  const sid = STATE.sid;
-  if (!anon && STATE.me?.jwt) headers["authorization"] = "Bearer " + STATE.me.jwt;
-  let payload = body;
-  if (json !== undefined) { headers["content-type"] = "application/json"; payload = JSON.stringify(json); }
+async function api(method, path, opt = {}) {
+  const headers = Object.assign({}, opt.headers || {});
+  const sid = S.sid;
+  if (opt.auth) headers["authorization"] = "Bearer " + S.me.id + "." + S.me.token;
+  let body = opt.body;
+  if (opt.json !== undefined) { headers["content-type"] = "application/json"; body = JSON.stringify(opt.json); }
   let r;
-  try {
-    r = await fetch(path, { method, headers, body: payload, cache: "no-store" });
-  } catch (e) {
-    throw new ApiError("Keine Verbindung zum Server", 0);
-  }
+  const init = { method, headers, body, cache: "no-store" };
+  if (opt.keepalive && typeof body === "string" && body.length < 60000) init.keepalive = true;
+  try { r = await fetch(path, init); }
+  catch (e) { throw new ApiError("Keine Verbindung zum Server", 0); }
   if (!r.ok) {
     let detail = r.statusText;
-    try { const err = await r.json(); if (err && err.detail) detail = typeof err.detail === "string" ? err.detail : JSON.stringify(err.detail); } catch (e) {}
-    // Token ungültig (Konto gelöscht oder auf anderem Gerät wiederhergestellt): abmelden.
-    if (r.status === 401 && !anon && STATE.me && sid === STATE.sid && !path.startsWith("/api/login")) {
-      logout("Sitzung abgelaufen. Bitte neu anmelden.");
-    }
+    try { const j = await r.json(); if (j && j.detail) detail = String(j.detail); } catch (e) {}
+    if (r.status === 401 && opt.auth && S.me && sid === S.sid && !opt.noLogout) logout("Sitzung beendet. Bitte neu anmelden.");
     throw new ApiError(detail, r.status);
   }
-  if (raw) return new Uint8Array(await r.arrayBuffer());
-  return r.json();
+  return opt.raw ? r : r.json();
 }
 
-const API = {
-  post: (path, json) => apiFetch("POST", path, { json }),
-  put:  (path, json) => apiFetch("PUT", path, { json }),
-  get:  (path) => apiFetch("GET", path),
-  del:  (path) => apiFetch("DELETE", path),
-  keys: (address) => apiFetch("GET", "/api/keys/" + encodeURIComponent(address), { anon: true }),
-  // Alle Anfragen sind gleich lang (Füllfeld gleicht verschieden lange Adressen
-  // aus). Der Server antwortet immer mit Status 200 und gleicher Länge; ob es
-  // geklappt hat, steht im Feld ok.
-  async sendPacket(packet) {
-    const pad = "x".repeat(Math.max(0, 55 - String(packet.recipient_address).length));
-    const r = await apiFetch("POST", "/api/packets", { json: { ...packet, pad }, anon: true });
-    if (!r || r.ok !== true) throw new ApiError((r && r.detail) || "send failed", (r && r.code) || 500);
-    return r;
-  },
-  proofPacket: (pid) => apiFetch("GET", "/api/proof/packet/" + pid, { anon: true }),
-  uploadAttachment(blob) {
-    const fd = new FormData();
-    fd.append("file", new File([blob], "encrypted.bin", { type: "application/octet-stream" }));
-    return apiFetch("POST", "/api/attachments", { body: fd, anon: true });   // { token, size_bytes }
-  },
-  fetchAttachment: (token) => apiFetch("GET", "/api/attachments/" + encodeURIComponent(token), { raw: true, anon: true }),
-  deleteAttachment: (token) => apiFetch("DELETE", "/api/attachments/" + encodeURIComponent(token), { anon: true }),
-};
-
-function humanError(err) {
-  const m = String(err && err.message || err);
-  if (err && err.status === 429) return "Zu viele Versuche. Bitte kurz warten.";
-  if (err && err.status === 503) return "Der Server ist gerade ausgelastet. Bitte gleich noch einmal versuchen.";
-  if (err && err.status === 403) return "Unter dieser Adresse ist chatmesh nicht erreichbar.";
-  if (/invalid credentials/.test(m)) return "Adresse oder Passwort falsch.";
-  if (/recipient not found|address not found/.test(m)) return "Diese Adresse gibt es nicht.";
-  if (/payload too large/.test(m)) return "Die Nachricht ist zu lang (höchstens etwa 60.000 Zeichen).";
-  if (/attachment too large/.test(m)) return "Die Datei ist zu groß (höchstens 16 MB).";
-  if (/recipient inbox full/.test(m)) return "Das Postfach des Empfängers ist voll.";
-  if (err && err.status === 507) return "Der Speicher ist gerade voll. Bitte später erneut versuchen.";
-  if (err && err.status === 422) return "Der Server hat die Anfrage abgelehnt. Bitte die Seite neu laden.";
-  return m;
-}
-
-// =========================================================================
-// MERKEN AUF DIESEM GERÄT (nur wenn der Nutzer es ausdrücklich anhakt)
-// Gespeichert werden ausschließlich die eigene Adresse und zwei Zähler, mit
-// denen ein veralteter Stand vom Server erkannt wird. Kein Schlüssel, kein Inhalt.
-// =========================================================================
-function rememberEnabled() {
-  try { return !!localStorage.getItem(LS_LAST); } catch (e) { return false; }
-}
-function getRememberedAddress() {
-  try { return localStorage.getItem(LS_LAST) || ""; } catch (e) { return ""; }
-}
-function setRemember(addr) {
+// Der Server verlangt zu jeder Einlieferung eine kleine Rechenaufgabe. Wie
+// schwer sie gerade ist, steht in den öffentlichen Einstellungen.
+async function loadConfig() {
   try {
-    if (addr) localStorage.setItem(LS_LAST, addr);
-    else { localStorage.removeItem(LS_LAST); localStorage.removeItem(LS_SEEN); }
+    const c = await api("GET", "/api/v2/config");
+    if (c && c.work && Array.isArray(c.work.pile) && Array.isArray(c.work.account) && Array.isArray(c.work.upload)) S.work = c.work;
   } catch (e) {}
 }
-function seenCounters() {
+const subject = (hexId, letter, extra) => C.concat(C.unhex(hexId), C.utf8(letter), extra === undefined ? new Uint8Array(0) : new Uint8Array([extra]));
+
+// Einliefern und Löschen sehen von außen gleich aus: gleiche Länge der Anfrage,
+// gleiche Länge und Dauer der Antwort.
+const POST_LEN = JSON.stringify({ tag: "0".repeat(32), data: "x".repeat(5500), del_hash: "0".repeat(64), work: "0".repeat(16) }).length;
+async function pilePost(tag, bytes, delToken, maxBits = 26) {
+  const delHash = await C.delHash(delToken);
+  const idx = bytes.byteLength > 5000 ? 1 : 0;
+  for (let i = 0; i < 3; i++) {
+    const bits = S.work.pile[idx] || 0;
+    if (bits > maxBits) return 428;      // Server unter Last: nicht endlos rechnen
+    const work = await C.work(subject(tag, "p"), bits);
+    const r = await api("POST", "/api/v2/pile", { json: { tag, data: C.b64(bytes), del_hash: delHash, work } });
+    if (r && r.ok === true) return 200;
+    const code = (r && r.code) || 500;
+    if (code !== 428) return code;
+    await loadConfig();                 // Aufgabe ist schwerer geworden: neu holen, noch einmal
+  }
+  return 428;
+}
+
+async function pileDelete(tag, token) {
   try {
-    const o = JSON.parse(localStorage.getItem(LS_SEEN) || "null");
-    if (o && o.a === STATE.me?.address) return o;
-  } catch (e) {}
-  return { a: STATE.me?.address, h: 0, u: 0 };
-}
-function noteSeen(kind, n) {
-  if (!STATE.me || !rememberEnabled() || getRememberedAddress() !== STATE.me.address) return;
-  const o = seenCounters();
-  if (n > (o[kind] || 0)) {
-    o[kind] = n;
-    try { localStorage.setItem(LS_SEEN, JSON.stringify(o)); } catch (e) {}
-  }
-}
-// true, wenn der Server einen älteren Stand liefert als dieses Gerät schon gesehen hat.
-function isRollback(kind, n) {
-  if (!rememberEnabled() || getRememberedAddress() !== STATE.me?.address) return false;
-  return n < (seenCounters()[kind] || 0);
+    const bits = S.work.delete || 0;
+    if (bits > 24) return false;
+    const work = await C.work(subject(tag, "d"), bits);
+    const base = JSON.stringify({ tag, token, work, pad: "" }).length;
+    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "x".repeat(Math.max(0, POST_LEN - base)) } });
+    if (r && r.code === 428) { await loadConfig(); return false; }
+    return !!(r && (r.ok || r.code === 404));
+  } catch (e) { return false; }
 }
 
-// =========================================================================
-// VERSCHLÜSSELTE USERDATA-ABLAGE (Kontakte, Spitznamen, Abgelehnte)
-// Klartext-Format: { contacts: [{address}], nicknames: {address: name}, declined: [address], _n: Zähler }
-// =========================================================================
-let _userdataLoaded = false;
-
-function applyUserdata(data) {
-  const contacts = Array.isArray(data?.contacts) ? data.contacts : [];
-  STATE.contacts = contacts
-    .filter(c => c && typeof c.address === "string" && ADDR_RE.test(c.address))
-    .map(c => ({ address: c.address }));
-  const nicks = (data?.nicknames && typeof data.nicknames === "object") ? data.nicknames : {};
-  STATE.nicknames = {};
-  for (const [k, v] of Object.entries(nicks)) {
-    if (ADDR_RE.test(k) && typeof v === "string") STATE.nicknames[k] = v.slice(0, 60);
-  }
-  STATE.declined = (Array.isArray(data?.declined) ? data.declined : []).filter(a => typeof a === "string" && ADDR_RE.test(a));
-  STATE.userdataCount = Number.isFinite(data?._n) ? data._n : 0;
-  STATE.cover = true;       // Tarnverkehr ist immer an, es gibt keinen Schalter
-}
-
-async function loadUserdata() {
-  const sid = STATE.sid;
-  const resp = await API.get("/api/userdata");
-  if (sid !== STATE.sid) return;
-  STATE.userdataVersion = resp.version || 0;
-  if (!resp.ciphertext_b64) {
-    applyUserdata({});
-  } else {
-    // Schlägt das Entschlüsseln fehl, brechen wir ab statt mit leeren Daten
-    // weiterzumachen (sonst würde die Ablage beim nächsten Speichern überschrieben).
-    const data = await LehnoCrypto.decryptUserdata(STATE.me.kek, resp);
-    if (sid !== STATE.sid) return;
-    applyUserdata(data);
-    if (isRollback("u", STATE.userdataCount)) {
-      toast("Achtung: Der Server liefert einen älteren Stand deiner Kontaktliste als dieses Gerät zuletzt gesehen hat.", "err");
-    }
-    noteSeen("u", STATE.userdataCount);
-  }
-  _userdataLoaded = true;
-}
-
-let _saveTimer = null;
-function scheduleUserdataSave() {
-  STATE.userdataDirty = true;
-  if (_saveTimer) clearTimeout(_saveTimer);
-  _saveTimer = setTimeout(() => { _saveTimer = null; saveUserdata(); }, 400);
-}
-
-let _udChain = Promise.resolve(true);
-function saveUserdata() {
-  _udChain = _udChain.then(doSaveUserdata, doSaveUserdata);
-  return _udChain;
-}
-
-async function doSaveUserdata() {
-  const sid = STATE.sid;
-  if (!STATE.me?.kek || !_userdataLoaded) return false;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      const data = { contacts: STATE.contacts, nicknames: STATE.nicknames, declined: STATE.declined, _n: STATE.userdataCount + 1 };
-      const enc = await LehnoCrypto.encryptUserdata(STATE.me.kek, data);
-      const resp = await API.put("/api/userdata", { ...enc, expected_version: STATE.userdataVersion });
-      if (sid !== STATE.sid) return false;
-      STATE.userdataVersion = resp.version;
-      STATE.userdataCount = data._n;
-      STATE.userdataDirty = false;
-      noteSeen("u", data._n);
-      return true;
-    } catch (e) {
-      if (sid !== STATE.sid) return false;
-      if (e.status !== 409) break;
-      // Anderes Gerät war schneller: neu laden und unsere Änderungen dazumischen.
-      try { await reloadUserdataMerging(); } catch (e2) { break; }
-      if (sid !== STATE.sid) return false;
-    }
-  }
-  STATE.userdataDirty = true;      // der regelmäßige Takt versucht es erneut
-  return false;
-}
-
-// Lädt die Kontaktablage neu und behält dabei alles, was lokal schon geändert wurde.
-async function reloadUserdataMerging() {
-  const sid = STATE.sid;
-  const before = { contacts: [...STATE.contacts], nicknames: { ...STATE.nicknames }, declined: [...STATE.declined], cover: STATE.cover };
-  await loadUserdata();
-  if (sid !== STATE.sid) return;
-  STATE.cover = true;
-  for (const a of before.declined) {
-    if (!STATE.declined.includes(a)) STATE.declined.push(a);
-  }
-  for (const c of before.contacts) {
-    if (!STATE.contacts.find(x => x.address === c.address) && !STATE.declined.includes(c.address)) STATE.contacts.unshift(c);
-  }
-  Object.assign(STATE.nicknames, before.nicknames);
-}
-
-function ensureContact(addr) {
-  if (STATE.contacts.find(c => c.address === addr)) return false;
-  STATE.contacts.unshift({ address: addr });
-  STATE.declined = STATE.declined.filter(a => a !== addr);
-  scheduleUserdataSave();
-  return true;
-}
-// Kontakt ist, wen ich angenommen habe ODER wem ich selbst schon geschrieben habe
-// (so verschwindet ein Chat auch dann nicht, wenn das Speichern der Kontaktliste
-// einmal scheitert).
-function isContact(addr) {
-  if (STATE.contacts.find(c => c.address === addr)) return true;
-  const c = STATE.history.chats[addr];
-  return !!(c && c.msgs.some(m => m.me));
-}
-function chatAddresses() {
-  const out = STATE.contacts.map(c => c.address);
-  for (const [addr, c] of Object.entries(STATE.history.chats)) {
-    if (!out.includes(addr) && c.msgs.some(m => m.me)) out.push(addr);
-  }
-  return out;
-}
-
-// =========================================================================
-// VERSCHLÜSSELTER CHAT-VERLAUF
-// Nachricht: { id, me: 0|1, k: "text"|"image"|"video", x: Text,
-//              a: { t: Token, k: Dateischlüssel, i: IV, m: MIME, c: Bildtext },
-//              o: Reihenfolge-Nummer (reiner Zähler, keine Zeit),
-//              u: 1 = Alt-Format, Absender nicht kryptografisch geprüft,
-//              q: 1 = Einmal-Ansicht, e: Löschzeitpunkt (nur bei Löschfrist) }
-// Regeln:    { ttl: Minuten bis zum Löschen (0 = aus), once: Einmal-Ansicht, v }
-//            gelten für MEINE Nachrichten in diesem Chat.
-// Chat:      { msgs, gone: [Kennungen gelöschter Nachrichten], read }
-// =========================================================================
-function emptyHistory() { return { v: 1, chats: {}, ctl: [] }; }
-function emptyRules() { return { ttl: 0, once: 0, v: 0 }; }
-function emptyChat() { return { msgs: [], gone: [], read: 0, rules: emptyRules() }; }
-
-function sanitizeRules(r) {
-  if (!r || typeof r !== "object") return emptyRules();
-  let ttl = Number(r.ttl);
-  if (!Number.isFinite(ttl) || ttl <= 0) ttl = 0;
-  return { ttl: Math.min(ttl, TTL_MAX_MIN), once: r.once ? 1 : 0, v: Number.isFinite(r.v) ? Math.max(0, Math.floor(r.v)) : 0 };
-}
-
-// Lösch-Aufträge an das Gegenüber, die noch nicht rausgegangen sind.
-function sanitizeCtl(list) {
-  const out = [];
-  const seen = new Set();
-  const ids = (x) => (Array.isArray(x) ? x : []).filter(v => typeof v === "string" && v && v.length <= 60).slice(0, 500);
-  for (const c of (Array.isArray(list) ? list : [])) {
-    if (!c || typeof c !== "object" || typeof c.id !== "string" || seen.has(c.id) || !ADDR_RE.test(c.p)) continue;
-    const b = c.b && typeof c.b === "object" ? c.b : {};
-    seen.add(c.id);
-    out.push({ id: c.id.slice(0, 40), p: c.p, b: { mine: ids(b.mine), yours: ids(b.yours) } });
-  }
-  return out.slice(-CTL_MAX);
-}
-
-function sanitizeMsg(m) {
-  if (!m || typeof m !== "object" || typeof m.id !== "string" || !m.id || m.id.length > 80) return null;
-  const k = KINDS.includes(m.k) ? m.k : "text";
-  const out = {
-    id: m.id,
-    me: m.me ? 1 : 0,
-    k,
-    x: typeof m.x === "string" ? m.x : "",
-    o: Number.isFinite(m.o) ? m.o : 0,
+function queueDelete(tag, token, delay = 0) {
+  const sid = S.sid;
+  const waits = [2000, 6000, 20000, 60000, 180000];
+  let attempt = 0;
+  const run = async () => {
+    if (await pileDelete(tag, token)) return;
+    if (sid !== S.sid || attempt >= waits.length) return;
+    setTimeout(run, waits[attempt++] + randInt(1500));
   };
-  if (m.u) out.u = 1;
-  if (m.q) out.q = 1;
-  if (Number.isFinite(m.e) && m.e > 0) out.e = Math.floor(m.e);
-  if (typeof m.p === "string" && /^[0-9a-f]{24}$/.test(m.p)) out.p = m.p;
-  if (k !== "text") {
-    const a = m.a && typeof m.a === "object" ? m.a : {};
-    out.a = {
-      t: typeof a.t === "string" && TOKEN_RE.test(a.t) ? a.t : "",
-      k: typeof a.k === "string" ? a.k.slice(0, 64) : "",
-      i: typeof a.i === "string" ? a.i.slice(0, 32) : "",
-      m: typeof a.m === "string" ? a.m.slice(0, 40) : "",
-      c: typeof a.c === "string" ? a.c.slice(0, 2000) : "",
-    };
-    if (k === "file") {
-      out.a.n = safeFileName(a.n);
-      out.a.s = Number.isFinite(a.s) && a.s > 0 ? Math.floor(a.s) : 0;
-    }
+  if (delay > 0) setTimeout(run, delay); else run();
+}
+
+// =========================================================================
+// KONTO
+// =========================================================================
+function emptyAccount(wipeOuterKey, wipePub, wipePrivSealed) {
+  return { v: 2, set: { view: VIEW_DEFAULT, lockOn: 1, lockMin: 1, rv: 0 }, wk: C.b64(wipeOuterKey), wp: C.b64(wipePub), wq: C.b64(wipePrivSealed), ch: [], gone: [], notes: [], n: 1 };
+}
+const strList = (v, max) => (Array.isArray(v) ? v : []).filter(x => typeof x === "string").slice(-max);
+const numList = (v) => (Array.isArray(v) ? v : []).filter(x => Number.isInteger(x) && x >= 0).slice(-WINDOW_BACK * 2);
+const modeList = (v) => (Array.isArray(v) ? v : []).filter(x => x === "keep" || x === "shots").filter((x, i, a) => a.indexOf(x) === i);
+function sanitizeChannel(c) {
+  if (!c || typeof c.id !== "string" || !/^[0-9a-f]{16}$/.test(c.id)) return null;
+  c.name = String(c.name || "Kanal").slice(0, 40);
+  c.dir = c.dir === "b" ? "b" : "a";
+  c.rv = Number.isInteger(c.rv) ? c.rv : 0;
+  if (c.pend) {
+    const p = c.pend;
+    if (![p.ta, p.da, p.tb].every(x => typeof x === "string" && /^[0-9a-f]{32}$/.test(x)) || typeof p.s !== "string" || typeof p.c !== "string") return null;
+    p.exp = Number.isFinite(p.exp) ? p.exp : 0;
+    return c;
   }
+  if (typeof c.kt !== "string" || !c.wrap || typeof c.wrap.s !== "string" || typeof c.wrap.c !== "string") return null;
+  if (!c.pd || typeof c.pd.t !== "string" || typeof c.pd.k !== "string" || typeof c.pd.d !== "string") return null;
+  for (const k of ["sn", "cn", "sr", "cr", "rn", "rc"]) c[k] = Number.isInteger(c[k]) && c[k] >= 0 ? c[k] : 0;
+  c.rp = numList(c.rp); c.rpc = numList(c.rpc);
+  c.keep = c.keep ? 1 : 0; c.shots = c.shots ? 1 : 0;
+  c.rq = modeList(c.rq); c.ro = modeList(c.ro);
+  c.hist = typeof c.hist === "string" ? c.hist : "";
+  c.sym = typeof c.sym === "string" ? c.sym.slice(0, 80) : "";
+  delete c.open;
+  return c;
+}
+function sanitizeAccount(a) {
+  const out = { v: 2, set: {}, wk: typeof a.wk === "string" ? a.wk : "", wp: typeof a.wp === "string" ? a.wp : "", wq: typeof a.wq === "string" ? a.wq : "", ch: [], gone: strList(a.gone, 300), notes: [], n: Number.isFinite(a.n) ? a.n : 1 };
+  const s = a.set && typeof a.set === "object" ? a.set : {};
+  out.set.view = Math.max(VIEW_MIN, Math.min(VIEW_MAX, Math.floor(Number(s.view) || VIEW_DEFAULT)));
+  out.set.lockOn = s.lockOn === 0 ? 0 : 1;
+  out.set.lockMin = Math.max(0, Math.min(1440, Math.floor(Number(s.lockMin) >= 0 ? Number(s.lockMin) : 1)));
+  out.set.rv = Number.isInteger(s.rv) ? s.rv : 0;
+  const ids = new Set();
+  for (const raw of (Array.isArray(a.ch) ? a.ch : [])) {
+    const c = sanitizeChannel(raw);
+    if (c && !ids.has(c.id) && !out.gone.includes(c.id)) { ids.add(c.id); out.ch.push(c); }
+  }
+  out.notes = strList(a.notes, 20).map(n => n.slice(0, 300));
   return out;
 }
 
-function safeFileName(name) {
-  let n = typeof name === "string" ? name : "";
-  // Steuer- und Richtungszeichen raus (sonst ließe sich z. B. "exe" als "pdf" tarnen).
-  n = n.replace(/[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, "");
-  n = n.replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, "_").replace(/^\.+/, "").trim().slice(0, 120);
-  return n || "datei";
+// Kleiner zweiter Block für die Löschwörter. Er enthält, was zum Auflösen der
+// Kanäle beim Gegenüber nötig ist, je Kanal verschlossen an einen Schlüssel,
+// den nur die 12 Löschwörter öffnen. Das Konto selbst kann die Einträge nicht lesen.
+async function wipeBlobFor(acct) {
+  const entries = acct.ch.filter(c => !c.pend && c.wb).map(c => c.wb);
+  for (;;) {
+    try { return C.b64(await C.sealJson(C.unb64(acct.wk), { p: acct.wp, q: acct.wq, e: entries }, C.WIPE)); }
+    catch (e) { if (!entries.length) throw e; entries.pop(); }
+  }
+}
+async function accountBlobs() {
+  S.acct.n = (S.acct.n || 0) + 1;
+  const plainLen = C.utf8(JSON.stringify(S.acct)).byteLength + 4;
+  S.blobClass = Math.max(0, C.ACCOUNT.findIndex(x => plainLen <= x));
+  const blob = C.b64(await C.sealJson(S.me.encKey, S.acct, C.ACCOUNT));
+  S.blobLen = blob.length;
+  const wipe_blob = await wipeBlobFor(S.acct);
+  S.wipeBig = wipe_blob.length > 10000;
+  return { blob, wipe_blob };
 }
 
-function sanitizeGone(list) {
-  const out = [];
-  const seen = new Set();
-  for (const id of (Array.isArray(list) ? list : [])) {
-    if (typeof id === "string" && id && id.length <= 80 && !seen.has(id)) { seen.add(id); out.push(id); }
+// Zwei Geräte mit demselben Konto: Stände je Kanal zusammenführen statt
+// überschreiben. Zähler nehmen den höheren Wert, Gelöschtes bleibt gelöscht,
+// bei Einstellungen gewinnt die neuere Änderung.
+function mergeChannel(l, r) {
+  if (l.pend && !r.pend) { for (const k of Object.keys(l)) delete l[k]; Object.assign(l, r); return; }
+  if (l.pend || r.pend) return;
+  // Nummern: hinter allem weitermachen, was irgendein Gerät benutzt oder reserviert hat.
+  l.sn = Math.max(l.sn || 0, r.sn || 0, r.sr || 0);
+  l.cn = Math.max(l.cn || 0, r.cn || 0, r.cr || 0);
+  l.sr = Math.max(l.sr || 0, r.sr || 0);
+  l.cr = Math.max(l.cr || 0, r.cr || 0);
+  l.rn = Math.max(l.rn || 0, r.rn || 0);
+  l.rc = Math.max(l.rc || 0, r.rc || 0);
+  for (const [k, base] of [["rp", "rn"], ["rpc", "rc"]]) {
+    l[k] = Array.from(new Set([...(l[k] || []), ...(r[k] || [])])).filter(n => n >= l[base] - WINDOW_BACK).sort((a, b) => a - b);
   }
-  return out.slice(-GONE_MAX);
-}
-
-function sanitizeHistory(h) {
-  const out = emptyHistory();
-  const chats = (h && typeof h === "object" && h.chats && typeof h.chats === "object") ? h.chats : {};
-  for (const [addr, c] of Object.entries(chats)) {
-    if (!ADDR_RE.test(addr) || !c || typeof c !== "object") continue;
-    const gone = sanitizeGone(c.gone);
-    const goneSet = new Set(gone);
-    const seen = new Set();
-    const msgs = [];
-    for (const raw of (Array.isArray(c.msgs) ? c.msgs : [])) {
-      const m = sanitizeMsg(raw);
-      if (!m || seen.has(m.id) || goneSet.has(m.id)) continue;
-      seen.add(m.id);
-      msgs.push(m);
-    }
-    msgs.sort(msgCompare);
-    out.chats[addr] = { msgs, gone, read: Number.isFinite(c.read) ? c.read : 0, rules: sanitizeRules(c.rules) };
-  }
-  out.ctl = sanitizeCtl(h && h.ctl);
-  return out;
-}
-
-function msgCompare(a, b) {
-  if (a.o !== b.o) return a.o - b.o;
-  return a.id < b.id ? -1 : (a.id > b.id ? 1 : 0);
-}
-
-// Vereinigt zwei Verläufe (z. B. zwei Geräte). Nachrichten werden nie
-// überschrieben, nur ergänzt. Gelöscht bleibt gelöscht: maßgeblich sind die
-// gemerkten Kennungen, nicht Uhrzeiten (Uhren verschiedener Geräte weichen ab).
-function mergeHistory(a, b) {
-  const out = emptyHistory();
-  const addrs = new Set([...Object.keys(a.chats), ...Object.keys(b.chats)]);
-  for (const addr of addrs) {
-    const ca = a.chats[addr] || emptyChat();
-    const cb = b.chats[addr] || emptyChat();
-    const gone = sanitizeGone([...(ca.gone || []), ...(cb.gone || [])]);
-    const goneSet = new Set(gone);
-    const byId = new Map();
-    for (const m of [...ca.msgs, ...cb.msgs]) {
-      if (goneSet.has(m.id)) continue;
-      if (!byId.has(m.id)) byId.set(m.id, m);
-    }
-    const ra = sanitizeRules(ca.rules), rb = sanitizeRules(cb.rules);
-    out.chats[addr] = {
-      msgs: Array.from(byId.values()).sort(msgCompare),
-      gone,
-      read: Math.max(ca.read || 0, cb.read || 0),
-      rules: rb.v > ra.v ? rb : ra,      // die zuletzt geänderten Regeln gelten
-    };
-  }
-  out.ctl = sanitizeCtl([...(a.ctl || []), ...(b.ctl || [])]);
-  return out;
-}
-
-// Übernimmt einen vom Server geladenen Stand in den Arbeitsspeicher (mit
-// allem, was lokal schon da ist). Nachrichten, die es bisher nur hier gibt
-// (noch nicht gesichert), reihen sich HINTER den Stand vom Server ein: so
-// rutscht nichts nachträglich mitten in einen Verlauf, den ein anderes Gerät
-// inzwischen weitergeschrieben hat.
-function adoptRemoteHistory(remote) {
-  let remoteMax = 0;
-  const remoteIds = {};
-  for (const [addr, c] of Object.entries(remote.data.chats)) {
-    remoteIds[addr] = new Set(c.msgs.map(m => m.id));
-    remoteMax = Math.max(remoteMax, c.read || 0);
-    for (const m of c.msgs) remoteMax = Math.max(remoteMax, m.o);
-  }
-  const localOnly = [];
-  for (const [addr, c] of Object.entries(STATE.history.chats)) {
-    const ids = remoteIds[addr];
-    for (const m of c.msgs) {
-      if ((!ids || !ids.has(m.id)) && m.o <= remoteMax) localOnly.push([addr, m, m.o <= (c.read || 0)]);
-    }
-  }
-  localOnly.sort((x, y) => msgCompare(x[1], y[1]));
-  let next = Math.max(remoteMax, STATE.lastOrder);
-  for (const [addr, m, wasRead] of localOnly) {
-    m.o = ++next;
-    if (wasRead) STATE.history.chats[addr].read = m.o;
-  }
-  STATE.history = mergeHistory(remote.data, STATE.history);
-  STATE.historyVersion = remote.version;
-  STATE.historyCount = Math.max(STATE.historyCount, remote.count);
-  STATE.lastOrder = Math.max(STATE.lastOrder, next);
-  for (const c of Object.values(STATE.history.chats)) {
-    STATE.lastOrder = Math.max(STATE.lastOrder, c.read || 0);
-    for (const m of c.msgs) STATE.lastOrder = Math.max(STATE.lastOrder, m.o);
+  const run = S.run[l.id];
+  const open = S.active === l.id && run && run.loaded;
+  const newer = (r.rv || 0) > (l.rv || 0);
+  if (newer) for (const k of ["name", "keep", "shots", "rq", "ro", "rv"]) l[k] = r[k];
+  if (!l.keep) { l.hist = ""; return; }
+  if (r.hist && r.hist !== l.hist) {
+    // Verlauf: Ist der Chat hier gerade offen, werden beide Stände vereint.
+    // Sonst gilt der Stand des anderen Geräts (dieses hat ihn nicht verändert).
+    if (open) _histMerges.push([l.id, r.hist]);
+    else { l.hist = r.hist; if (run) run.loaded = false; }
   }
 }
 
-function chatOf(addr, create=false) {
-  let c = STATE.history.chats[addr];
-  if (!c && create) { c = emptyChat(); STATE.history.chats[addr] = c; }
-  return c || null;
-}
-
-function addMessage(addr, msg) {
-  const c = chatOf(addr, true);
-  if (c.msgs.some(m => m.id === msg.id) || c.gone.includes(msg.id)) return false;
-  c.msgs.push(msg);
-  c.msgs.sort(msgCompare);
-  STATE.lastOrder = Math.max(STATE.lastOrder, msg.o);
-  return true;
-}
-
-// Entfernt Nachrichten spurlos aus einem Chat: kein Platzhalter, kein Hinweis.
-// Die Kennungen bleiben intern gemerkt, damit nichts wieder eingespielt wird.
-// dropAtt: zugehörige Anhänge auch auf dem Server löschen.
-function removeMessages(addr, ids, dropAtt) {
-  const c = chatOf(addr);
-  if (!c || !ids.length) return 0;
-  const set = new Set(ids);
-  const removed = c.msgs.filter(m => set.has(m.id));
-  if (!removed.length) return 0;
-  c.msgs = c.msgs.filter(m => !set.has(m.id));
-  c.gone = sanitizeGone([...c.gone, ...removed.map(m => m.id)]);
-  // Ein offenes Menü könnte sich auf eine eben entfernte Nachricht beziehen.
-  if (STATE.activeChat === addr) { try { closeSheet(); } catch (e) {} }
-  for (const m of removed) {
-    const tok = m.a && m.a.t;
-    if (!tok) continue;
-    const pending = MEDIA_URLS.get(tok);
-    if (pending) { Promise.resolve(pending).then(u => { try { URL.revokeObjectURL(u); } catch (e) {} }).catch(() => {}); MEDIA_URLS.delete(tok); }
-    if (dropAtt) API.deleteAttachment(tok).catch(() => {});
+function mergeAccount(local, remote) {
+  const gone = new Set([...remote.gone, ...local.gone]);
+  const mine = new Map(local.ch.map(c => [c.id, c]));
+  const out = [], seen = new Set();
+  for (const c of local.ch) if (!gone.has(c.id)) { out.push(c); seen.add(c.id); }
+  for (const rc of remote.ch) {
+    if (gone.has(rc.id)) continue;
+    if (seen.has(rc.id)) mergeChannel(mine.get(rc.id), rc);
+    else out.push(rc);
   }
-  STATE.historyDirty = true;
-  return removed.length;
+  for (const c of local.ch) if (gone.has(c.id)) dropRuntime(c.id);
+  local.ch = out;
+  local.gone = Array.from(gone).slice(-300);
+  if ((remote.set.rv || 0) > (local.set.rv || 0)) local.set = remote.set;
+  local.notes = Array.from(new Set([...remote.notes, ...local.notes])).slice(-20);
+}
+function dropRuntime(id) {
+  if (S.active === id) { try { closeChannel(true); } catch (e) {} }
+  const r = S.run[id];
+  if (r) { freeUrls(r); for (const t of r.tags) S.expect.delete(t); }
+  delete S.run[id];
 }
 
-// Löschfrist: Nachrichten, deren Frist abgelaufen ist, verschwinden auf diesem
-// Gerät. Das Gegenüber macht dasselbe mit seiner Kopie. Läuft alle paar Sekunden.
-function purgeExpired() {
-  if (!STATE.me || !STATE.historyLoaded) return false;
-  const now = Math.floor(Date.now() / 1000);
-  let n = 0, active = false;
-  for (const [addr, c] of Object.entries(STATE.history.chats)) {
-    const ids = c.msgs.filter(m => m.e && m.e <= now).map(m => m.id);
-    if (!ids.length) continue;
-    n += removeMessages(addr, ids, true);
-    if (addr === STATE.activeChat) active = true;
-  }
-  if (n) { renderSidebar(); if (active) renderChat(); scheduleHistorySave(); }
-  return n > 0;
-}
-
-// Einmal-Ansicht: beim Verlassen eines Chats verschwinden dort meine eigenen
-// Einmal-Nachrichten und alle Einmal-Nachrichten des Gegenübers, die ich schon
-// gesehen habe.
-function purgeOnce(addr) {
-  const c = chatOf(addr);
-  if (!c) return 0;
-  const mine = c.msgs.filter(m => m.q && m.me).map(m => m.id);
-  const seen = c.msgs.filter(m => m.q && !m.me && m.o <= (c.read || 0)).map(m => m.id);
-  const n = removeMessages(addr, mine, false) + removeMessages(addr, seen, true);
-  if (n) scheduleHistorySave();
-  return n;
-}
-
-// Wird immer aufgerufen, wenn der gerade offene Chat verlassen wird.
-function leaveChat() {
-  const addr = STATE.activeChat;
-  if (!addr) return;
-  stopRecording(true);          // eine laufende Sprachaufnahme gehört zu diesem Chat
-  stashDraft();
-  purgeOnce(addr);
-}
-
-// Regeln, die beim Senden für meine Nachricht in diesem Chat gelten.
-function outgoingRules(peer) {
-  const c = chatOf(peer);
-  const r = c ? sanitizeRules(c.rules) : emptyRules();
-  const out = {};
-  if (r.ttl > 0) {
-    out.ttl = Math.max(1, Math.round(r.ttl * 60));
-    out.exp = Math.floor(Date.now() / 1000) + out.ttl;
-  }
-  if (r.once) out.once = 1;
-  return out;
-}
-function ruleFields(rule) {
-  const f = {};
-  if (rule.exp) f.e = rule.exp;
-  if (rule.once) f.q = 1;
-  return f;
-}
-
-// Lösch-Auftrag vom Gegenüber: jeder darf in einem Chat jede Nachricht (eigene
-// und fremde) bei beiden entfernen. Gilt nur für den Chat mit genau diesem Absender.
-function applyDeleteControl(sender, body) {
-  const c = chatOf(sender);
-  if (!c) return false;
-  const clean = (x) => (Array.isArray(x) ? x : []).filter(v => typeof v === "string" && v && v.length <= 60).slice(0, 500);
-  const theirs = clean(body.mine).map(x => "r-" + x);          // Nachrichten des Absenders (bei mir mit Präfix)
-  const mineRaw = new Set(clean(body.yours));                   // meine Nachrichten (bei mir ohne Präfix)
-  const ids = theirs.concat(c.msgs.filter(m => m.me && mineRaw.has(m.id)).map(m => m.id));
-  // Kennungen, die noch gar nicht angekommen sind, merken wir nur bei Kontakten
-  // (sonst könnte ein Fremder den Verlauf mit erfundenen Kennungen aufblähen).
-  if (isContact(sender)) c.gone = sanitizeGone([...c.gone, ...theirs]);
-  removeMessages(sender, ids, true);
-  STATE.historyDirty = true;
-  return true;
-}
-
-// Entfernt Nachrichten bei mir und gibt dem Gegenüber den Auftrag, sie ebenfalls
-// zu entfernen. Der Auftrag nennt immer die einzelnen Kennungen (nie "alles"):
-// so trifft er nur, was beim Abschicken da war, auch wenn er verspätet ankommt.
-async function deleteForBoth(peer, msgs, all=false) {
-  const c = chatOf(peer, true);
-  const list = all ? [...c.msgs] : msgs;
-  const mine = list.filter(m => m.me).map(m => m.id);
-  const yours = list.filter(m => !m.me && m.id.startsWith("r-")).map(m => m.id.slice(2));
-  const entries = [];
-  for (let i = 0; i < Math.max(mine.length, yours.length, 1); i += 500) {
-    const part = { mine: mine.slice(i, i + 500), yours: yours.slice(i, i + 500) };
-    if (part.mine.length || part.yours.length) entries.push({ id: LehnoCrypto.b64(LehnoCrypto.randomBytes(9)), p: peer, b: part });
-  }
-  removeMessages(peer, list.map(m => m.id), true);
-  if (all) c.read = Math.max(c.read || 0, STATE.lastOrder);
-  STATE.history.ctl = sanitizeCtl([...(STATE.history.ctl || []), ...entries]);
-  STATE.historyDirty = true;
-  renderSidebar();
-  renderChat();
-  const saved = await saveHistory();
-  flushControls();
-  return saved;
-}
-
-let _ctlRunning = false;
-async function flushControls() {
-  if (_ctlRunning || !STATE.me) return;
-  _ctlRunning = true;
-  const sid = STATE.sid, me = STATE.me;
-  try {
-    for (const entry of [...(STATE.history.ctl || [])]) {
-      if (sid !== STATE.sid) return;
-      try {
-        await sendBody(me, sid, entry.p, { msg_type: "delete", ...entry.b });
-      } catch (e) {
-        if (e && (e.status === 404 || e.status === 400 || e.status === 422)) { /* Gegenüber gibt es nicht mehr: Auftrag verwerfen */ }
-        else break;      // später erneut versuchen
-      }
-      if (sid !== STATE.sid) return;
-      STATE.history.ctl = (STATE.history.ctl || []).filter(x => x.id !== entry.id);
-      scheduleHistorySave();
-    }
-  } finally {
-    _ctlRunning = false;
-  }
-}
-
-function unreadCount(addr) {
-  const c = chatOf(addr);
-  if (!c) return 0;
-  let n = 0;
-  for (const m of c.msgs) if (!m.me && m.o > (c.read || 0)) n++;
-  return n;
-}
-
-function lastMsg(addr) {
-  const c = chatOf(addr);
-  return c && c.msgs.length ? c.msgs[c.msgs.length - 1] : null;
-}
-
-// Adressen, die uns geschrieben haben, aber (noch) kein Kontakt sind.
-function requestAddresses() {
-  const out = [];
-  for (const [addr, c] of Object.entries(STATE.history.chats)) {
-    if (isContact(addr) || STATE.declined.includes(addr)) continue;
-    if (c.msgs.some(m => !m.me)) out.push(addr);
-  }
-  return out;
-}
-
-async function fetchRemoteHistory() {
-  const resp = await API.get("/api/history");
-  const version = resp.version || 0;
-  if (!resp.ciphertext_b64) return { version, data: emptyHistory(), count: 0 };
-  const plain = await LehnoCrypto.decryptHistory(STATE.me.kek, resp);
-  return { version, data: sanitizeHistory(plain), count: Number.isFinite(plain?._n) ? plain._n : 0 };
-}
-
-async function loadHistory() {
-  const sid = STATE.sid;
-  const remote = await fetchRemoteHistory();   // wirft bei Fehler -> historyLoaded bleibt false
-  if (sid !== STATE.sid) return;
-  if (isRollback("h", remote.count)) {
-    toast("Achtung: Der Server liefert einen älteren Stand deines Verlaufs als dieses Gerät zuletzt gesehen hat.", "err");
-  }
-  adoptRemoteHistory(remote);
-  STATE.historyLoaded = true;
-  noteSeen("h", remote.count);
-}
-
-// Passt der Verlauf nicht mehr in die größte Ablage (4 MB), wird gekürzt:
-// zuerst bei Adressen, die kein Kontakt sind, erst danach fallen die ältesten
-// Nachrichten der echten Chats weg. Die Kennungen bleiben gemerkt, damit
-// Gelöschtes nicht erneut eingespielt werden kann.
-function trimHistoryToFit() {
-  const fits = () => LehnoCrypto.historyFits({ ...STATE.history, _n: STATE.historyCount + 1 });
-  if (fits()) return;
-  // 1) Leere Hüllen fremder Adressen entfernen.
-  for (const [addr, c] of Object.entries(STATE.history.chats)) {
-    if (!c.msgs.length && !c.gone.length && !STATE.contacts.find(x => x.address === addr)) delete STATE.history.chats[addr];
-  }
-  let guard = 0;
-  while (!fits() && guard++ < 400) {
-    const strangers = [], known = [];
-    for (const [addr, c] of Object.entries(STATE.history.chats)) {
-      const list = isContact(addr) ? known : strangers;
-      for (const m of c.msgs) list.push([m.o, addr, m.id]);
-    }
-    if (!strangers.length) {
-      // Bevor echte Chats gekürzt werden: leere Reste fremder Adressen (nur
-      // gemerkte Kennungen, keine Nachrichten) vollständig entfernen.
-      let dropped = false;
-      for (const [addr, c] of Object.entries(STATE.history.chats)) {
-        if (!c.msgs.length && !isContact(addr)) { delete STATE.history.chats[addr]; dropped = true; }
-      }
-      if (dropped) continue;
-    }
-    const pool = strangers.length ? strangers : known;
-    if (!pool.length) {
-      // Keine Nachrichten mehr: dann sind es die gemerkten Kennungen.
-      let cut = false;
-      for (const c of Object.values(STATE.history.chats)) {
-        if (c.gone.length) { c.gone = c.gone.slice(-Math.floor(c.gone.length / 2)); cut = true; }
-      }
-      if (!cut) break;
-      continue;
-    }
-    pool.sort((x, y) => x[0] - y[0]);
-    const drop = pool.slice(0, Math.max(20, Math.floor(pool.length / 20)));
-    for (const [, addr, id] of drop) {
-      const c = STATE.history.chats[addr];
-      c.msgs = c.msgs.filter(m => m.id !== id);
-      c.gone = sanitizeGone([...c.gone, id]);
-    }
-  }
-}
-
-// Alle Speichervorgänge laufen nacheinander (nie zwei gleichzeitig).
-let _histChain = Promise.resolve(true);
-function saveHistory() {
-  _histChain = _histChain.then(doSaveHistory, doSaveHistory);
-  return _histChain;
-}
-
-async function doSaveHistory() {
-  const sid = STATE.sid;
-  if (!STATE.me?.kek) return false;
-  if (!STATE.historyLoaded) {
-    // Verlauf konnte beim Anmelden nicht geladen werden: erst nachladen, damit
-    // wir nichts überschreiben.
-    try { await loadHistory(); } catch (e) { if (sid === STATE.sid) STATE.historyDirty = true; return false; }
-    if (sid !== STATE.sid || !STATE.historyLoaded) return false;
-  }
+// Alle Speichervorgänge laufen nacheinander.
+let _saveChain = Promise.resolve(true);
+let _saveWarned = false;
+function saveAccount() { _saveChain = _saveChain.then(doSave, doSave); return _saveChain; }
+async function doSave() {
+  const sid = S.sid;
+  if (!S.me || !S.acct) return false;
+  let work = "";
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      trimHistoryToFit();
-      const n = STATE.historyCount + 1;
-      const enc = await LehnoCrypto.encryptHistory(STATE.me.kek, { ...STATE.history, _n: n });
-      const resp = await API.put("/api/history", { ...enc, expected_version: STATE.historyVersion });
-      if (sid !== STATE.sid) return false;
-      STATE.historyVersion = resp.version;
-      STATE.historyCount = n;
-      STATE.historyDirty = false;
-      noteSeen("h", n);
+      const blobs = await accountBlobs();
+      const body = { ...blobs, expected_version: S.version };
+      if (work) body.work = work;
+      const r = await api("PUT", "/api/v2/account", { auth: true, keepalive: true, json: body });
+      if (sid !== S.sid) return false;
+      S.version = r.version;
+      if (!_saveTimer) S.urgent = false;
+      S.dirty = false;
+      if (_saveWarned) { _saveWarned = false; setSync(""); }
       return true;
     } catch (e) {
-      if (sid !== STATE.sid) return false;
-      if (e.status === 409) {
-        try {
-          const remote = await fetchRemoteHistory();
-          if (sid !== STATE.sid) return false;
-          adoptRemoteHistory(remote);
-          renderSidebar();
-          renderChat();
-          continue;
-        } catch (e2) { break; }
+      if (sid !== S.sid) return false;
+      if (e.status === 428) {
+        // Das Konto wächst in eine größere Stufe: einmalige Rechenaufgabe.
+        await loadConfig();
+        const bits = (S.work.account[S.blobClass] || 0) + (S.wipeBig ? (S.work.account_wipe_extra || 2) : 0);
+        if (bits > 28) { setSync("Speichern gerade nicht möglich"); break; }
+        work = await C.work(subject(S.me.id, "g", S.blobClass * 2 + (S.wipeBig ? 1 : 0)), bits);
+        continue;
       }
-      break;
+      if (e.status !== 409) {
+        if (String(e.message) === "too large") { setSync("Konto ist voll"); if (!_saveWarned) toast("Der Speicher für behaltene Verläufe ist voll. Bitte in einem Kanal „Verlauf nicht mehr behalten“ wählen.", "err"); _saveWarned = true; }
+        break;
+      }
+      // Ein anderes Gerät hat gespeichert: Stand holen und zusammenführen.
+      try {
+        const r = await api("GET", "/api/v2/account", { auth: true });
+        if (sid !== S.sid) return false;
+        const remote = sanitizeAccount(await C.openJson(S.me.encKey, C.unb64(r.blob), C.ACCOUNT));
+        mergeAccount(S.acct, remote);
+        S.version = r.version;
+        for (const c of S.acct.ch) runOf(c);
+        await applyHistMerges();
+        await rebuildExpect();
+        renderList();
+      } catch (e2) { break; }
     }
   }
-  if (sid === STATE.sid) STATE.historyDirty = true;
+  if (sid === S.sid) S.dirty = true;
   return false;
 }
+// Dringend: Dinge, die nicht verloren gehen dürfen (Einstellungen, Zustimmungen, Verlauf).
+let _saveTimer = null;
+function saveSoon() {
+  S.dirty = true;
+  S.urgent = true;
+  if (_saveTimer) return;
+  _saveTimer = setTimeout(() => { _saveTimer = null; saveAccount(); }, 700);
+}
+// Ruhig: Zähler und Kleinigkeiten. Sie gehen mit dem nächsten Hintergrund-Speichern
+// mit, das ohnehin in unregelmäßigen Abständen läuft. So verrät der Zeitpunkt
+// des Speicherns nicht, wann eine Nachricht kam oder ging.
+function saveLazy() { S.dirty = true; }
 
-let _histTimer = null;
-function scheduleHistorySave() {
-  STATE.historyDirty = true;
-  if (_histTimer) clearTimeout(_histTimer);
-  _histTimer = setTimeout(() => { _histTimer = null; saveHistory(); }, 600);
+async function doRegister() {
+  await loadConfig();
+  const L = C.rand(16), W = C.rand(16);
+  const ak = await C.accountKeys(L), wk = await C.wipeKeys(W);
+  const box = await C.newExchangeKey();
+  const acct = emptyAccount(wk.encKey, box.pub, await C.seal(wk.innerKey, C.utf8(JSON.stringify(box.privJwk))));
+  const blob = C.b64(await C.sealJson(ak.encKey, acct, C.ACCOUNT));
+  const wipe_blob = await wipeBlobFor(acct);
+  let r = null;
+  for (let i = 0; i < 3 && !r; i++) {
+    const work = await C.work(subject(ak.id, "a"), S.work.account[0] || 0);
+    try { r = await api("POST", "/api/v2/account", { json: { id: ak.id, auth_hash: ak.authHash, wipe_hash: wk.wipeHash, blob, wipe_blob, work } }); }
+    catch (e) { if (e.status !== 428 || i === 2) throw e; await loadConfig(); }
+  }
+  S.sid++;
+  S.me = { id: ak.id, token: ak.token, encKey: ak.encKey };
+  S.acct = acct;
+  S.version = r.version;
+  showWords(await C.bytesToWords(L), await C.bytesToWords(W));
 }
 
-// Frühere Versionen haben gesendete Nachrichten unverschlüsselt im Browser
-// abgelegt. Diese werden einmalig in den verschlüsselten Verlauf übernommen.
-// Gelöscht werden sie auf dem Gerät erst, wenn das Sichern geklappt hat.
-function migrateLegacyLocal() {
-  const keys = [];
-  const found = [];
+async function doLogin(wordsText) {
+  let L;
+  try { L = await C.wordsToBytes(wordsText, 16); }
+  catch (e) { throw new Error(wordError(e, 12)); }
+  const ak = await C.accountKeys(L);
+  S.sid++;
+  S.me = { id: ak.id, token: ak.token, encKey: ak.encKey };
+  let r;
+  try { r = await api("GET", "/api/v2/account", { auth: true, noLogout: true }); }
+  catch (e) {
+    S.me = null;
+    if (e.status !== 401) throw new Error(e.message || "Anmeldung nicht möglich");
+    // Kein Konto zu diesen Wörtern. Sind es die Löschwörter eines Kontos, wird
+    // jetzt alles unwiderruflich gelöscht. Von außen und auf dem Bildschirm sieht
+    // beides gleich aus: Es gibt kein Konto zu diesen Wörtern.
+    try { await wipeWith(L); } catch (e2) {}
+    throw new Error("Zu diesen Wörtern gibt es kein Konto.");
+  }
+  S.acct = sanitizeAccount(await C.openJson(ak.encKey, C.unb64(r.blob), C.ACCOUNT));
+  S.version = r.version;
+  // Wurde die letzte Sitzung nicht sauber beendet, könnten reservierte Nummern
+  // schon benutzt sein. Dann geht es hinter der Reservierung weiter.
+  for (const c of S.acct.ch) { if (c.pend) continue; c.sn = Math.max(c.sn, c.sr); c.cn = Math.max(c.cn, c.cr); }
+  await startSession();
+}
+
+function wordError(e, count) {
+  const m = String(e && e.message || "");
+  if (m === "count") return `Es müssen genau ${count} Wörter sein.`;
+  if (m.startsWith("word:")) return `Das Wort „${m.slice(5)}“ gibt es in der Wortliste nicht. Bitte Schreibweise prüfen.`;
+  if (m === "checksum") return "Die Wörter passen nicht zusammen. Bitte auf Tippfehler oder falsche Reihenfolge prüfen.";
+  return "Die Wörter konnten nicht gelesen werden.";
+}
+
+// Unwiderrufliches Löschen mit den 12 Löschwörtern. Es gibt dafür keinen eigenen
+// Knopf: Wer bei "Anmelden" die Löschwörter eingibt, löscht alles. Die Anfrage
+// geht bei jeder fehlgeschlagenen Anmeldung raus, egal welche Wörter es waren.
+// Gibt die Zahl der benachrichtigten Kanäle zurück, -1 wenn es kein Konto gab.
+async function wipeWith(W) {
+  const wk = await C.wipeKeys(W);
+  const r = await api("POST", "/api/v2/wipe", { json: { token: wk.token } });
+  if (!r.ok) return -1;
+  await loadConfig();
+  // Die Gegenüber benachrichtigen: jeder gemeinsame Kanal wird bei ihnen aufgelöst.
+  let n = 0;
   try {
-    const prefix = "lehno-mesh:" + STATE.me.address + ":out:";
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith(prefix)) keys.push(k);
-    }
-    for (const k of keys) {
-      const peer = k.slice(prefix.length);
-      let list = [];
-      try { list = JSON.parse(localStorage.getItem(k) || "[]"); } catch (e) {}
-      if (!ADDR_RE.test(peer) || !Array.isArray(list)) continue;
-      for (const old of list) {
-        const ts = Date.parse(old && old.ts) || 0;
-        if (!old || !ts) continue;
-        const msg = { id: "alt-" + String(old.id || ts), me: 1, k: "text", x: "", o: 0 };
-        if (old.msg_type === "image" || old.msg_type === "video") {
-          let meta = {};
-          try { meta = JSON.parse(old.plain || "{}"); } catch (e) {}
-          msg.k = old.msg_type;
-          msg.a = { t: old.attachment_token || "", k: meta.file_key_b64 || "", i: meta.file_iv_b64 || "", m: meta.mime || "", c: meta.caption || "" };
-        } else {
-          msg.x = String(old.plain || "");
+    const data = await C.openJson(wk.encKey, C.unb64(String(r.wipe_blob).replace(/\.+$/, "")), C.WIPE);
+    const priv = JSON.parse(C.fromUtf8(await C.open(wk.innerKey, C.unb64(data.q))));
+    const pub = C.unb64(data.p);
+    for (const entry of (data.e || [])) {
+      try {
+        const own = JSON.parse(C.fromUtf8(await C.boxOpen(priv, pub, C.unb64(entry))));
+        for (let i = 0; i < 4; i++) {
+          let code = 0;
+          try { code = await postDissolve(own, "wipe"); } catch (e) {}
+          if (code === 200 || code === 409) { n++; break; }
+          await sleep(1500 * (i + 1));
         }
-        found.push([ts, peer, msg]);
-      }
+      } catch (e) {}
     }
-  } catch (e) { console.warn("legacy migration", e); }
-  // Die alte Zeitangabe dient nur noch zum Sortieren und wird nicht übernommen.
-  // Alt-Nachrichten kommen in ihrer alten Reihenfolge VOR alles Vorhandene
-  // (Nummern unter null).
-  found.sort((x, y) => x[0] - y[0]);
-  let imported = 0;
-  let minOrder = 0;
-  for (const c of Object.values(STATE.history.chats)) for (const m of c.msgs) minOrder = Math.min(minOrder, m.o);
-  let n = minOrder - found.length - 1;
-  for (const [, peer, msg] of found) {
-    msg.o = ++n;
-    const clean = sanitizeMsg(msg);
-    if (clean && addMessage(peer, clean)) imported++;
+  } catch (e) {}
+  return n;
+}
+
+function showWords(login, wipe) {
+  show("words");
+  for (const [id, words] of [["#words-login", login], ["#words-wipe", wipe]]) {
+    const grid = $(id);
+    grid.textContent = "";
+    words.split(" ").forEach((w, i) => {
+      const d = el("div", "w");
+      d.appendChild(el("span", "w-num", (i + 1) + "."));
+      d.appendChild(el("span", "w-text", w));
+      grid.appendChild(d);
+    });
   }
-  return { imported, keys };
+  _backup = { login, wipe };
+  $("#words-confirm").checked = false;
+  $("#words-continue").disabled = true;
 }
-
-// =========================================================================
-// REGISTER / LOGIN
-// =========================================================================
-async function doRegister(password) {
-  const setup = await LehnoCrypto.setupAccount(password);
-  const resp = await API.post("/api/register", {
-    auth_key_b64: setup.auth_key_b64,
-    salt_b64: setup.salt_b64,
-    identity_pub_b64: setup.identity_pub_b64,
-    signing_pub_b64: setup.signing_pub_b64,
-    keys_blob_b64: setup.keys_blob_b64,
-    keys_nonce_b64: setup.keys_nonce_b64,
-    kek_blob_b64: setup.kek_blob_b64,
-    kek_nonce_b64: setup.kek_nonce_b64,
-    kdf: setup.kdf,
-  });
-  if (resp.address !== setup.address) throw new Error("Server meldet eine falsche Adresse");
-  await loginWithPassword(setup.address, password);
-  const mnemonic = await LehnoBip39.bytesToMnemonic(setup.kek_for_backup);
-  showMnemonic(mnemonic, setup.address);
-}
-
-async function loginWithPassword(address, password) {
-  const init = await API.post("/api/login/init", { address });
-  const kdf = init.kdf === 2 ? 2 : 1;
-  const salt = LehnoCrypto.unb64(String(init.salt_b64 || ""));
-  if (salt.byteLength !== 16) throw new Error("Der Server liefert ungültige Anmeldedaten.");
-  const { auth_key } = await LehnoCrypto.deriveFromPassword(password, salt, kdf);
-  // Ist die Anmeldung für diese Adresse gerade gebremst (viele Fehlversuche),
-  // versuchen wir es ein paar Mal von selbst erneut.
-  let resp = null;
-  for (let attempt = 0; ; attempt++) {
-    try {
-      resp = await API.post("/api/login", { address, auth_key_b64: LehnoCrypto.b64(auth_key) });
-      break;
-    } catch (e) {
-      if (e.status !== 429 || attempt >= 6) throw e;
-      await new Promise(r => setTimeout(r, 1500 + Math.floor(Math.random() * 3000)));
-    }
-  }
-  // unlockAccount berechnet unsere öffentlichen Schlüssel selbst und prüft,
-  // dass sie zur Adresse gehören. Verfahren und Salz nehmen wir aus dem ersten
-  // Schritt, nicht aus der Antwort.
-  const live = await LehnoCrypto.unlockAccount(password, { ...resp, address, kdf, salt_b64: init.salt_b64 });
-  STATE.sid++;
-  STATE.history = emptyHistory();
-  STATE.historyLoaded = false;
-  STATE.me = {
-    address: live.address,
-    jwt: live.jwt,
-    identityPriv: live.identityPriv,
-    signingPriv: live.signingPriv,
-    kek: live.kek,
-    identity_pub_b64: live.identity_pub_b64,
-    signing_pub_b64: live.signing_pub_b64,
-  };
-}
-
-async function doLogin(address, password) {
-  await loginWithPassword(address, password);
-  await afterLogin();
-}
-
-async function doRecover(address, mnemonic, newPassword) {
-  const init = await API.post("/api/recover/init", { address });
-  const finalizePayload = await LehnoCrypto.recoverWithMnemonic(address, mnemonic, newPassword, init);
-  await API.post("/api/recover/finalize", finalizePayload);
-  await doLogin(address, newPassword);
-}
-
-function showMnemonic(mnemonic, address) {
-  show("mnemonic");
-  $("#my-address-display").textContent = address;
-  setLastBackupData(address, mnemonic);
-  const grid = $("#mnemonic-grid");
-  grid.textContent = "";
-  mnemonic.split(" ").forEach((w, i) => {
-    const el = document.createElement("div");
-    el.className = "w";
-    const num = document.createElement("span"); num.className = "w-num"; num.textContent = (i + 1) + ".";
-    const txt = document.createElement("span"); txt.className = "w-text"; txt.textContent = w;
-    el.appendChild(num); el.appendChild(txt);
-    grid.appendChild(el);
-  });
-  $("#mnemonic-confirm").checked = false;
-  $("#mnemonic-continue").disabled = true;
-}
-
-function clearSensitiveInputs() {
-  $$("input[type=password], textarea[name=mnemonic]").forEach(el => { el.value = ""; });
-  $("#mnemonic-grid").textContent = "";
-  setLastBackupData(null, null);
+let _backup = null;
+function downloadWords() {
+  if (!_backup) return;
+  const content = [
+    "chatmesh - Konto-Sicherung", "=".repeat(60), "",
+    "1. ANMELDEWÖRTER (damit meldest du dich an):", "",
+    _backup.login.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"), "",
+    "2. LÖSCHWÖRTER (bei \"Anmelden\" eingeben = alles wird sofort unwiderruflich gelöscht):", "",
+    _backup.wipe.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"), "",
+    "=".repeat(60),
+    "- Wer die Anmeldewörter hat, hat Zugriff auf dein Konto.",
+    "- Wer die Löschwörter bei \"Anmelden\" eingibt, löscht alles: sofort, ohne Rückfrage.",
+    "- Danach sieht es so aus, als hätte es das Konto nie gegeben.",
+    "- Offline aufbewahren (Papier, USB-Stick). Niemals Cloud, niemals Foto.",
+    "- Es gibt keine Wiederherstellung.",
+  ].join("\n");
+  const url = URL.createObjectURL(new Blob([content], { type: "text/plain;charset=utf-8" }));
+  const a = document.createElement("a");
+  a.href = url; a.download = "chatmesh-sicherung.txt";
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { a.remove(); URL.revokeObjectURL(url); }, 200);
 }
 
 function logout(message) {
-  STATE.sid++;
-  for (const t of STATE.timers) clearInterval(t);
-  STATE.timers = [];
+  try { closeChannel(true); } catch (e) {}
+  S.sid++;
+  for (const t of S.timers) clearTimeout(t);
+  S.timers = new Set();
   if (_saveTimer) { clearTimeout(_saveTimer); _saveTimer = null; }
-  if (_histTimer) { clearTimeout(_histTimer); _histTimer = null; }
-  if (_tickTimer) { clearTimeout(_tickTimer); _tickTimer = null; }
-  const ws = STATE.ws;
-  STATE.ws = null;
-  if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} }
-  for (const p of MEDIA_URLS.values()) { Promise.resolve(p).then(u => { try { URL.revokeObjectURL(u); } catch (e) {} }).catch(() => {}); }
-  MEDIA_URLS.clear();
-  STATE.me = null;
-  STATE.pubKeyCache = {};
-  STATE.contacts = [];
-  STATE.nicknames = {};
-  STATE.declined = [];
-  STATE.history = emptyHistory();
-  STATE.historyVersion = 0;
-  STATE.historyCount = 0;
-  STATE.historyLoaded = false;
-  STATE.historyDirty = false;
-  STATE.userdataVersion = 0;
-  STATE.userdataCount = 0;
-  STATE.userdataDirty = false;
-  STATE.activeChat = null;
-  STATE.mediaAllowed = new Set();
-  STATE.drafts = {};
-  for (const q of STATE.outQueue) { try { q.reject(new SessionChanged()); } catch (e) {} }
-  STATE.outQueue = [];
-  STATE.cover = true;
+  for (const k of Object.keys(_histTimers)) { clearTimeout(_histTimers[k]); delete _histTimers[k]; }
   stopRecording(true);
-  STATE.lastOrder = 0;
-  _userdataLoaded = false;
-  _histChain = Promise.resolve(true);
-  _udChain = Promise.resolve(true);
-  _lastFailed = null;
-  _sendChain = Promise.resolve();
-  for (const id of ["#chat-stream", "#chat-header", "#contact-list", "#request-list",
-                    "#me-address-full", "#my-address-display"]) {
-    $(id).textContent = "";
-  }
+  stopScan();
+  for (const r of Object.values(S.run)) freeUrls(r);
+  S.me = null; S.acct = null; S.version = 0; S.dirty = false; S.urgent = false; S.blobLen = 0;
+  S.pile = new Map(); S.pileBytes = 0; S.cursor = 0; S.synced = false; S.expect = new Map(); S.run = {}; S.active = null;
+  _saveChain = Promise.resolve(true);
+  _backup = null;
+  for (const id of ["#chat-stream", "#chat-header", "#channel-list", "#notes", "#words-login", "#words-wipe"]) $(id).textContent = "";
   $("#msg-input").value = "";
-  $("#new-chat-address").value = "";
-  hideMyAddress();
-  $("#view-chat").classList.remove("sidebar-collapsed");
-  $("#view-chat").classList.remove("peek-chat");
-  clearSensitiveInputs();
-  const remembered = getRememberedAddress();
-  $$("#form-login input[name=address], #form-recover input[name=address]").forEach(el => { el.value = remembered; });
-  document.title = APP_NAME;
-  // Nach dem Abmelden immer das Anmelde-Formular zeigen (nicht das Registrieren).
+  $$("textarea[name=words]").forEach(t => { t.value = ""; });
+  $("#view-chat").classList.remove("peek-chat", "sidebar-collapsed");
+  closeSheet();
   $$("#view-auth .tab").forEach(x => x.classList.toggle("active", x.dataset.tab === "login"));
   $$("#view-auth .auth-form").forEach(f => f.classList.toggle("active", f.id === "form-login"));
-  closeSheet();
+  document.title = APP_NAME;
   show("auth");
   $("#auth-msg").textContent = typeof message === "string" ? message : "";
 }
 
-async function afterLogin() {
-  const sid = STATE.sid;
-  hideMyAddress();
-  clearSensitiveInputs();
-  let loadProblem = false;
-  try { await loadUserdata(); } catch (e) { console.warn("loadUserdata failed", e); loadProblem = true; }
-  if (sid !== STATE.sid) return;
-  try { await loadHistory(); } catch (e) { console.warn("loadHistory failed", e); loadProblem = true; }
-  if (sid !== STATE.sid) return;
-  if (STATE.historyLoaded) {
-    const legacy = migrateLegacyLocal();
-    if (legacy.keys.length) {
-      const saved = legacy.imported > 0 ? await saveHistory() : true;
-      if (sid !== STATE.sid) return;
-      if (saved) { for (const k of legacy.keys) { try { localStorage.removeItem(k); } catch (e) {} } }
-    }
-  }
-  if (STATE.historyLoaded) {
-    // Beim Anmelden ist kein Chat offen: alles, was als Einmal-Ansicht schon
-    // gesehen oder selbst gesendet wurde, und alles Abgelaufene ist weg.
-    for (const addr of Object.keys(STATE.history.chats)) purgeOnce(addr);
-    purgeExpired();
-  }
+async function startSession() {
+  const sid = S.sid;
+  S.lastInput = Date.now();
+  for (const c of S.acct.ch) runOf(c);
   show("chat");
-  renderSidebar();
+  renderList();
   renderChat();
-  if (loadProblem) toast("Verlauf oder Kontakte konnten nicht geladen werden. Es wird weiter versucht.", "err");
-  if (!STATE.cover) startWebSocket();
-  startTimers();
-  startTick();
-  await pollInbox();
-  flushControls();
+  setSync("Synchronisiere …");
+  await loadConfig();
+  // Erst ausrechnen, welche Marken uns gehören, dann den Haufen laden. So geht
+  // auch bei einem sehr großen Haufen nichts Eigenes verloren.
+  await rebuildExpect();
+  if (sid !== S.sid) return;
+  try { await pileSync(true); } catch (e) {}
+  if (sid !== S.sid) return;
+  S.synced = true;
+  setSync("");
+  renderList();
+  startLoops();
+}
+function setSync(text) { const e = $("#sync-state"); if (e) e.textContent = text; }
+
+// =========================================================================
+// KANÄLE: Laufzeitdaten und Erwartungen
+// =========================================================================
+function chan(id) { return S.acct ? S.acct.ch.find(c => c.id === id) : null; }
+function runOf(c) {
+  // kMsg/kDel/own: nur nach Eingabe des Kanal-Passworts vorhanden.
+  // wait: wartende Nachrichten, cwait: wartende stille Steuerzeichen.
+  // ps: Geheimnisse einer offenen Einladung (nur in dieser Sitzung).
+  // ok: bis zu welcher Nummer diese Sitzung bestätigt reserviert hat (je Spur).
+  if (!S.run[c.id]) S.run[c.id] = { kMsg: null, kDel: null, own: null, ps: null, ok: {}, msgs: [], wait: new Map(), cwait: new Map(), top: {}, seen: new Set(), urls: [], tags: [], loaded: false, flush: null };
+  return S.run[c.id];
+}
+const peerDir = (c) => c.dir === "a" ? "b" : "a";
+const unlocked = (c) => !!(S.run[c.id] && S.run[c.id].kMsg);
+
+// Rechnet für einen Kanal aus, unter welchen Marken als Nächstes etwas für uns
+// liegen kann, und merkt sie vor. Schon verarbeitete Nummern werden nie wieder
+// angenommen: ein alter Block lässt sich nicht noch einmal unterschieben.
+async function refreshExpect(c) {
+  const r = runOf(c);
+  for (const t of r.tags) S.expect.delete(t);
+  r.tags = [];
+  const add = (tag, info) => { S.expect.set(tag, info); r.tags.push(tag); };
+  if (c.pend) {
+    if (!c.pend.ans) add(c.pend.tb, { id: c.id, kind: "ans" });
+    return;
+  }
+  const kt = C.unb64(c.kt), p = peerDir(c);
+  for (const [lane, base, map, done] of [["", c.rn || 0, r.wait, c.rp], ["c", c.rc || 0, r.cwait, c.rpc]]) {
+    let top = base;
+    for (const k of map.keys()) if (k + 1 > top) top = k + 1;
+    const from = Math.max(0, base - WINDOW_BACK), to = top + WINDOW_AHEAD;
+    r.top[lane] = to;
+    const used = new Set(done);
+    const tags = await C.msgTags(kt, p + lane, from, to);
+    for (let n = from; n < to; n++) {
+      if (map.has(n) || used.has(n)) continue;
+      add(tags[n - from], { id: c.id, kind: "msg", lane, n });
+    }
+  }
+  add(c.pd.t, { id: c.id, kind: "dis" });
+}
+async function rebuildExpect() {
+  S.expect = new Map();
+  if (!S.acct) return;
+  for (const c of S.acct.ch) { runOf(c).tags = []; await refreshExpect(c); }
+  await matchPile();
+}
+// Sucht im schon geladenen Haufen nach vorgemerkten Marken.
+async function matchPile() {
+  const hits = [];
+  for (const [tag, info] of S.expect) { if (S.pile.has(tag)) hits.push([tag, info]); }
+  for (const [tag, info] of hits) await onMatch(tag, info, S.pile.get(tag));
 }
 
 // =========================================================================
-// INBOX
+// DER HAUFEN: abrufen und zuordnen
 // =========================================================================
-let _pollRunning = false;
-let _pollAgain = false;
-
-async function pollInbox() {
-  if (!STATE.me) return;
-  if (_pollRunning) { _pollAgain = true; return; }
-  _pollRunning = true;
+function parsePile(buf) {
+  const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+  const out = [];
+  let o = 0;
+  while (o + 28 <= buf.length) {
+    const seq = dv.getUint32(o) * 4294967296 + dv.getUint32(o + 4);
+    const len = dv.getUint32(o + 24);
+    if (o + 28 + len > buf.length) break;
+    out.push([seq, C.hex(buf.subarray(o + 8, o + 24)), buf.slice(o + 28, o + 28 + len)]);
+    o += 28 + len;
+  }
+  return out;
+}
+function pileStore(tag, block) {
+  const old = S.pile.get(tag);
+  if (old) S.pileBytes -= old.byteLength;
+  S.pile.set(tag, block);
+  S.pileBytes += block.byteLength;
+}
+function pileDrop(tag) {
+  const old = S.pile.get(tag);
+  if (old) { S.pileBytes -= old.byteLength; S.pile.delete(tag); }
+}
+let _syncing = false;
+async function pileSync(initial) {
+  if (_syncing || !S.me) return;
+  _syncing = true;
+  const sid = S.sid;
   try {
-    do {
-      _pollAgain = false;
-      await pollInboxOnce();
-    } while (_pollAgain && STATE.me);
-  } catch (e) {
-    console.warn("inbox poll", e && e.message);
-  } finally {
-    _pollRunning = false;
-  }
-}
-
-async function packetFallbackId(p) {
-  const h = new Uint8Array(await crypto.subtle.digest("SHA-256", LehnoCrypto.utf8(p.ephemeral_pub_b64 + "|" + p.nonce_b64)));
-  return "p-" + LehnoCrypto.b64(h.slice(0, 12));
-}
-
-async function pollInboxOnce() {
-  const sid = STATE.sid;
-  for (let round = 0; round < 40 && STATE.me && sid === STATE.sid; round++) {
-    const r = await API.get("/api/packets/inbox?limit=50");
-    if (sid !== STATE.sid) return;
-
-    // Hat ein anderes Gerät den Verlauf geändert? Dann zuerst nachladen.
-    if (STATE.historyLoaded && r.history_version !== STATE.historyVersion && !STATE.historyDirty) {
-      try {
-        const remote = await fetchRemoteHistory();
-        if (sid !== STATE.sid) return;
-        if (remote.version !== STATE.historyVersion) {
-          adoptRemoteHistory(remote);
-          renderSidebar();
-          renderChat();
+    for (let round = 0; round < 400; round++) {
+      const resp = await api("GET", "/api/v2/pile?since=" + S.cursor, { raw: true });
+      const state = String(resp.headers.get("X-Pile") || "ende:" + S.cursor + ":0").split(":");
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      if (sid !== S.sid) return;
+      for (const [seq, tag, block] of parsePile(buf)) {
+        if (seq > S.cursor) S.cursor = seq;
+        const info = S.expect.get(tag);
+        if (info) await onMatch(tag, info, block);
+        else pileStore(tag, block);
+        if (sid !== S.sid) return;
+      }
+      // Arbeitsspeicher begrenzen: die ältesten nicht zugeordneten Blöcke fallen weg.
+      if (S.pile.size > LIM.keep || S.pileBytes > LIM.bytes) {
+        for (const k of S.pile.keys()) {
+          if (S.pile.size <= LIM.keep * 0.9 && S.pileBytes <= LIM.bytes * 0.9) break;
+          pileDrop(k);
         }
-      } catch (e) { console.warn("history refresh", e && e.message); }
+      }
+      if (initial) setSync("Synchronisiere … " + S.pile.size + " Blöcke");
+      if (state[0] !== "weiter") break;
     }
+  } finally { _syncing = false; }
+}
+// Sucht gezielt nach bestimmten Marken im ganzen Haufen (für das Einlösen
+// eines Einmal-Codes). Verändert nichts am eigenen Stand.
+async function scanFor(tags) {
+  const found = {};
+  let cursor = 0;
+  for (let round = 0; round < 400; round++) {
+    const resp = await api("GET", "/api/v2/pile?since=" + cursor, { raw: true });
+    const state = String(resp.headers.get("X-Pile") || "ende:0:0").split(":");
+    for (const [seq, tag, block] of parsePile(new Uint8Array(await resp.arrayBuffer()))) {
+      if (seq > cursor) cursor = seq;
+      if (tags.includes(tag)) found[tag] = block;
+    }
+    if (state[0] !== "weiter") break;
+  }
+  return found;
+}
 
-    const ackIds = [];
-    let changed = false;
-    const incomingFor = new Set();
+async function onMatch(tag, info, block) {
+  const c = chan(info.id);
+  S.expect.delete(tag);
+  pileDrop(tag);
+  if (!c) return;
+  const r = runOf(c);
+  if (info.kind === "ans") {
+    if (!c.pend) return;
+    if (c.pend.exp <= nowSec()) { expireInvites(); return; }
+    if (r.ps) await completeInvite(c, block, r.ps);
+    else { c.pend.ans = C.b64(block); saveSoon(); renderList(); toast("Jemand ist „" + c.name + "“ beigetreten. Kanal antippen und Passwort eingeben.", "ok"); }
+    return;
+  }
+  if (info.kind === "dis") {
+    try {
+      const body = await C.openJson(C.unb64(c.pd.k), block, C.BLOCK);
+      queueDelete(tag, c.pd.d);
+      dissolveLocal(c, String(body.r || "deleted"), false);
+    } catch (e) { await refreshExpect(c); }
+    return;
+  }
+  // Nachricht oder Steuerzeichen: bleibt verschlossen liegen, bis der Chat geöffnet wird.
+  (info.lane ? r.cwait : r.wait).set(info.n, block);
+  if (info.n + 32 >= (r.top[info.lane] || 0)) await refreshExpect(c);
+  if (S.active === c.id && r.kMsg) await processWaiting(c);
+  else renderList();
+}
 
-    for (const p of r.packets) {
-      let body, unverified = false;
-      try {
-        body = await LehnoCrypto.decryptMessage(STATE.me, p);
-      } catch (e) {
-        body = null;
-        // Alt-Paket von vor dem Update? Lesbar machen, aber kennzeichnen.
-        if (p.signature_b64) {
-          try { body = await LehnoCrypto.decryptLegacyMessage(STATE.me, p); unverified = true; } catch (e2) { body = null; }
-        }
-        if (!body) {
-          // Nicht entschlüsselbar oder Absender-Nachweis ungültig: verwerfen.
-          console.warn("packet rejected", e && e.message);
-          ackIds.push(p.id);
-          continue;
-        }
+// Öffnet alle wartenden Blöcke eines Kanals (nur wenn der Chat offen ist),
+// löscht sie sofort vom Server und zeigt sie an.
+let _processing = false;
+async function processWaiting(c) {
+  const r = runOf(c);
+  if (_processing || !r.kMsg || S.active !== c.id) return;
+  _processing = true;
+  const sid = S.sid, kMsg = r.kMsg, kDel = r.kDel;
+  const alive = () => sid === S.sid && S.active === c.id && r.kMsg === kMsg;
+  try {
+    const p = peerDir(c), kt = C.unb64(c.kt);
+    const seenIds = [];
+    const jobs = [];
+    let advanced = false;
+    // Erst die Nachrichten, dann die stillen Steuerzeichen.
+    for (const [lane, map, key, doneKey] of [["", r.wait, "rn", "rp"], ["c", r.cwait, "rc", "rpc"]]) {
+      while (map.size && alive()) {
+        const n = Math.min(...map.keys());
+        const block = map.get(n);
+        let body = null;
+        try { body = await C.openJson(await C.msgKey(kMsg, p + lane, n), block, C.BLOCK); } catch (e) { body = null; }
+        if (!alive()) break;                 // Chat inzwischen verlassen: Block bleibt verschlossen liegen
+        map.delete(n);
+        // Nummer als verarbeitet merken: sie wird nie wieder angenommen.
+        if (n + 1 > (c[key] || 0)) c[key] = n + 1;
+        c[doneKey] = (c[doneKey] || []).filter(x => x !== n && x >= c[key] - WINDOW_BACK);
+        c[doneKey].push(n);
+        advanced = true;
+        jobs.push([p + lane, n]);
+        if (!body || typeof body !== "object") continue;
+        const shown = await handleIncoming(c, body);
+        if (shown) seenIds.push(shown);
       }
-      if (sid !== STATE.sid) return;
-      const sender = body.sender_address;
-      if (!ADDR_RE.test(sender) || STATE.declined.includes(sender)) { ackIds.push(p.id); continue; }
-
-      // Kennung des Absenders. Eingehende Kennungen bekommen ein eigenes Präfix:
-      // so kann das Gegenüber mit einer geschickt gewählten Kennung keine meiner
-      // eigenen Nachrichten verdrängen.
-      const rawId = (typeof body.msg_id === "string" && body.msg_id.length >= 8 && body.msg_id.length <= 40)
-        ? body.msg_id : await packetFallbackId(p);
-      const id = "r-" + rawId;
-      const chat = chatOf(sender) || emptyChat();
-      // Schon vorhanden (doppelte Zustellung) oder von mir gelöscht: nicht erneut anzeigen.
-      if (chat.msgs.some(m => m.id === id) || chat.gone.includes(id)) { ackIds.push(p.id); continue; }
-      // Nachricht an mich selbst: die gesendete Fassung steht schon im Verlauf.
-      if (sender === STATE.me.address && chat.msgs.some(m => m.me && m.id === rawId)) { ackIds.push(p.id); continue; }
-
-      // Lösch-Auftrag des Gegenübers (jeder darf jede Nachricht im gemeinsamen
-      // Chat bei beiden entfernen). Erscheint nie als Nachricht.
-      if (body.msg_type === "delete") {
-        const c2 = chatOf(sender);
-        if (c2 && !unverified) {
-          applyDeleteControl(sender, body);
-          c2.gone = sanitizeGone([...c2.gone, id]);
-          changed = true;
-          incomingFor.add(sender);
-        }
-        ackIds.push(p.id);
-        continue;
-      }
-
-      const known = isContact(sender);
-      if (!known) {
-        // Fremde Adresse: nur begrenzt aufnehmen (siehe REQ_MAX_*).
-        const incoming = chat.msgs.filter(m => !m.me).length;
-        if (incoming >= REQ_MAX_MSGS || (incoming === 0 && requestAddresses().length >= REQ_MAX_CHATS)) {
-          ackIds.push(p.id);
-          continue;
-        }
-      }
-
-      const kind = KINDS.includes(body.msg_type) ? body.msg_type : "text";
-      // Löschfrist des Absenders: zählt ab dem Absenden, egal ob gelesen. Ist
-      // sie schon vorbei, erscheint die Nachricht gar nicht erst.
-      const nowSec = Math.floor(Date.now() / 1000);
-      let expiry = 0;
-      const ttl = Number(body.ttl), exp = Number(body.exp);
-      if (Number.isFinite(ttl) && ttl > 0) {
-        expiry = nowSec + Math.min(ttl, TTL_MAX_MIN * 60);
-        if (Number.isFinite(exp) && exp > 0) expiry = Math.min(expiry, Math.floor(exp));
-        if (expiry <= nowSec) {
-          // Schon abgelaufen: gar nicht erst aufnehmen und nichts dazu merken.
-          if (body.attachment_token && TOKEN_RE.test(String(body.attachment_token))) API.deleteAttachment(body.attachment_token).catch(() => {});
-          ackIds.push(p.id);
-          continue;
-        }
-      }
-      let text = kind === "text" ? String(body.text || "") : "";
-      let caption = typeof body.caption === "string" ? body.caption : "";
-      if (!known) {
-        if (text.length > REQ_MAX_TEXT) text = text.slice(0, REQ_MAX_TEXT) + " … [gekürzt, weil diese Adresse noch kein Kontakt ist]";
-        caption = caption.slice(0, 200);
-      }
-      const msg = sanitizeMsg({
-        id, me: 0, k: kind, u: unverified ? 1 : 0,
-        x: text,
-        a: kind === "text" ? undefined : {
-          t: body.attachment_token, k: body.file_key_b64, i: body.file_iv_b64, m: body.mime, c: caption,
-          n: body.file_name, s: Number(body.file_size),
-        },
-        q: body.once ? 1 : 0,
-        e: expiry,
-        o: nextOrder(),
+    }
+    if (jobs.length) {
+      // Erst im Konto merken, dass diese Nummern verarbeitet sind, dann sofort vom
+      // Server löschen. So lässt sich ein gelesener Block nie wieder unterschieben.
+      saveAccount().catch(() => false).then(async () => {
+        for (const [d, n] of jobs) { try { queueDelete(await C.msgTag(kt, d, n), await C.msgDelToken(kDel, d, n)); } catch (e) {} }
       });
-      if (msg && addMessage(sender, msg)) { changed = true; incomingFor.add(sender); }
-      ackIds.push(p.id);
     }
+    if (advanced) { await refreshExpect(c); await matchPile(); }
+    if (seenIds.length && alive()) sendObj(c, { t: "seen", ids: seenIds.slice(0, 200) }, "c").catch(() => {});
+    renderList();
+    renderChat();
+  } finally { _processing = false; }
+  if ((r.wait.size || r.cwait.size) && S.active === c.id && r.kMsg) processWaiting(c);
+}
 
-    if (changed) {
-      if (STATE.activeChat && incomingFor.has(STATE.activeChat) && !document.hidden) markRead(STATE.activeChat, false);
-      renderSidebar();
-      if (STATE.activeChat && incomingFor.has(STATE.activeChat)) renderChat();
-    }
-    // Erst sichern, dann beim Server löschen. Das gilt auch, wenn ein früherer
-    // Sicherungsversuch gescheitert ist: solange etwas ungesichert im
-    // Arbeitsspeicher liegt, wird nichts bestätigt. Klappt das Sichern nicht,
-    // bleiben die Pakete liegen und werden beim nächsten Abruf erneut geholt.
-    if (ackIds.length) {
-      if (changed || STATE.historyDirty || !STATE.historyLoaded) {
-        const saved = await saveHistory();
-        if (sid !== STATE.sid) return;
-        if (!saved) { toast("Verlauf konnte nicht gesichert werden. Neuer Versuch folgt.", "err"); return; }
-      }
-      try { await API.post("/api/packets/ack", { packet_ids: ackIds }); } catch (e) { return; }
-    }
-    if (!r.more) break;
+// =========================================================================
+// EINGEHENDES
+// =========================================================================
+function clampView(v) { v = Math.floor(Number(v)); return Number.isFinite(v) ? Math.max(VIEW_MIN, Math.min(VIEW_MAX, v)) : VIEW_DEFAULT; }
+function safeName(n) {
+  let s = typeof n === "string" ? n : "";
+  s = s.replace(/[​-‏‪-‮⁦-⁩﻿]/g, "");
+  s = s.replace(/[\u0000-\u001f\u007f<>:"/\\|?*]/g, "_").replace(/^\.+/, "").trim().slice(0, 120);
+  return s || "datei";
+}
+function cleanAtt(a) {
+  if (!a || typeof a !== "object") return null;
+  if (typeof a.t !== "string" || !/^[0-9a-f]{32}$/.test(a.t) || typeof a.k !== "string") return null;
+  return { t: a.t, k: a.k.slice(0, 64), m: typeof a.m === "string" ? a.m.slice(0, 40) : "", n: safeName(a.n), s: Number.isFinite(a.s) ? Math.floor(a.s) : 0 };
+}
+const bump = (c) => { c.rv = (c.rv || 0) + 1; };
+
+async function handleIncoming(c, body) {
+  const r = runOf(c);
+  const t = body.t;
+  if (t === "m") {
+    const id = typeof body.i === "string" && body.i.length >= 6 && body.i.length <= 32 ? "r" + body.i : null;
+    if (!id || r.seen.has(id) || r.msgs.some(m => m.i === id)) return null;
+    if (r.seen.size > 5000) r.seen.clear();
+    r.seen.add(id);
+    const kind = ["image", "video", "voice", "file"].includes(body.k) ? body.k : "text";
+    const m = { i: id, me: 0, k: kind, x: kind === "text" ? String(body.x || "").slice(0, 60000) : "", vs: clampView(body.vs) };
+    if (kind !== "text") { m.a = cleanAtt(body.a); if (!m.a) return null; }
+    if (!c.keep) m.exp = Date.now() + m.vs * 1000;       // Zeit läuft ab dem Öffnen
+    r.msgs.push(m);
+    if (kind !== "text") fetchMedia(c, m);
+    if (c.keep) saveHistorySoon(c);
+    return body.i;
   }
-}
-
-// =========================================================================
-// ANFRAGE AKZEPTIEREN / ABLEHNEN, VERLAUF LÖSCHEN
-// =========================================================================
-function acceptRequest(addr) {
-  ensureContact(addr);
-  renderSidebar();
-  if (STATE.activeChat === addr) renderChat();
-  toast("Kontakt akzeptiert", "ok");
-}
-
-async function clearChat(addr) {
-  const c = chatOf(addr, true);
-  c.gone = sanitizeGone([...c.gone, ...c.msgs.map(m => m.id)]);
-  c.msgs = [];
-  c.read = Math.max(c.read || 0, STATE.lastOrder);
-  return await saveHistory();
-}
-
-async function declineRequest(addr) {
-  if (!STATE.declined.includes(addr)) STATE.declined.push(addr);
-  STATE.contacts = STATE.contacts.filter(c => c.address !== addr);
-  scheduleUserdataSave();
-  if (STATE.activeChat === addr) {
-    $("#msg-input").value = "";
-    STATE.activeChat = null;
-    $("#view-chat").classList.remove("peek-chat");
+  if (t === "seen") {
+    const ids = new Set((Array.isArray(body.ids) ? body.ids : []).filter(x => typeof x === "string"));
+    for (const m of r.msgs) if (m.me && ids.has(m.i)) m.st = "seen";
+    if (c.keep) saveHistorySoon(c);
+    return null;
   }
-  delete STATE.drafts[addr];
-  await clearChat(addr);
-  renderSidebar();
-  renderChat();
-  toast("Anfrage abgelehnt");
-}
-
-function markRead(addr, save=true) {
-  const c = chatOf(addr);
-  const last = lastMsg(addr);
-  if (!c || !last || (c.read || 0) >= last.o) return;
-  c.read = last.o;
-  if (save) scheduleHistorySave();
-}
-
-// =========================================================================
-// SPITZNAMEN
-// =========================================================================
-function setNickname(addr, nick) {
-  const trimmed = (nick || "").trim().slice(0, 60);
-  if (trimmed) STATE.nicknames[addr] = trimmed;
-  else delete STATE.nicknames[addr];
-  scheduleUserdataSave();
-  renderSidebar();
-  if (STATE.activeChat === addr) renderChat();
-}
-
-function promptNickname(addr) {
-  const current = STATE.nicknames[addr] || "";
-  const next = prompt("Spitzname für diesen Kontakt\n\n(verschlüsselt, nur du siehst ihn)", current);
-  if (next === null) return;
-  setNickname(addr, next);
-  toast(next.trim() ? "Spitzname gespeichert" : "Spitzname entfernt", "ok");
-}
-
-// =========================================================================
-// SEITENLEISTE
-// =========================================================================
-let currentList = "chats";
-
-function previewText(m) {
-  if (!m) return "";
-  const who = m.me ? "Du: " : "";
-  if (m.q) return who + "Einmal-Nachricht";
-  if (m.k === "image") return who + "Bild" + (m.a && m.a.c ? ": " + m.a.c : "");
-  if (m.k === "video") return who + "Video" + (m.a && m.a.c ? ": " + m.a.c : "");
-  if (m.k === "voice") return who + "Sprachnachricht";
-  if (m.k === "file") return who + "Datei: " + ((m.a && m.a.n) || "");
-  return who + m.x.replace(/\s+/g, " ").slice(0, 80);
-}
-
-function renderSidebar() {
-  if (!STATE.me) return;
-  const reqs = requestAddresses();
-  $("#req-count").textContent = reqs.length > 0 ? String(reqs.length) : "";
-
-  let totalUnread = 0;
-  for (const addr of chatAddresses()) totalUnread += unreadCount(addr);
-  document.title = (totalUnread + reqs.length > 0 ? "(" + (totalUnread + reqs.length) + ") " : "") + APP_NAME;
-
-  if (currentList === "chats") {
-    $("#contact-list").style.display = "";
-    $("#request-list").style.display = "none";
-    renderContacts();
-  } else {
-    $("#contact-list").style.display = "none";
-    $("#request-list").style.display = "";
-    renderRequests(reqs);
+  if (t === "del") {
+    const ids = new Set((Array.isArray(body.ids) ? body.ids : []).filter(x => typeof x === "string").slice(0, 500));
+    // Kennungen des Gegenübers stehen bei uns mit "r" davor, unsere eigenen ohne.
+    const before = r.msgs.length;
+    r.msgs = r.msgs.filter(m => {
+      const hit = m.me ? ids.has(m.i) : ids.has(m.i.slice(1));
+      if (hit) dropMedia(c, m, true);
+      return !hit;
+    });
+    if (r.msgs.length !== before && c.keep) saveHistorySoon(c);
+    return null;
   }
-}
-
-function contactRow(addr, { isRequest }) {
-  const div = document.createElement("div");
-  div.className = "contact" + (addr === STATE.activeChat ? " active" : "");
-  const last = lastMsg(addr);
-  const unread = unreadCount(addr);
-  const nick = STATE.nicknames[addr];
-  const hasNick = !!(nick && nick.trim());
-  const nameClass = hasNick ? "name is-nick" : "name is-address";
-  const nameContent = hasNick
-    ? `${escapeHtml(nick)}<div class="sub-addr">${escapeHtml(addr)}</div>`
-    : escapeHtml(addr);
-  const preview = isRequest ? "Anfrage: " + previewText(last) : previewText(last);
-  div.innerHTML = `
-    <div class="avatar${isRequest ? " req" : ""}" data-av="1">${escapeHtml(avatarLabel(addr))}</div>
-    <div class="meta">
-      <div class="${nameClass}" title="${escapeHtml(addr)}">${nameContent}</div>
-      <div class="last-row">
-        <div class="last${isRequest ? " warn" : ""}">${escapeHtml(preview || "Noch keine Nachrichten")}</div>
-        ${unread > 0 ? `<span class="unread">${unread > 99 ? "99+" : unread}</span>` : ""}
-      </div>
-    </div>`;
-  if (!isRequest) div.querySelector("[data-av]").style.background = avatarColor(addr);
-  div.addEventListener("click", () => openChat(addr));
-  return div;
-}
-
-function renderContacts() {
-  const list = $("#contact-list");
-  list.textContent = "";
-  const addrs = chatAddresses();
-  if (!addrs.length) {
-    list.innerHTML = '<div class="contact-empty">Noch keine Chats.<br>Füge oben eine Adresse hinzu.</div>';
-    return;
+  if (t === "req" && (body.k === "keep" || body.k === "shots")) {
+    if (c[body.k]) return null;                           // schon eingeschaltet
+    if (!c.rq.includes(body.k)) c.rq.push(body.k);
+    bump(c);
+    saveSoon();
+    if (S.active === c.id) askRequest(c);
+    return null;
   }
-  addrs.sort((a, b) => {
-    const la = lastMsg(a), lb = lastMsg(b);
-    return (lb ? lb.o : 0) - (la ? la.o : 0);
-  });
-  for (const addr of addrs) list.appendChild(contactRow(addr, { isRequest: false }));
+  if (t === "ans" && (body.k === "keep" || body.k === "shots")) {
+    // Gilt nur, wenn wir selbst danach gefragt haben.
+    if (!c.ro.includes(body.k)) return null;
+    c.ro = c.ro.filter(x => x !== body.k);
+    if (body.y) {
+      c[body.k] = 1;
+      if (body.k === "keep") { for (const m of r.msgs) delete m.exp; if (S.active === c.id) r.loaded = true; saveHistorySoon(c); }
+      toast(body.k === "keep" ? "Dein Gegenüber stimmt zu: Verlauf wird behalten." : "Dein Gegenüber stimmt zu: Screenshots sind erlaubt.", "ok");
+    } else toast(body.k === "keep" ? "Dein Gegenüber möchte den Verlauf nicht behalten." : "Dein Gegenüber möchte Screenshots nicht erlauben.");
+    bump(c);
+    saveSoon();
+    return null;
+  }
+  if (t === "set" && (body.k === "keep" || body.k === "shots") && !body.v) {
+    setMode(c, body.k, 0);
+    return null;
+  }
+  return null;
 }
 
-function renderRequests(reqs) {
-  const list = $("#request-list");
-  list.textContent = "";
-  if (!reqs.length) {
-    list.innerHTML = '<div class="contact-empty">Keine offenen Anfragen.</div>';
-    return;
+function setMode(c, kind, value) {
+  const r = runOf(c);
+  c[kind] = value ? 1 : 0;
+  if (kind === "keep" && !value) {
+    c.hist = "";
+    const view = S.acct.set.view;
+    for (const m of r.msgs) if (!m.exp) m.exp = Date.now() + (m.vs || view) * 1000;
   }
-  for (const addr of reqs) list.appendChild(contactRow(addr, { isRequest: true }));
+  if (kind === "keep" && value) { for (const m of r.msgs) delete m.exp; if (S.active === c.id) r.loaded = true; }
+  bump(c);
+  saveSoon();
+  if (S.active === c.id) renderChat();
 }
 
 // =========================================================================
-// CHAT-ANSICHT
+// SENDEN
 // =========================================================================
-// Angefangener Text gehört zu dem Chat, in dem er getippt wurde. Beim Wechsel
-// wird er dort abgelegt und nie in einen anderen Chat mitgenommen.
-function stashDraft() {
-  const input = $("#msg-input");
-  if (STATE.activeChat) {
-    if (input.value) STATE.drafts[STATE.activeChat] = input.value;
-    else delete STATE.drafts[STATE.activeChat];
+// Nummern werden vor der Benutzung im Konto reserviert, je Spur und in kleinen
+// Schritten. Benutzt wird eine Nummer erst, wenn die Reservierung wirklich
+// gespeichert ist. So wird nach einem Absturz oder mit zwei Geräten nie eine
+// Nummer zweimal vergeben.
+const _reserving = {};
+function reserveNumbers(c, key) {
+  const rkey = key === "sn" ? "sr" : "cr", slot = c.id + key;
+  if (!_reserving[slot]) {
+    _reserving[slot] = (async () => {
+      try {
+        c[rkey] = Math.max(c[rkey] || 0, c[key] || 0) + RESERVE;
+        if (!(await saveAccount())) throw new ApiError("Keine Verbindung zum Server", 0);
+        // Nach dem Speichern gilt, was im Konto steht (ein anderes Gerät kann
+        // inzwischen weiter sein: dann ist c[key] schon dahinter gesetzt).
+        if (chan(c.id) === c) runOf(c).ok[key] = c[rkey];
+      } finally { delete _reserving[slot]; }
+    })();
   }
-  input.value = "";
+  return _reserving[slot];
 }
 
-async function openChat(address) {
-  if (STATE.activeChat !== address) {
-    leaveChat();
-    $("#msg-input").value = STATE.drafts[address] || "";
-    delete STATE.drafts[address];
+// Verschließt einen Inhalt und legt ihn als Block auf den Haufen.
+// lane "" = Nachricht, lane "c" = stilles Steuerzeichen (gelesen, gelöscht, Antwort).
+// Gibt die Nummer zurück, unter der er liegt.
+async function sendObj(c, obj, lane = "") {
+  const r = runOf(c);
+  const kMsg = r.kMsg, kDel = r.kDel;
+  if (!kMsg) throw new Error("Kanal ist gesperrt");
+  const sid = S.sid;
+  const key = lane ? "cn" : "sn";
+  const kt = C.unb64(c.kt), dir = c.dir + lane;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    while ((c[key] || 0) >= (r.ok[key] || 0)) { await reserveNumbers(c, key); if (sid !== S.sid) throw new Error("abgemeldet"); }
+    const n = c[key] || 0;
+    c[key] = n + 1;
+    saveLazy();
+    const block = await C.sealJson(await C.msgKey(kMsg, dir, n), obj, C.BLOCK);
+    const code = await pilePost(await C.msgTag(kt, dir, n), block, await C.msgDelToken(kDel, dir, n));
+    if (sid !== S.sid) throw new Error("abgemeldet");
+    if (code === 200) return n;
+    if (code !== 409) throw new ApiError(code === 507 ? "Der Server ist gerade voll." : (code === 429 || code === 428 ? "Der Server ist gerade überlastet, bitte kurz warten." : "Senden nicht möglich"), code);
   }
-  STATE.activeChat = address;
-  STATE.showCount = SHOW_STEP;
-  $("#view-chat").classList.add("peek-chat");
-  markRead(address);
-  renderSidebar();
+  throw new Error("Senden nicht möglich");
+}
+
+function newId() { return C.b64(C.rand(9)); }
+
+function sendText(c, text) {
+  const r = runOf(c);
+  const vs = S.acct.set.view;
+  const m = { i: newId(), me: 1, k: "text", x: text, vs, st: "sending" };
+  const obj = { t: "m", i: m.i, x: text, vs };
+  if (!C.fitsJson(obj, C.BLOCK)) { toast("Die Nachricht ist zu lang.", "err"); return false; }
+  if (!c.keep) m.exp = Date.now() + vs * 1000;
+  r.msgs.push(m);                       // sofort anzeigen, das Senden läuft im Hintergrund
   renderChat(true);
-  fetchPubKey(address).catch(() => {});
+  deliver(c, m, obj, true);
+  return true;
 }
 
-// Holt den öffentlichen Schlüssel einer Adresse und PRÜFT, dass er wirklich zu
-// dieser Adresse gehört (Adresse = Hash des Schlüssels). Der Server kann uns so
-// keinen fremden Schlüssel unterschieben.
-async function fetchPubKey(address) {
-  if (address === STATE.me.address) return STATE.me.identity_pub_b64;
-  if (STATE.pubKeyCache[address]) return STATE.pubKeyCache[address];
-  const r = await API.keys(address);
-  const derived = await LehnoCrypto.addressFromIdentityPubB64(String(r.identity_pub_b64 || ""));
-  if (derived !== address) throw new Error("Der Schlüssel vom Server passt nicht zur Adresse. Es wird NICHT gesendet.");
-  STATE.pubKeyCache[address] = r.identity_pub_b64;
-  return r.identity_pub_b64;
+async function deliver(c, m, obj, canRetry) {
+  const r = runOf(c);
+  try {
+    m.n = await sendObj(c, obj);
+    m.st = "sent";
+    delete m.retry;
+    if (c.keep) saveHistorySoon(c);
+  } catch (e) {
+    m.st = "failed";
+    if (canRetry) m.retry = obj;
+    if (S.me) toast("Nicht gesendet: " + (e.message || "Fehler") + (canRetry ? " Antippen zum Wiederholen." : ""), "err");
+  }
+  if (S.active === c.id && r.msgs.includes(m)) renderChat();
+}
+
+async function uploadAttachment(sealed) {
+  const index = C.FILE_SIZES.indexOf(sealed.byteLength);
+  if (index < 0) throw new Error("Die Datei konnte nicht verarbeitet werden.");
+  const token = C.hex(C.rand(16));
+  for (let i = 0; i < 3; i++) {
+    const work = await C.work(subject(token, "u", index), S.work.upload[index] || 0);
+    const fd = new FormData();
+    fd.append("file", new File([sealed], "block.bin", { type: "application/octet-stream" }));
+    try { await api("POST", "/api/attachments", { body: fd, headers: { "x-work": token + "." + index + "." + work } }); return token; }
+    catch (e) { if (e.status !== 428 || i === 2) throw e; await loadConfig(); }
+  }
+  throw new Error("Hochladen nicht möglich");
+}
+const dropAttachment = (token) => api("DELETE", "/api/attachments/" + token).catch(() => {});
+
+let _uploads = 0;
+async function sendMedia(c, file, kind, name) {
+  _uploads++;
+  try { return await sendMediaInner(c, file, kind, name); }
+  finally { _uploads--; S.lastInput = Date.now(); }
+}
+async function sendMediaInner(c, file, kind, name) {
+  const r = runOf(c);
+  const sid = S.sid, kMsg = r.kMsg;
+  const here = () => sid === S.sid && S.active === c.id && r.kMsg && r.kMsg === kMsg;
+  if (file.size > 16 * 1024 * 1024 - 64) throw new Error("Die Datei ist zu groß (höchstens 16 MB).");
+  toast("Verschlüsseln und senden …");
+  // Zusatzangaben (Ort, Gerät, Aufnahmezeit) entfernen, bevor etwas das Gerät verlässt.
+  let clean;
+  try { clean = kind === "file" ? { bytes: new Uint8Array(await file.arrayBuffer()), mime: "application/octet-stream" } : await window.CMMedia.cleanFile(file, kind); }
+  catch (e) { throw new Error("Die Datei konnte nicht verarbeitet werden."); }
+  if (clean.bytes.byteLength > 16 * 1024 * 1024 - 64) throw new Error("Die Datei ist zu groß (höchstens 16 MB).");
+  const enc = await C.encryptFile(clean.bytes);
+  if (!here()) return;
+  const token = await uploadAttachment(enc.data);
+  // Wurde der Chat währenddessen verlassen, wird nichts gesendet und nichts angezeigt.
+  if (!here()) { dropAttachment(token); return; }
+  const vs = S.acct.set.view;
+  const a = { t: token, k: C.b64(enc.key), m: clean.mime, n: kind === "file" ? safeName(name) : "", s: clean.bytes.byteLength };
+  const m = { i: newId(), me: 1, k: kind, x: "", a, vs, st: "sending" };
+  if (!c.keep) m.exp = Date.now() + vs * 1000;
+  m.url = URL.createObjectURL(new Blob([clean.bytes], { type: kind === "file" ? "application/octet-stream" : clean.mime }));
+  r.urls.push(m.url);
+  r.msgs.push(m);
+  renderChat(true);
+  await deliver(c, m, { t: "m", i: m.i, k: kind, a, vs }, false);
+  if (m.st === "failed") dropAttachment(token);
 }
 
 // =========================================================================
-// SYMBOLE (eingebettete SVG, keine fremden Dateien)
+// MEDIEN ANZEIGEN
+// =========================================================================
+function freeUrls(r) { for (const u of r.urls) { try { URL.revokeObjectURL(u); } catch (e) {} } r.urls = []; }
+
+// Lädt einen Anhang, entschlüsselt ihn in den Arbeitsspeicher und löscht ihn
+// (außer bei „Verlauf behalten“) sofort vom Server.
+async function fetchMedia(c, m) {
+  const r = runOf(c);
+  if (m.url || m.loading) return;
+  m.loading = true;
+  try {
+    const resp = await api("GET", "/api/attachments/" + m.a.t, { raw: true });
+    const plain = await C.decryptFile(C.unb64(m.a.k), new Uint8Array(await resp.arrayBuffer()));
+    if (S.active !== c.id || !r.msgs.includes(m)) { m.loading = false; return; }
+    const show = (SHOW_MIMES[m.k] || []).includes(m.a.m);
+    m.url = URL.createObjectURL(new Blob([plain], { type: show ? m.a.m : "application/octet-stream" }));
+    r.urls.push(m.url);
+    if (!c.keep) dropAttachment(m.a.t);
+  } catch (e) { m.gone = true; }
+  m.loading = false;
+  if (S.active === c.id) renderChat();
+}
+function dropMedia(c, m, alsoServer) {
+  if (m.url) { try { URL.revokeObjectURL(m.url); } catch (e) {} m.url = null; }
+  if (alsoServer && m.a && m.a.t) dropAttachment(m.a.t);
+}
+
+// =========================================================================
+// VERLAUF BEHALTEN (nur wenn beide zugestimmt haben)
+// Liegt verschlüsselt im Konto, zusätzlich geschützt durch das Kanal-Passwort.
+// =========================================================================
+async function histKey(kMsg) { return await C.hkdf(kMsg, "chatmesh2|history"); }
+const _histTimers = {};
+function saveHistorySoon(c) {
+  if (_histTimers[c.id]) return;
+  _histTimers[c.id] = setTimeout(() => { delete _histTimers[c.id]; saveHistory(c); }, 600);
+}
+// Schreibt den Verlauf verschlüsselt ins Konto. Nur wenn der Verlauf gerade
+// geladen ist (Chat offen), sonst würde ein leerer Stand den echten überschreiben.
+async function saveHistory(c, msgs, kMsg) {
+  const r = runOf(c);
+  if (!msgs) { if (!r.loaded) return; msgs = r.msgs; kMsg = r.kMsg; }
+  if (!c.keep || !kMsg || !S.me) return;
+  // Begrenzt nach Größe: die neuesten Einträge bleiben, die ältesten fallen weg.
+  const list = [];
+  let bytes = 2;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (m.st === "failed") continue;
+    const e = { i: m.i, me: m.me, k: m.k, x: m.x, a: m.a, st: m.st === "seen" ? "seen" : "sent", n: m.n };
+    bytes += C.utf8(JSON.stringify(e)).byteLength + 1;
+    if (bytes > HIST_BYTES) break;
+    list.unshift(e);
+  }
+  const sealed = C.b64(await C.seal(await histKey(kMsg), C.utf8(JSON.stringify(list))));
+  if (!c.keep || !chan(c.id)) return;
+  c.hist = sealed;
+  bump(c);
+  saveSoon();
+}
+// Liest einen gespeicherten Verlauf und gibt die Einträge zurück, die noch fehlen.
+async function readHistory(c, sealed, kMsg, have) {
+  const list = JSON.parse(C.fromUtf8(await C.open(await histKey(kMsg), C.unb64(sealed))));
+  const out = [];
+  for (const m of (Array.isArray(list) ? list : [])) {
+    if (!m || typeof m.i !== "string" || have.has(m.i)) continue;
+    const kind = ["image", "video", "voice", "file"].includes(m.k) ? m.k : "text";
+    const o = { i: m.i, me: m.me ? 1 : 0, k: kind, x: typeof m.x === "string" ? m.x : "", st: m.st === "seen" ? "seen" : "sent", n: m.n };
+    if (kind !== "text") { o.a = cleanAtt(m.a); if (!o.a) continue; }
+    out.push(o);
+  }
+  return out;
+}
+async function loadHistory(c) {
+  const r = runOf(c);
+  if (!c.keep || !r.kMsg) return;
+  if (!c.hist) { r.loaded = true; return; }
+  try {
+    const old = await readHistory(c, c.hist, r.kMsg, new Set(r.msgs.map(m => m.i)));
+    for (const o of old) if (!o.me) r.seen.add(o.i);
+    r.msgs = old.concat(r.msgs);
+    for (const m of old) if (m.k !== "text") fetchMedia(c, m);
+  } catch (e) {}
+  r.loaded = true;
+}
+// Ein anderes Gerät hat denselben Verlauf weitergeschrieben, während der Chat
+// hier offen ist: fehlende Einträge übernehmen, dann den vereinten Stand sichern.
+const _histMerges = [];
+async function applyHistMerges() {
+  while (_histMerges.length) {
+    const [id, sealed] = _histMerges.shift();
+    const c = chan(id), r = c && S.run[id];
+    if (!c || !r || !r.kMsg || S.active !== id || !c.keep || !r.loaded) continue;
+    try {
+      const add = await readHistory(c, sealed, r.kMsg, new Set(r.msgs.map(m => m.i)));
+      if (add.length) {
+        for (const o of add) if (!o.me) r.seen.add(o.i);
+        r.msgs = add.concat(r.msgs);
+        for (const m of add) if (m.k !== "text") fetchMedia(c, m);
+        renderChat();
+      }
+      await saveHistory(c);
+    } catch (e) {}
+  }
+}
+
+// =========================================================================
+// KANAL ÖFFNEN / SCHLIESSEN / SPERREN
+// =========================================================================
+// Öffnet die verpackten Kanal-Schlüssel mit dem Kanal-Passwort.
+async function unwrapKeys(c, password) {
+  let plain;
+  try { plain = JSON.parse(C.fromUtf8(await C.unwrapWithPassword(password, c.wrap))); }
+  catch (e) { throw new Error("Falsches Passwort."); }
+  return { kMsg: C.unb64(plain.m), kDel: C.unb64(plain.d), own: plain.o };
+}
+async function unlock(c, password) {
+  const r = runOf(c);
+  const k = await unwrapKeys(c, password);
+  r.kMsg = k.kMsg; r.kDel = k.kDel; r.own = k.own;
+}
+function lockKeys(c) {
+  const r = S.run[c.id];
+  if (r) { r.kMsg = null; r.kDel = null; r.own = null; }
+}
+
+function openChannel(id) {
+  const c = chan(id);
+  if (!c) return;
+  if (c.pend) { openPending(c); return; }
+  if (S.active === id) { $("#view-chat").classList.add("peek-chat"); return; }
+  const r = runOf(c);
+  const go = async () => {
+    closeChannel(false);
+    S.active = id;
+    S.lastInput = Date.now();
+    $("#view-chat").classList.add("peek-chat");
+    renderList();
+    renderChat(true);
+    if (r.flush) { try { await r.flush; } catch (e) {} }
+    if (S.active !== id) return;
+    await loadHistory(c);
+    if (S.active !== id) return;
+    renderList();
+    renderChat(true);
+    await processWaiting(c);
+    if (S.active === id && c.rq.length) askRequest(c);
+  };
+  // Ist die Kanal-Sperre abgeschaltet, bleibt der Kanal nach der ersten
+  // Passwort-Eingabe für die Dauer der Anmeldung offen (nur im Arbeitsspeicher).
+  if (r.kMsg) { go(); return; }
+  askPassword("Kanal „" + c.name + "“ öffnen", "Passwort dieses Kanals", async (pw) => { await unlock(c, pw); go(); });
+}
+
+// Verlässt den offenen Kanal. Ohne „Verlauf behalten“ ist danach alles weg,
+// auch die eigenen Nachrichten. Mit Kanal-Sperre werden die Schlüssel vergessen.
+function closeChannel(silent) {
+  const id = S.active;
+  if (!id) return;
+  const c = chan(id);
+  S.active = null;
+  stopRecording(true);
+  $("#msg-input").value = "";
+  if (c) {
+    const r = runOf(c);
+    freeUrls(r);
+    for (const m of r.msgs) { m.url = null; m.loading = false; }
+    if (!c.keep) {
+      for (const m of r.msgs) if (!m.me && m.a) dropMedia(c, m, true);
+    } else if (r.loaded && r.kMsg) {
+      // Verlauf ein letztes Mal sichern; beim nächsten Öffnen wird er daraus geladen.
+      if (_histTimers[c.id]) { clearTimeout(_histTimers[c.id]); delete _histTimers[c.id]; }
+      r.flush = saveHistory(c, r.msgs.slice(), r.kMsg).catch(() => {});
+    }
+    r.msgs = [];
+    r.loaded = false;
+    if (S.acct && S.acct.set.lockOn) lockKeys(c);
+  }
+  closeSheet();
+  if (!silent) { $("#view-chat").classList.remove("peek-chat"); renderList(); renderChat(); }
+}
+
+// =========================================================================
+// KANAL AUFLÖSEN (löschen, Screenshot-Versuch, Löschwörter)
+// =========================================================================
+// own = { t: Marke, k: Schlüssel, d: Lösch-Geheimnis } der eigenen Richtung.
+async function postDissolve(own, reason) {
+  const block = await C.sealJson(C.unb64(own.k), { r: reason }, C.BLOCK);
+  return await pilePost(own.t, block, own.d);
+}
+function reasonText(name, reason, mine) {
+  if (reason === "shot") return mine
+    ? `Screenshot-Versuch erkannt. Der Kanal „${name}“ wurde bei euch beiden aufgelöst.`
+    : `Im Kanal „${name}“ wurde versucht, einen Screenshot zu machen. Der Kanal wurde aufgelöst.`;
+  if (reason === "wipe") return `Dein Gegenüber im Kanal „${name}“ hat sein Konto gelöscht. Der Kanal wurde aufgelöst.`;
+  return mine ? `Kanal „${name}“ gelöscht.` : `Der Kanal „${name}“ wurde vom Gegenüber gelöscht.`;
+}
+function dissolveLocal(c, reason, mine) {
+  dropRuntime(c.id);
+  S.acct.ch = S.acct.ch.filter(x => x.id !== c.id);
+  S.acct.gone = [...S.acct.gone.filter(x => x !== c.id), c.id].slice(-300);
+  if (!(mine && reason === "deleted")) S.acct.notes.push(reasonText(c.name, reason, mine));
+  S.acct.notes = S.acct.notes.slice(-20);
+  saveAccount();
+  $("#view-chat").classList.remove("peek-chat");
+  renderList();
+  renderChat();
+}
+// Schickt die Mitteilung "Kanal aufgelöst" ans Gegenüber, mit Wiederholung.
+function notifyDissolve(own, reason) {
+  if (!own) return;
+  const waits = [1500, 5000, 15000, 45000, 120000, 300000, 900000];
+  let i = 0;
+  const run = async () => {
+    let ok = false;
+    try { const code = await postDissolve(own, reason); ok = code === 200 || code === 409; } catch (e) {}
+    if (!ok && i < waits.length) setTimeout(run, waits[i++]);
+  };
+  run();
+}
+// Löst den Kanal bei beiden auf. Normal: erst wenn die Mitteilung auf dem Server
+// liegt, verschwindet er hier. Mit force (Screenshot-Versuch): sofort hier weg,
+// die Mitteilung geht parallel raus und wird bei Bedarf wiederholt.
+async function dissolveChannel(c, reason, own, force) {
+  if (c.pend) {
+    queueDelete(c.pend.ta, c.pend.da);
+    dissolveLocal(c, reason, true);
+    return true;
+  }
+  own = own || runOf(c).own;
+  if (force) {
+    dissolveLocal(c, reason, true);
+    notifyDissolve(own, reason);
+    return true;
+  }
+  let code = 0;
+  if (own) { try { code = await postDissolve(own, reason); } catch (e) { code = 0; } }
+  if (code !== 200 && code !== 409) return false;
+  dissolveLocal(c, reason, true);
+  return true;
+}
+
+// =========================================================================
+// KANAL ANLEGEN UND BEITRETEN (Einmal-Code)
+// =========================================================================
+async function dissolvePart(kDis, dir) {
+  const dk = await C.dissolveKeys(kDis, dir);
+  return { t: dk.tag, k: C.b64(dk.key), d: dk.del };
+}
+// Legt die Schlüssel eines neuen Kanals ab: Marken-Schlüssel offen (damit
+// Ungelesenes auch bei gesperrtem Kanal gezählt werden kann), alles andere
+// verpackt mit dem Kanal-Passwort.
+async function installKeys(c, keys, pwKey, salt) {
+  const own = await dissolvePart(keys.kDis, c.dir);
+  c.kt = C.b64(keys.kTag);
+  c.pd = await dissolvePart(keys.kDis, peerDir(c));
+  c.wrap = await C.wrapWithKey(pwKey, salt, C.utf8(JSON.stringify({ m: C.b64(keys.kMsg), d: C.b64(keys.kDel), o: own })));
+  c.wb = C.b64(await C.boxSeal(C.unb64(S.acct.wp), C.utf8(JSON.stringify(own))));
+  c.sym = keys.symbols;
+  c.sn = 0; c.cn = 0; c.sr = 0; c.cr = 0; c.rn = 0; c.rc = 0; c.rp = []; c.rpc = [];
+  c.keep = 0; c.shots = 0; c.rq = []; c.ro = []; c.hist = ""; c.rv = 0;
+  return own;
+}
+
+async function createChannel(name, password, keepReq) {
+  const I = C.rand(12);
+  const ik = await C.inviteKeys(I);
+  const ex = await C.newExchangeKey();
+  const salt = C.rand(16);
+  const pwKey = await C.passwordKey(password, salt);
+  const kr = keepReq ? 1 : 0;
+  const offer = await C.sealJson(ik.key, { t: "offer", p: C.b64(ex.pub), kr }, C.BLOCK);
+  const code = await pilePost(ik.tagA, offer, ik.delA);
+  if (code !== 200) throw new Error("Der Kanal konnte gerade nicht angelegt werden. Bitte noch einmal versuchen.");
+  // Die Geheimnisse der Einladung liegen im Konto nur verpackt mit dem Kanal-Passwort.
+  const sealed = await C.seal(pwKey, C.utf8(JSON.stringify({ inv: C.b64(I), priv: ex.privJwk, pub: C.b64(ex.pub), kr })));
+  const c = {
+    id: C.hex(C.rand(8)), name, dir: "a", rv: 0,
+    pend: { ta: ik.tagA, da: ik.delA, tb: ik.tagB, exp: nowSec() + INVITE_SECONDS, s: C.b64(salt), c: C.b64(sealed) },
+  };
+  S.acct.ch.unshift(c);
+  runOf(c).ps = { I, priv: ex.privJwk, pub: ex.pub, kr, pwKey, salt };
+  await refreshExpect(c);
+  await saveAccount();
+  renderList();
+  return c;
+}
+
+// Öffnet die verpackten Geheimnisse einer offenen Einladung mit dem Kanal-Passwort.
+async function unsealPending(c, password) {
+  const salt = C.unb64(c.pend.s);
+  const pwKey = await C.passwordKey(password, salt);
+  let plain;
+  try { plain = JSON.parse(C.fromUtf8(await C.open(pwKey, C.unb64(c.pend.c)))); }
+  catch (e) { throw new Error("Falsches Passwort."); }
+  const ps = { I: C.unb64(plain.inv), priv: plain.priv, pub: C.unb64(plain.pub), kr: plain.kr ? 1 : 0, pwKey, salt };
+  runOf(c).ps = ps;
+  return ps;
+}
+
+async function completeInvite(c, block, ps) {
+  if (!c.pend) return false;
+  const r = runOf(c);
+  try {
+    const ik = await C.inviteKeys(ps.I);
+    const ans = await C.openJson(ik.key, block, C.BLOCK);
+    const pubB = C.unb64(String(ans.p || ""));
+    const keys = await C.channelKeys(await C.channelRoot(ps.priv, pubB, ps.I, ps.pub, pubB));
+    const own = await installKeys(c, keys, ps.pwKey, ps.salt);
+    c.ro = ps.kr ? ["keep"] : [];          // die Anfrage steckte schon im Einmal-Code
+    delete c.pend;
+    r.ps = null;
+    if (!S.acct.set.lockOn) { r.kMsg = keys.kMsg; r.kDel = keys.kDel; r.own = own; }
+    await refreshExpect(c);
+    await saveAccount();
+    // Die beiden Blöcke des Einmal-Codes später unauffällig entfernen.
+    const wait = randBetween(15000, 90000);
+    queueDelete(ik.tagA, ik.delA, wait);
+    queueDelete(ik.tagB, ik.delB, wait + randBetween(500, 5000));
+    toast("Kanal „" + c.name + "“ ist verbunden.", "ok");
+    if ($("#sheet .qr-canvas")) closeSheet();
+    renderList();
+    await matchPile();
+    return true;
+  } catch (e) {
+    // Ungültige Antwort: verwerfen und weiter warten.
+    if (c.pend) { delete c.pend.ans; await refreshExpect(c); }
+    return false;
+  }
+}
+
+async function joinChannel(codeText, name, password) {
+  let I;
+  try { I = await C.wordsToBytes(codeText, 12); }
+  catch (e) { throw new Error(wordError(e, 9)); }
+  const ik = await C.inviteKeys(I);
+  const invalid = "Dieser Code ist nicht gültig.";
+  const found = await scanFor([ik.tagA, ik.tagB]);
+  const block = found[ik.tagA];
+  if (!block || found[ik.tagB]) throw new Error(invalid);
+  let offer;
+  try { offer = await C.openJson(ik.key, block, C.BLOCK); } catch (e) { throw new Error(invalid); }
+  const pubA = C.unb64(String(offer.p || ""));
+  const ex = await C.newExchangeKey();
+  let keys;
+  try { keys = await C.channelKeys(await C.channelRoot(ex.privJwk, pubA, I, pubA, ex.pub)); } catch (e) { throw new Error(invalid); }
+  const salt = C.rand(16);
+  const pwKey = await C.passwordKey(password, salt);
+  const c = { id: C.hex(C.rand(8)), name, dir: "b" };
+  const own = await installKeys(c, keys, pwKey, salt);
+  if (offer.kr) c.rq = ["keep"];
+  const answer = await C.sealJson(ik.key, { t: "answer", p: C.b64(ex.pub) }, C.BLOCK);
+  const code = await pilePost(ik.tagB, answer, ik.delB);
+  if (code !== 200) throw new Error(invalid);
+  pileDrop(ik.tagA);
+  S.acct.ch.unshift(c);
+  const r = runOf(c);
+  r.kMsg = keys.kMsg; r.kDel = keys.kDel; r.own = own;
+  await refreshExpect(c);
+  await saveAccount();
+  renderList();
+  await matchPile();
+  return c;
+}
+
+// Abgelaufene Einmal-Codes entfernen (24 Stunden).
+function expireInvites() {
+  if (!S.acct) return;
+  for (const c of [...S.acct.ch]) {
+    // Ist das Gegenüber schon beigetreten, läuft nichts mehr ab: es fehlt nur das Passwort.
+    if (c.pend && !c.pend.ans && c.pend.exp <= nowSec()) {
+      queueDelete(c.pend.ta, c.pend.da);
+      dropRuntime(c.id);
+      S.acct.ch = S.acct.ch.filter(x => x.id !== c.id);
+      S.acct.gone = [...S.acct.gone, c.id].slice(-300);
+      S.acct.notes.push(`Der Einmal-Code für „${c.name}“ ist abgelaufen.`);
+      saveSoon();
+      renderList();
+    }
+  }
+}
+
+// =========================================================================
+// SCHLEIFEN: Abruf, Schein-Verkehr, Ablauf, Sperre
+// Alles in unregelmäßigen Abständen, damit kein Takt erkennbar ist.
+// =========================================================================
+function loop(fn, nextDelay) {
+  const sid = S.sid;
+  let timer = null;
+  const plan = () => { timer = setTimeout(run, nextDelay()); S.timers.add(timer); };
+  const run = async () => {
+    S.timers.delete(timer);
+    if (!S.me || sid !== S.sid) return;
+    try { await fn(); } catch (e) {}
+    if (S.me && sid === S.sid) plan();
+  };
+  plan();
+}
+
+function startLoops() {
+  // Haufen abrufen
+  loop(() => pileSync(false), () => randBetween(600, 1700));
+  // Schein-Blöcke: sehen aus wie echte, werden nach kurzer Zeit wieder gelöscht
+  loop(async () => {
+    const big = randInt(40) === 0;
+    const tag = C.hex(C.rand(16)), token = C.hex(C.rand(16));
+    const code = await pilePost(tag, C.rand(big ? 65564 : 4124), token, 20);
+    if (code === 200) queueDelete(tag, token, randBetween(4000, 90000));
+  }, () => Math.round(randExp(10000, 1200, 45000)));
+  // Ablauf der Anzeige-Zeit, Einmal-Codes, Sperre bei Untätigkeit
+  loop(async () => { tickExpiry(); expireInvites(); idleCheck(); }, () => 1000);
+  // Konto in unregelmäßigen Abständen speichern, mit und ohne Anlass: von außen
+  // sieht beides gleich aus. Größere Konten (mit behaltenem Verlauf) seltener.
+  loop(async () => { await saveAccount(); }, () => {
+    const mean = (S.blobLen || 0) < 100000 ? 14000 : ((S.blobLen || 0) < 400000 ? 45000 : 120000);
+    return Math.round(randExp(mean, mean / 4, mean * 4));
+  });
+  // Schwere der Rechenaufgabe ab und zu neu holen
+  loop(loadConfig, () => randBetween(120000, 360000));
+}
+
+function tickExpiry() {
+  const c = S.active ? chan(S.active) : null;
+  if (!c) return;
+  const r = runOf(c);
+  const now = Date.now();
+  const before = r.msgs.length;
+  r.msgs = r.msgs.filter(m => {
+    if (m.exp && m.exp <= now) { dropMedia(c, m, !m.me); return false; }
+    return true;
+  });
+  if (r.msgs.length !== before) renderChat();
+  else updateCountdowns();
+}
+
+function idleCheck() {
+  if (!S.active || !S.acct.set.lockOn) return;
+  if (_rec || _uploads > 0) S.lastInput = Date.now();   // Aufnahme und Hochladen zählen als Eingabe
+  const min = S.acct.set.lockMin;
+  if (min > 0 && Date.now() - S.lastInput > min * 60000) {
+    closeChannel(false);
+    toast("Kanal wegen Untätigkeit gesperrt.");
+  }
+}
+
+// =========================================================================
+// SCREENSHOT-SCHUTZ
+// Eine Webseite kann Screenshots nicht sicher verhindern. Was möglich ist:
+// Inhalt ausblenden, sobald das Fenster den Fokus verliert oder eine typische
+// Tastenkombination gedrückt wird, und den Kanal bei einem erkannten Versuch
+// auflösen. Auf Handys lässt sich ein Screenshot technisch nicht erkennen.
+// =========================================================================
+let _shieldHold = 0;
+function shield(on) {
+  if (!on && Date.now() < _shieldHold) return;
+  document.body.classList.toggle("shielded", !!on);
+}
+function holdShield(ms) {
+  _shieldHold = Date.now() + ms;
+  shield(true);
+  setTimeout(() => { if (document.hasFocus() && !document.hidden) shield(false); }, ms + 60);
+}
+function shotsAllowed() { const c = S.active ? chan(S.active) : null; return !c || !!c.shots; }
+let _shotBusy = false;
+async function onShotAttempt() {
+  if (_shotBusy || shotsAllowed()) return;
+  const c = chan(S.active);
+  if (!c) return;
+  _shotBusy = true;
+  _shieldHold = Date.now() + 1500;
+  shield(true);
+  // Sofort auflösen, auch ohne Verbindung. Die Mitteilung ans Gegenüber wird dann nachgeholt.
+  try { await dissolveChannel(c, "shot", null, true); }
+  finally { _shotBusy = false; setTimeout(() => { if (document.hasFocus() && !document.hidden) shield(false); }, 1600); }
+}
+
+function bindShield() {
+  window.addEventListener("blur", () => { if (!shotsAllowed()) shield(true); });
+  window.addEventListener("focus", () => shield(false));
+  document.addEventListener("visibilitychange", () => { if (document.hidden) { if (!shotsAllowed()) shield(true); } else shield(false); });
+  const check = (e) => {
+    const k = String(e.key || "");
+    const low = k.toLowerCase();
+    if (shotsAllowed()) return;
+    // Vorbereitung einer Aufnahme: sofort ausblenden.
+    if (e.metaKey && e.shiftKey) holdShield(8000);
+    else if (k === "Meta" || k === "OS") shield(true);
+    const code = String(e.code || "");
+    const attempt = k === "PrintScreen" || code === "PrintScreen"
+      || (e.metaKey && e.shiftKey && (["Digit3", "Digit4", "Digit5", "Digit6", "KeyS"].includes(code) || low === "s"))
+      || (e.ctrlKey && e.shiftKey && !e.altKey && (code === "KeyS" || low === "s"))
+      || ((e.ctrlKey || e.metaKey) && !e.shiftKey && !e.altKey && (code === "KeyP" || low === "p"));
+    if (attempt) { e.preventDefault(); onShotAttempt(); }
+  };
+  document.addEventListener("keydown", check, true);
+  document.addEventListener("keyup", (e) => {
+    if (String(e.key) === "PrintScreen" || e.code === "PrintScreen") { if (!shotsAllowed()) onShotAttempt(); }
+    if (!e.metaKey && !document.hidden && document.hasFocus()) shield(false);
+  }, true);
+  window.addEventListener("beforeprint", () => { if (!shotsAllowed()) onShotAttempt(); });
+  document.addEventListener("contextmenu", (e) => { if (e.target.closest && e.target.closest("#chat-stream") && !shotsAllowed()) e.preventDefault(); });
+  document.addEventListener("copy", (e) => { if (e.target.closest && e.target.closest("#chat-stream") && !shotsAllowed()) e.preventDefault(); });
+  document.addEventListener("dragstart", (e) => { if (e.target.closest && e.target.closest("#chat-stream")) e.preventDefault(); });
+}
+
+// =========================================================================
+// FENSTER (Menüs, Eingaben)
+// =========================================================================
+function closeSheet() {
+  stopScan();
+  $("#sheet-bg").style.display = "none";
+  $("#sheet").textContent = "";
+}
+function openSheetNodes(title, nodes, noClose) {
+  const sheet = $("#sheet");
+  stopScan();
+  sheet.textContent = "";
+  if (title) sheet.appendChild(el("div", "sheet-title", title));
+  for (const n of nodes) sheet.appendChild(n);
+  if (!noClose) {
+    const cancel = el("button", "sheet-item cancel", "Schließen");
+    cancel.type = "button";
+    cancel.addEventListener("click", closeSheet);
+    sheet.appendChild(cancel);
+  }
+  $("#sheet-bg").style.display = "flex";
+}
+function menuItem(label, sub, danger, onClick) {
+  const b = el("button", "sheet-item" + (danger ? " danger" : ""));
+  b.type = "button";
+  b.appendChild(el("span", "sheet-label", label));
+  if (sub) b.appendChild(el("span", "sheet-sub", sub));
+  b.addEventListener("click", () => { closeSheet(); onClick(); });
+  return b;
+}
+function infoNode(text) { return el("p", "sheet-info", text); }
+
+// Formular in einem Fenster. onSubmit darf einen Fehler werfen, dessen Text
+// dann im Fenster erscheint.
+function formSheet(title, opts) {
+  const form = el("form", "sheet-form");
+  const inputs = {};
+  let grid = null;
+  if (opts.info) form.appendChild(infoNode(opts.info));
+  for (const f of opts.fields) {
+    if (f.node) { form.appendChild(f.node); grid = null; continue; }
+    const lab = el("label", f.type === "checkbox" ? "check-row" : "sheet-field");
+    const inp = document.createElement(f.type === "textarea" ? "textarea" : "input");
+    // Kanal-Passwörter sind bewusst keine "Passwort-Felder" des Browsers: so bietet
+    // er nicht an, sie zu speichern oder vorzuschlagen. Verdeckt werden sie per Stil.
+    if (f.type === "password") { inp.type = "text"; inp.classList.add("pw"); inp.setAttribute("inputmode", "text"); }
+    else if (f.type !== "textarea") inp.type = f.type || "text";
+    if (f.type === "textarea") inp.rows = 3;
+    inp.name = f.name;
+    if (f.placeholder) inp.placeholder = f.placeholder;
+    if (f.value !== undefined) { if (f.type === "checkbox") inp.checked = !!f.value; else inp.value = f.value; }
+    inp.autocomplete = "off";
+    inp.spellcheck = false;
+    if (f.type !== "checkbox") { inp.setAttribute("autocapitalize", "none"); inp.setAttribute("autocorrect", "off"); }
+    if (f.type === "number") { inp.setAttribute("inputmode", "numeric"); inp.min = "0"; }
+    if (f.max) inp.maxLength = f.max;
+    inputs[f.name] = inp;
+    if (f.type === "checkbox") { lab.appendChild(inp); lab.appendChild(el("span", "", f.label)); }
+    else { lab.appendChild(el("span", "sheet-field-label", f.label)); lab.appendChild(inp); if (f.hint) lab.appendChild(el("small", "", f.hint)); }
+    if (f.grid) { if (!grid) { grid = el("div", "sheet-grid"); form.appendChild(grid); } grid.appendChild(lab); }
+    else { grid = null; form.appendChild(lab); }
+  }
+  const err = el("div", "sheet-error");
+  form.appendChild(err);
+  const row = el("div", "sheet-row");
+  const cancel = el("button", "ghost small", "Abbrechen");
+  cancel.type = "button";
+  cancel.addEventListener("click", () => { closeSheet(); if (opts.onCancel) opts.onCancel(); });
+  const ok = el("button", "primary small" + (opts.danger ? " danger-fill" : ""), opts.submit || "OK");
+  ok.type = "submit";
+  row.appendChild(cancel); row.appendChild(ok);
+  form.appendChild(row);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (ok.disabled) return;
+    const values = {};
+    for (const [k, inp] of Object.entries(inputs)) values[k] = inp.type === "checkbox" ? inp.checked : inp.value;
+    for (const inp of Object.values(inputs)) if (inp.classList.contains("pw")) inp.value = "";
+    ok.disabled = true;
+    err.textContent = opts.busy || "Einen Moment …";
+    err.className = "sheet-error busy";
+    try {
+      await opts.onSubmit(values, inputs);
+    } catch (ex) {
+      err.textContent = String(ex && ex.message || ex);
+      err.className = "sheet-error";
+      ok.disabled = false;
+      return;
+    }
+    if (err.isConnected && err.className === "sheet-error busy") { err.textContent = ""; ok.disabled = false; }
+  });
+  openSheetNodes(title, [form], true);
+  const first = Object.values(inputs)[0];
+  if (first && !opts.noFocus) setTimeout(() => { try { first.focus(); } catch (e) {} }, 50);
+  return inputs;
+}
+
+function askPassword(title, label, onPassword, submit) {
+  formSheet(title, {
+    fields: [{ name: "pw", type: "password", label }],
+    submit: submit || "Öffnen",
+    busy: "Wird geprüft …",
+    onSubmit: async (v) => { await onPassword(v.pw); if ($("#sheet .sheet-form input.pw")) closeSheet(); },
+  });
+}
+
+// =========================================================================
+// FENSTER: Neuer Kanal, Beitreten, Code anzeigen, QR
+// =========================================================================
+function checkPw(v) {
+  if (!v.pw || v.pw.length < PW_MIN) throw new Error("Das Kanal-Passwort braucht mindestens " + PW_MIN + " Zeichen.");
+  if (v.pw !== v.pw2) throw new Error("Die beiden Passwörter stimmen nicht überein.");
+}
+
+function newChannelSheet() {
+  formSheet("Neuer Kanal", {
+    info: "Du bekommst einen Einmal-Code. Den gibst du deinem Gegenüber, als QR-Code zum Scannen oder zum Abtippen. Er gilt 24 Stunden und nur ein einziges Mal.",
+    fields: [
+      { name: "name", label: "Name für diesen Kanal (siehst nur du)", placeholder: "z. B. Kollege", max: 40 },
+      { name: "pw", type: "password", label: "Passwort für diesen Kanal", hint: "Dieses Passwort brauchst du jedes Mal, wenn du den Kanal öffnest oder löschst." },
+      { name: "pw2", type: "password", label: "Passwort wiederholen" },
+      { name: "keep", type: "checkbox", label: "Verlauf behalten anfragen (dein Gegenüber muss zustimmen, sonst wird wie üblich gelöscht)" },
+    ],
+    submit: "Kanal anlegen",
+    busy: "Kanal wird angelegt …",
+    onSubmit: async (v) => {
+      const name = (v.name || "").trim() || "Kanal";
+      checkPw(v);
+      const c = await createChannel(name.slice(0, 40), v.pw, v.keep);
+      showInvite(c);
+    },
+  });
+}
+
+function drawQr(canvas, text) {
+  const qr = window.qrcode(0, "M");
+  qr.addData(text);
+  qr.make();
+  const n = qr.getModuleCount(), scale = Math.max(3, Math.floor(260 / (n + 8)));
+  const size = (n + 8) * scale;
+  canvas.width = size; canvas.height = size;
+  const g = canvas.getContext("2d");
+  g.fillStyle = "#ffffff"; g.fillRect(0, 0, size, size);
+  g.fillStyle = "#000000";
+  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (qr.isDark(y, x)) g.fillRect((x + 4) * scale, (y + 4) * scale, scale, scale);
+}
+
+async function showInvite(c) {
+  if (!c.pend) return;
+  const ps = runOf(c).ps;
+  if (!ps) {
+    // In einer neuen Sitzung ist der Einmal-Code nur mit dem Kanal-Passwort lesbar.
+    askPassword("Einmal-Code für „" + c.name + "“", "Passwort dieses Kanals", async (pw) => { await unsealPending(c, pw); setTimeout(() => showInvite(c), 0); }, "Anzeigen");
+    return;
+  }
+  const words = await C.bytesToWords(ps.I);
+  const canvas = el("canvas", "qr-canvas");
+  drawQr(canvas, words);
+  const code = el("div", "code-words");
+  words.split(" ").forEach((w, i) => { const s = el("span", "", w); s.dataset.n = String(i + 1); code.appendChild(s); });
+  const copy = el("button", "ghost small", "Code kopieren");
+  copy.type = "button";
+  copy.addEventListener("click", () => { navigator.clipboard.writeText(words).then(() => toast("Code kopiert", "ok")).catch(() => toast("Kopieren nicht möglich", "err")); });
+  const wait = el("p", "sheet-info center", "Warte auf den Beitritt … Der Kanal erscheint von selbst, sobald dein Gegenüber den Code eingegeben hat.");
+  const drop = menuItem("Einmal-Code zurückziehen", "Der Code wird sofort ungültig.", true, () => dissolveChannel(c, "deleted"));
+  openSheetNodes("Einmal-Code für „" + c.name + "“", [
+    infoNode("Lass dein Gegenüber diesen QR-Code scannen oder die 9 Wörter abtippen. Gültig 24 Stunden, nur ein einziges Mal. Die Wörter sind englisch (eine weltweit übliche Liste)."),
+    canvas, code, copy, wait, drop,
+  ]);
+}
+
+// Kanal, dessen Einmal-Code noch offen ist: Code zeigen oder, wenn das Gegenüber
+// schon beigetreten ist, mit dem Kanal-Passwort fertig verbinden.
+function openPending(c) {
+  if (!c.pend) return;
+  if (!c.pend.ans) { showInvite(c); return; }
+  const finish = async (ps) => {
+    const ok = await completeInvite(c, C.unb64(c.pend.ans), ps);
+    if (!ok) { saveSoon(); renderList(); throw new Error("Der Beitritt war ungültig. Der Einmal-Code gilt weiter."); }
+  };
+  const ps = runOf(c).ps;
+  if (ps) { finish(ps).catch(e => toast(e.message, "err")); return; }
+  askPassword("Kanal „" + c.name + "“ verbinden", "Passwort dieses Kanals", async (pw) => { await finish(await unsealPending(c, pw)); }, "Verbinden");
+}
+
+let _scan = null;
+function stopScan() {
+  if (!_scan) return;
+  try { _scan.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  if (_scan.timer) clearInterval(_scan.timer);
+  _scan = null;
+}
+async function startScan(video, onText) {
+  stopScan();
+  if (!navigator.mediaDevices || !window.jsQR) throw new Error("Die Kamera steht hier nicht zur Verfügung. Bitte den Code abtippen.");
+  let stream;
+  try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false }); }
+  catch (e) { throw new Error("Kein Zugriff auf die Kamera. Bitte den Code abtippen."); }
+  video.srcObject = stream;
+  video.setAttribute("playsinline", "");
+  await video.play().catch(() => {});
+  const canvas = document.createElement("canvas");
+  const g = canvas.getContext("2d", { willReadFrequently: true });
+  _scan = { stream, timer: null };
+  _scan.timer = setInterval(() => {
+    if (!video.videoWidth) return;
+    const w = Math.min(640, video.videoWidth), h = Math.round(video.videoHeight * w / video.videoWidth);
+    canvas.width = w; canvas.height = h;
+    g.drawImage(video, 0, 0, w, h);
+    let res = null;
+    try { res = window.jsQR(g.getImageData(0, 0, w, h).data, w, h); } catch (e) {}
+    if (res && res.data) { const text = res.data; stopScan(); onText(text); }
+  }, 250);
+}
+
+function joinChannelSheet() {
+  const video = el("video", "scan-video");
+  video.hidden = true;
+  video.muted = true;
+  const scanBtn = el("button", "ghost small", "QR-Code scannen");
+  scanBtn.type = "button";
+  const scanWrap = el("div", "scan-wrap");
+  scanWrap.appendChild(scanBtn);
+  scanWrap.appendChild(video);
+  const inputs = formSheet("Kanal beitreten", {
+    info: "Gib den Einmal-Code ein, den dein Gegenüber dir zeigt: scannen oder die 9 Wörter abtippen.",
+    noFocus: true,
+    fields: [
+      { node: scanWrap },
+      { name: "code", type: "textarea", label: "Einmal-Code (9 Wörter)", placeholder: "wort1 wort2 … wort9" },
+      { name: "name", label: "Name für diesen Kanal (siehst nur du)", placeholder: "z. B. Kollege", max: 40 },
+      { name: "pw", type: "password", label: "Passwort für diesen Kanal", hint: "Dein eigenes Passwort für diesen Kanal. Es muss nicht dasselbe sein wie bei deinem Gegenüber." },
+      { name: "pw2", type: "password", label: "Passwort wiederholen" },
+    ],
+    submit: "Beitreten",
+    busy: "Kanal wird verbunden …",
+    onCancel: stopScan,
+    onSubmit: async (v) => {
+      const name = (v.name || "").trim() || "Kanal";
+      checkPw(v);
+      stopScan();
+      const c = await joinChannel(v.code, name.slice(0, 40), v.pw);
+      closeSheet();
+      toast("Kanal „" + c.name + "“ ist verbunden.", "ok");
+      openChannel(c.id);
+    },
+  });
+  scanBtn.addEventListener("click", async () => {
+    try {
+      video.hidden = false;
+      await startScan(video, (text) => { inputs.code.value = text; video.hidden = true; toast("Code erkannt", "ok"); });
+    } catch (e) { video.hidden = true; toast(e.message, "err"); }
+  });
+}
+
+// =========================================================================
+// FENSTER: Einstellungen, Anfragen, Kanal-Menü, Nachricht-Menü
+// =========================================================================
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400), h = Math.floor(sec % 86400 / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const parts = [];
+  if (d) parts.push(d + (d === 1 ? " Tag" : " Tage"));
+  if (h) parts.push(h + (h === 1 ? " Stunde" : " Stunden"));
+  if (m) parts.push(m + (m === 1 ? " Minute" : " Minuten"));
+  if (s || !parts.length) parts.push(s + (s === 1 ? " Sekunde" : " Sekunden"));
+  return parts.join(", ");
+}
+function fmtClock(sec) {
+  sec = Math.max(0, Math.ceil(sec));
+  if (sec >= 86400) return Math.floor(sec / 86400) + " T " + Math.floor(sec % 86400 / 3600) + " Std";
+  if (sec >= 3600) return Math.floor(sec / 3600) + ":" + String(Math.floor(sec % 3600 / 60)).padStart(2, "0") + " Std";
+  return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+}
+
+function settingsSheet() {
+  const set = S.acct.set;
+  const v = set.view;
+  formSheet("Einstellungen", {
+    info: "So lange bleibt eine Nachricht von dir nach dem Öffnen sichtbar. Danach verschwindet sie bei dir und beim Gegenüber. Verlässt jemand den Chat, ist sie bei ihm sofort weg.",
+    noFocus: true,
+    fields: [
+      { name: "d", type: "number", grid: true, label: "Tage", value: Math.floor(v / 86400) },
+      { name: "h", type: "number", grid: true, label: "Stunden", value: Math.floor(v % 86400 / 3600) },
+      { name: "m", type: "number", grid: true, label: "Minuten", value: Math.floor(v % 3600 / 60) },
+      { name: "s", type: "number", grid: true, label: "Sekunden", value: v % 60 },
+      { node: el("div", "sheet-section", "Kanal-Sperre") },
+      { name: "lockOn", type: "checkbox", label: "Kanal-Passwort jedes Mal verlangen: beim Öffnen und immer, wenn du einen Kanal verlassen hast. Ausgeschaltet fragt jeder Kanal nur einmal je Anmeldung.", value: set.lockOn },
+      { name: "lockMin", type: "number", label: "Bei Untätigkeit sperren nach (Minuten, 0 = nie)", value: set.lockMin },
+    ],
+    submit: "Speichern",
+    onSubmit: async (val) => {
+      const num = (x) => Math.max(0, Math.floor(Number(x) || 0));
+      const total = num(val.d) * 86400 + num(val.h) * 3600 + num(val.m) * 60 + num(val.s);
+      if (total < VIEW_MIN) throw new Error("Mindestens " + VIEW_MIN + " Sekunden.");
+      if (total > VIEW_MAX) throw new Error("Höchstens 30 Tage.");
+      set.view = total;
+      set.lockMin = Math.min(1440, num(val.lockMin));
+      const wasOn = set.lockOn;
+      set.lockOn = val.lockOn ? 1 : 0;
+      set.rv = (set.rv || 0) + 1;
+      if (set.lockOn && !wasOn) {
+        // Sperre wieder an: alle nicht geöffneten Kanäle sofort sperren.
+        for (const c of S.acct.ch) if (S.active !== c.id) lockKeys(c);
+      }
+      if (!(await saveAccount())) throw new Error("Speichern nicht möglich. Bitte Verbindung prüfen.");
+      closeSheet();
+      renderList();
+      renderChat();
+      toast("Gespeichert", "ok");
+    },
+  });
+}
+
+function askRequest(c) {
+  const kind = c.rq[0];
+  if (!kind || $("#sheet .sheet-choice")) return;
+  const answer = async (yes, btn) => {
+    for (const b of $$("#sheet .sheet-choice")) b.disabled = true;
+    // Erst wenn die Antwort wirklich unterwegs ist, gilt sie auch hier.
+    try { await sendObj(c, { t: "ans", k: kind, y: yes ? 1 : 0 }, "c"); }
+    catch (e) {
+      for (const b of $$("#sheet .sheet-choice")) b.disabled = false;
+      toast("Antwort nicht gesendet: " + (e.message || "Fehler") + " Bitte noch einmal.", "err");
+      return;
+    }
+    closeSheet();
+    c.rq = c.rq.filter(x => x !== kind);
+    if (yes) setMode(c, kind, 1); else { bump(c); saveSoon(); }
+    if (yes && kind === "keep") saveHistorySoon(c);
+    renderChat();
+    if (c.rq.length && S.active === c.id) askRequest(c);
+  };
+  const yes = el("button", "sheet-choice danger-fill", kind === "keep" ? "Ja, Chats behalten" : "Ja, Screenshots erlauben");
+  yes.type = "button";
+  yes.addEventListener("click", () => answer(true));
+  const no = el("button", "sheet-choice", kind === "keep" ? "Nein, Chats löschen (Standard)" : "Nein, Screenshots verbieten (Standard)");
+  no.type = "button";
+  no.addEventListener("click", () => answer(false));
+  openSheetNodes(kind === "keep" ? "Verlauf behalten?" : "Screenshots erlauben?", [
+    infoNode(kind === "keep"
+      ? "Dein Gegenüber möchte, dass der Verlauf dieses Kanals behalten wird. Dann bleiben Nachrichten bei euch beiden gespeichert (verschlüsselt, nur für euch lesbar), statt zu verschwinden. Bilder, Videos und Dateien bleiben dabei etwa 5 Wochen abrufbar."
+      : "Dein Gegenüber möchte in diesem Kanal Screenshots erlauben. Dann wird der Kanal bei einem Screenshot nicht mehr aufgelöst."),
+    no, yes,
+  ], true);
+}
+
+async function requestMode(c, kind) {
+  try {
+    await sendObj(c, { t: "req", k: kind });
+    if (!c.ro.includes(kind)) c.ro.push(kind);
+    bump(c);
+    saveSoon();
+    renderChat();
+    toast("Anfrage gesendet. Dein Gegenüber muss zustimmen.", "ok");
+  } catch (e) { toast("Anfrage nicht gesendet: " + (e.message || ""), "err"); }
+}
+
+async function endMode(c, kind) {
+  try { await sendObj(c, { t: "set", k: kind, v: 0 }, "c"); }
+  catch (e) { toast("Nicht geändert: " + (e.message || "keine Verbindung"), "err"); return; }
+  setMode(c, kind, 0);
+  toast(kind === "keep" ? "Verlauf wird nicht mehr behalten." : "Screenshots sind wieder verboten.", "ok");
+}
+
+function channelMenu(c) {
+  const items = [];
+  if (c.keep) items.push(menuItem("Verlauf nicht mehr behalten", "Gespeicherter Verlauf wird bei euch beiden gelöscht, ab dann verschwinden Nachrichten wieder.", false, () => endMode(c, "keep")));
+  else items.push(menuItem("Verlauf behalten anfragen", "Standard ist: alles verschwindet. Dein Gegenüber muss zustimmen.", false, () => requestMode(c, "keep")));
+  if (c.shots) items.push(menuItem("Screenshots wieder verbieten", "", false, () => endMode(c, "shots")));
+  else items.push(menuItem("Screenshots erlauben anfragen", "Standard ist: Ein erkannter Screenshot-Versuch löst den Kanal bei euch beiden auf. Am Handy kann eine Webseite Screenshots nicht erkennen.", false, () => requestMode(c, "shots")));
+  const sym = el("div", "sheet-item static");
+  sym.appendChild(el("span", "sheet-label", "Prüf-Symbole"));
+  sym.appendChild(el("span", "sym-row", c.sym || ""));
+  sym.appendChild(el("span", "sheet-sub", "Stehen bei deinem Gegenüber dieselben acht Symbole in derselben Reihenfolge, hat sich niemand dazwischengedrängt."));
+  items.push(sym);
+  items.push(menuItem("Kanal umbenennen", "", false, () => {
+    formSheet("Kanal umbenennen", {
+      fields: [{ name: "name", label: "Neuer Name (siehst nur du)", value: c.name, max: 40 }],
+      submit: "Speichern",
+      onSubmit: async (v) => { c.name = ((v.name || "").trim() || c.name).slice(0, 40); bump(c); await saveAccount(); closeSheet(); renderList(); renderChat(); },
+    });
+  }));
+  items.push(menuItem("Kanal löschen", "Löst den Kanal bei euch beiden auf. Braucht das Kanal-Passwort.", true, () => deleteChannelSheet(c)));
+  openSheetNodes(c.name, items);
+}
+
+function deleteChannelSheet(c) {
+  formSheet("Kanal „" + c.name + "“ löschen", {
+    info: "Der Kanal wird bei dir und bei deinem Gegenüber aufgelöst. Das lässt sich nicht rückgängig machen.",
+    fields: [{ name: "pw", type: "password", label: "Passwort dieses Kanals" }],
+    submit: "Endgültig löschen",
+    danger: true,
+    busy: "Wird geprüft …",
+    onSubmit: async (v) => {
+      // Nur mit dem Passwort lässt sich die Mitteilung ans Gegenüber überhaupt erzeugen.
+      const k = await unwrapKeys(c, v.pw);
+      if (!(await dissolveChannel(c, "deleted", k.own))) throw new Error("Keine Verbindung. Der Kanal wurde nicht gelöscht, bitte noch einmal versuchen.");
+      closeSheet();
+      toast("Kanal gelöscht", "ok");
+    },
+  });
+}
+
+async function deleteForBoth(c, m) {
+  const r = runOf(c);
+  if (m.st !== "failed" && m.st !== "sending") {
+    try { await sendObj(c, { t: "del", ids: [m.me ? m.i : m.i.slice(1)] }, "c"); }
+    catch (e) { toast("Nicht gelöscht: " + (e.message || "keine Verbindung"), "err"); return; }
+    if (m.me && Number.isFinite(m.n) && r.kDel) {
+      // Liegt der Block noch auf dem Server, wird er dort direkt entfernt.
+      const kt = C.unb64(c.kt);
+      queueDelete(await C.msgTag(kt, c.dir, m.n), await C.msgDelToken(r.kDel, c.dir, m.n));
+    }
+  }
+  r.msgs = r.msgs.filter(x => x !== m);
+  dropMedia(c, m, true);
+  renderChat();
+  if (c.keep) saveHistorySoon(c);
+}
+
+function messageMenu(c, m) {
+  if (m.st === "failed" && m.retry) {
+    m.st = "sending";
+    renderChat();
+    deliver(c, m, m.retry);
+    return;
+  }
+  const items = [];
+  if (c.shots && m.k === "text" && m.x) items.push(menuItem("Text kopieren", "", false, () => { navigator.clipboard.writeText(m.x).then(() => toast("Kopiert", "ok")).catch(() => {}); }));
+  items.push(menuItem("Bei beiden löschen", "Verschwindet bei dir und beim Gegenüber, ohne Hinweis.", true, () => deleteForBoth(c, m)));
+  openSheetNodes(null, items);
+}
+
+// =========================================================================
+// ANZEIGE: Kanal-Liste
+// =========================================================================
+function avatarColor(seed) {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) % 360;
+  return `linear-gradient(135deg, hsl(${h} 70% 52%), hsl(${(h + 40) % 360} 75% 42%))`;
+}
+function initials(name) {
+  const p = String(name || "?").trim().split(/\s+/);
+  return (p.length >= 2 ? p[0][0] + p[1][0] : p[0].slice(0, 2)).toUpperCase();
+}
+
+function renderList() {
+  if (!S.acct) return;
+  const notes = $("#notes");
+  notes.textContent = "";
+  S.acct.notes.forEach((text, idx) => {
+    const n = el("div", "note");
+    n.appendChild(el("span", "", text));
+    const x = el("button", "note-x", "×");
+    x.type = "button";
+    x.setAttribute("aria-label", "Hinweis schließen");
+    x.addEventListener("click", () => { S.acct.notes.splice(idx, 1); saveLazy(); renderList(); });
+    n.appendChild(x);
+    notes.appendChild(n);
+  });
+  const list = $("#channel-list");
+  list.textContent = "";
+  let unread = 0;
+  if (!S.acct.ch.length) {
+    const e = el("div", "contact-empty");
+    e.appendChild(document.createTextNode("Noch keine Kanäle."));
+    e.appendChild(document.createElement("br"));
+    e.appendChild(document.createTextNode("Lege einen neuen Kanal an oder tritt mit einem Einmal-Code bei."));
+    list.appendChild(e);
+  }
+  for (const c of S.acct.ch) {
+    const r = runOf(c);
+    const row = el("div", "contact" + (c.id === S.active ? " active" : ""));
+    const av = el("div", "avatar", initials(c.name));
+    av.style.background = avatarColor(c.id);
+    const meta = el("div", "meta");
+    meta.appendChild(el("div", "name is-nick", c.name));
+    const line = el("div", "last-row");
+    let sub = "Ende-zu-Ende verschlüsselt";
+    if (c.pend) sub = c.pend.ans ? "Beitritt da: antippen und Passwort eingeben" : "Wartet auf Beitritt (Einmal-Code anzeigen)";
+    else if (c.id === S.active) sub = "geöffnet";
+    else if (!unlocked(c)) sub = "gesperrt";
+    line.appendChild(el("div", "last" + (c.pend ? " warn" : ""), sub));
+    const waiting = r.wait.size;
+    if (waiting > 0 && c.id !== S.active) { unread += waiting; line.appendChild(el("span", "unread", waiting > 99 ? "99+" : String(waiting))); }
+    meta.appendChild(line);
+    row.appendChild(av); row.appendChild(meta);
+    row.addEventListener("click", () => openChannel(c.id));
+    list.appendChild(row);
+  }
+  document.title = (unread > 0 ? "(" + unread + ") " : "") + APP_NAME;
+}
+
+// =========================================================================
+// ANZEIGE: Chat
 // =========================================================================
 const ICON = {
   back: '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg>',
   more: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>',
   lock: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>',
-  key: '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M11 12l9-9M17 6l3 3M14 9l2 2"/></svg>',
   timer: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="13" r="8"/><path d="M12 9v4l2.5 2M9 2h6"/></svg>',
-  eye: '<svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>',
   file: '<svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg>',
 };
+function svgEl(markup) { const s = el("span", "ico"); s.innerHTML = markup; return s; }   // nur feste Symbole
 
-function svgEl(markup) {
-  const span = document.createElement("span");
-  span.className = "ico";
-  span.innerHTML = markup;      // nur feste Symbole aus ICON, nie fremde Daten
-  return span;
-}
-
-// =========================================================================
-// AUSKLAPP-MENÜ (Blatt von unten bzw. Fenster in der Mitte)
-// =========================================================================
-function closeSheet() {
-  const bg = $("#sheet-bg");
-  bg.style.display = "none";
-  $("#sheet").textContent = "";
-}
-
-// items: [{ label, sub?, danger?, onClick }] oder { node }
-function openSheet(title, items) {
-  const sheet = $("#sheet");
-  sheet.textContent = "";
-  if (title) {
-    const h = document.createElement("div");
-    h.className = "sheet-title";
-    h.textContent = title;
-    sheet.appendChild(h);
-  }
-  for (const it of items) {
-    if (it.node) { sheet.appendChild(it.node); continue; }
-    const b = document.createElement("button");
-    b.type = "button";
-    b.className = "sheet-item" + (it.danger ? " danger" : "");
-    const l = document.createElement("span");
-    l.className = "sheet-label";
-    l.textContent = it.label;
-    b.appendChild(l);
-    if (it.sub) {
-      const sub = document.createElement("span");
-      sub.className = "sheet-sub";
-      sub.textContent = it.sub;
-      b.appendChild(sub);
-    }
-    b.addEventListener("click", () => { closeSheet(); it.onClick(); });
-    sheet.appendChild(b);
-  }
-  const cancel = document.createElement("button");
-  cancel.type = "button";
-  cancel.className = "sheet-item cancel";
-  cancel.textContent = "Schließen";
-  cancel.addEventListener("click", closeSheet);
-  sheet.appendChild(cancel);
-  $("#sheet-bg").style.display = "flex";
-}
-
-// =========================================================================
-// REGELN JE CHAT
-// =========================================================================
-const TTL_CHOICES = [
-  [0, "Aus"], [1, "1 Minute"], [5, "5 Minuten"], [30, "30 Minuten"],
-  [60, "1 Stunde"], [1440, "1 Tag"], [10080, "7 Tage"],
-];
-
-function ttlLabel(min) {
-  if (!min) return "aus";
-  const hit = TTL_CHOICES.find(c => c[0] === min);
-  if (hit) return hit[1];
-  if (min < 60) return min + " Minuten";
-  if (min % 1440 === 0) return (min / 1440) + " Tage";
-  if (min % 60 === 0) return (min / 60) + " Stunden";
-  return min + " Minuten";
-}
-
-function setRules(peer, change) {
-  const c = chatOf(peer, true);
-  const r = sanitizeRules(c.rules);
-  c.rules = sanitizeRules({ ...r, ...change, v: r.v + 1 });
-  STATE.historyDirty = true;
-  scheduleHistorySave();
-  if (STATE.activeChat === peer) renderChat();
-}
-
-function openRulesSheet(peer) {
-  const c = chatOf(peer);
-  const r = c ? sanitizeRules(c.rules) : emptyRules();
-  const items = [];
-  const info = document.createElement("p");
-  info.className = "sheet-info";
-  info.textContent = "Diese Regeln gelten für DEINE Nachrichten in diesem Chat, und zwar bei dir und beim Gegenüber. Gelöschtes verschwindet spurlos, ohne Hinweis.";
-  items.push({ node: info });
-  const h1 = document.createElement("div");
-  h1.className = "sheet-section";
-  h1.textContent = "Meine Nachrichten bei beiden löschen nach";
-  items.push({ node: h1 });
-  for (const [min, label] of TTL_CHOICES) {
-    items.push({ label: (r.ttl === min ? "● " : "○ ") + label, onClick: () => { setRules(peer, { ttl: min }); toast("Löschfrist: " + ttlLabel(min), "ok"); } });
-  }
-  items.push({ label: "○ Eigene Minutenzahl …", onClick: () => {
-    const v = prompt("Nach wie vielen Minuten sollen deine Nachrichten bei beiden gelöscht werden?", r.ttl ? String(r.ttl) : "10");
-    if (v === null) return;
-    const n = Math.floor(Number(String(v).replace(",", ".")));
-    if (!Number.isFinite(n) || n < 1 || n > TTL_MAX_MIN) { toast("Bitte eine Zahl zwischen 1 und " + TTL_MAX_MIN + " eingeben.", "err"); return; }
-    setRules(peer, { ttl: n });
-    toast("Löschfrist: " + ttlLabel(n), "ok");
-  } });
-  const h2 = document.createElement("div");
-  h2.className = "sheet-section";
-  h2.textContent = "Einmal-Ansicht";
-  items.push({ node: h2 });
-  items.push({
-    label: (r.once ? "● An" : "○ An"),
-    sub: "Deine Nachrichten sind nur einmal zu sehen. Sobald der Chat verlassen wird, sind sie weg, bei dir sofort nach dem Wechsel.",
-    onClick: () => { setRules(peer, { once: 1 }); toast("Einmal-Ansicht an", "ok"); },
-  });
-  items.push({ label: (r.once ? "○ Aus" : "● Aus"), onClick: () => { setRules(peer, { once: 0 }); toast("Einmal-Ansicht aus", "ok"); } });
-  openSheet("Regeln für diesen Chat", items);
-}
-
-function openChatMenu(peer) {
-  const nick = STATE.nicknames[peer] || "";
-  openSheet(null, [
-    { label: "Regeln (Löschfrist, Einmal-Ansicht)", onClick: () => openRulesSheet(peer) },
-    { label: nick ? "Spitzname ändern" : "Spitzname vergeben", onClick: () => promptNickname(peer) },
-    { label: "Adresse kopieren", onClick: () => { navigator.clipboard.writeText(peer).then(() => toast("Adresse kopiert", "ok")).catch(() => {}); } },
-    { label: "Chat bei beiden leeren", danger: true, sub: "Entfernt alle Nachrichten bei dir und beim Gegenüber.", onClick: async () => {
-      if (!confirm("Alle Nachrichten dieses Chats bei dir UND beim Gegenüber löschen?\n\nDas lässt sich nicht rückgängig machen.")) return;
-      const saved = await deleteForBoth(peer, [], true);
-      toast(saved ? "Chat bei beiden geleert" : "Geleert, wird gesichert sobald der Server erreichbar ist", saved ? "ok" : "err");
-    } },
-    { label: "Verlauf nur bei mir löschen", danger: true, onClick: async () => {
-      if (!confirm("Den gesamten Verlauf dieses Chats nur bei dir löschen?\n\nBeim Gegenüber bleibt er bestehen.")) return;
-      const saved = await clearChat(peer);
-      renderSidebar();
-      renderChat();
-      toast(saved ? "Verlauf gelöscht" : "Gelöscht, wird gesichert sobald der Server erreichbar ist", saved ? "ok" : "err");
-    } },
-  ]);
-}
-
-function openMessageMenu(peer, m) {
-  const items = [];
-  if (m.k === "text" && m.x) {
-    items.push({ label: "Text kopieren", onClick: () => { navigator.clipboard.writeText(m.x).then(() => toast("Kopiert", "ok")).catch(() => {}); } });
-  }
-  items.push({ label: "Bei beiden löschen", danger: true, sub: "Verschwindet bei dir und beim Gegenüber, ohne Hinweis.", onClick: async () => {
-    const saved = await deleteForBoth(peer, [m], false);
-    if (!saved) toast("Gelöscht, wird gesichert sobald der Server erreichbar ist", "err");
-  } });
-  items.push({ label: "Nur bei mir löschen", onClick: async () => {
-    removeMessages(peer, [m.id], false);
-    renderSidebar();
-    renderChat();
-    await saveHistory();
-  } });
-  if (m.me && m.p) {
-    items.push({ label: "Beweis ansehen", sub: "Zeigt öffentlich, was der Server zu dieser Nachricht gespeichert hat. Kennung: " + m.p, onClick: () => {
-      window.open("/beweis#" + m.p, "_blank", "noopener");
-    } });
-  }
-  openSheet(null, items);
-}
-
-// Linke Leiste ein- und ausklappen (Knopf oben links). Am Rechner bleibt dann
-// nur der Chat. Am Handy sind Liste und Chat ohnehin getrennte Ansichten: dort
-// wechselt der Knopf in den offenen Chat.
-function toggleSidebar() {
-  const view = $("#view-chat");
-  if (window.matchMedia("(max-width: 720px)").matches) {
-    if (STATE.activeChat) view.classList.add("peek-chat");
-    else toast("Wähle erst einen Chat aus.");
+function renderChat(forceBottom) {
+  const stream = $("#chat-stream"), header = $("#chat-header"), bar = $("#info-bar"), composer = $("#form-send");
+  const c = S.active ? chan(S.active) : null;
+  if (!c || !S.me) {
+    stream.textContent = ""; header.textContent = ""; bar.hidden = true; composer.style.display = "none";
+    document.body.classList.remove("no-select");
+    if (S.me) stream.appendChild(el("div", "empty", "Wähle links einen Kanal oder lege einen neuen an."));
     return;
   }
-  view.classList.toggle("sidebar-collapsed");
-}
-
-// Eigene Adresse: steht nicht dauerhaft da, sondern wird auf Wunsch für
-// 10 Sekunden eingeblendet (mit Kopieren und Ausblenden).
-const ADDR_SHOW_MS = 10000;
-let _addrTimer = null;
-
-function hideMyAddress() {
-  if (_addrTimer) { clearTimeout(_addrTimer); _addrTimer = null; }
-  const bar = $("#addr-reveal");
-  bar.hidden = true;
-  $("#me-address-full").textContent = "";
-  bar.classList.remove("counting");
-  $("#me-address-label").textContent = "Adresse anzeigen";
-}
-
-function showMyAddress() {
-  if (!STATE.me) return;
-  const bar = $("#addr-reveal");
-  $("#me-address-full").textContent = STATE.me.address;
-  bar.hidden = false;
-  $("#me-address-label").textContent = "Adresse ausblenden";
-  // Fortschrittsbalken neu starten
-  bar.classList.remove("counting");
-  void bar.offsetWidth;
-  bar.classList.add("counting");
-  if (_addrTimer) clearTimeout(_addrTimer);
-  _addrTimer = setTimeout(hideMyAddress, ADDR_SHOW_MS);
-}
-
-// =========================================================================
-// CHAT-ANSICHT
-// =========================================================================
-function renderChat(forceBottom=false) {
-  const stream = $("#chat-stream");
-  const header = $("#chat-header");
-  const banner = $("#request-banner");
-  const composer = $("#form-send");
-  const rulesBar = $("#rules-bar");
-  const peer = STATE.activeChat;
-  if (!peer || !STATE.me) {
-    stream.textContent = "";
-    header.textContent = "";
-    banner.style.display = "none";
-    composer.style.display = "none";
-    rulesBar.hidden = true;
-    const hint = document.createElement("div");
-    hint.className = "empty";
-    hint.textContent = STATE.me ? "Wähle links einen Chat oder füge oben eine Adresse hinzu." : "";
-    stream.appendChild(hint);
-    return;
-  }
+  const r = runOf(c);
   composer.style.display = "";
-  const contact = isContact(peer);
-  const chat = chatOf(peer);
-  const msgs = chat ? chat.msgs : [];
-  const isRequest = !contact && msgs.some(m => !m.me);
-  const nick = STATE.nicknames[peer] || "";
+  document.body.classList.toggle("no-select", !c.shots);
 
   header.textContent = "";
-  const back = document.createElement("button");
-  back.className = "icon-btn back";
-  back.id = "btn-back";
+  const back = el("button", "icon-btn back");
   back.setAttribute("aria-label", "Zurück");
   back.appendChild(svgEl(ICON.back));
-  const av = document.createElement("div");
-  av.className = "avatar";
-  av.style.background = avatarColor(peer);
-  av.textContent = avatarLabel(peer);
-  const idBox = document.createElement("div");
-  idBox.className = "head-id";
-  if (nick) { const n = document.createElement("div"); n.className = "head-name"; n.textContent = nick; idBox.appendChild(n); }
-  const addrEl = document.createElement("div");
-  addrEl.className = "head-addr";
-  addrEl.title = "Adresse kopieren";
-  addrEl.textContent = peer;
-  idBox.appendChild(addrEl);
-  const sec = document.createElement("div");
-  sec.className = "head-sec";
+  back.addEventListener("click", () => closeChannel(false));
+  const av = el("div", "avatar", initials(c.name));
+  av.style.background = avatarColor(c.id);
+  const idBox = el("div", "head-id");
+  idBox.appendChild(el("div", "head-name", c.name));
+  const sec = el("div", "head-sec");
   sec.appendChild(svgEl(ICON.lock));
   sec.appendChild(document.createTextNode(" Ende-zu-Ende verschlüsselt"));
   idBox.appendChild(sec);
-  const menu = document.createElement("button");
-  menu.className = "icon-btn";
+  const menu = el("button", "icon-btn");
   menu.id = "btn-chat-menu";
   menu.setAttribute("aria-label", "Menü");
   menu.appendChild(svgEl(ICON.more));
-  header.appendChild(back);
-  header.appendChild(av);
-  header.appendChild(idBox);
-  header.appendChild(menu);
+  menu.addEventListener("click", () => channelMenu(c));
+  header.appendChild(back); header.appendChild(av); header.appendChild(idBox); header.appendChild(menu);
 
-  back.addEventListener("click", () => {
-    $("#view-chat").classList.remove("peek-chat");
-    leaveChat();
-    STATE.activeChat = null;
-    renderSidebar();
-    renderChat();
-  });
-  menu.addEventListener("click", () => openChatMenu(peer));
-  addrEl.addEventListener("click", () => {
-    navigator.clipboard.writeText(peer).then(() => toast("Adresse kopiert", "ok")).catch(() => {});
-  });
+  bar.textContent = "";
+  bar.hidden = false;
+  const chip = (text, icon) => { const s = el("span", "chip"); if (icon) s.appendChild(svgEl(icon)); s.appendChild(document.createTextNode(" " + text)); bar.appendChild(s); };
+  if (c.keep) chip("Verlauf wird behalten (verschlüsselt, nur für euch beide)");
+  else chip("Deine Nachrichten bleiben " + fmtDuration(S.acct.set.view) + " nach dem Öffnen sichtbar, danach werden sie gelöscht. Beim Verlassen des Chats sofort.", ICON.timer);
+  chip(c.shots ? "Screenshots erlaubt" : "Screenshots verboten");
+  if (c.ro.length) chip("Anfrage gesendet: wartet auf Zustimmung");
 
-  // Hinweiszeile zu aktiven Regeln
-  const r = chat ? sanitizeRules(chat.rules) : emptyRules();
-  rulesBar.textContent = "";
-  if (r.ttl || r.once) {
-    if (r.ttl) { const c1 = document.createElement("span"); c1.className = "chip"; c1.appendChild(svgEl(ICON.timer)); c1.appendChild(document.createTextNode(" Meine Nachrichten: bei beiden weg nach " + ttlLabel(r.ttl))); rulesBar.appendChild(c1); }
-    if (r.once) { const c2 = document.createElement("span"); c2.className = "chip"; c2.appendChild(svgEl(ICON.eye)); c2.appendChild(document.createTextNode(" Einmal-Ansicht")); rulesBar.appendChild(c2); }
-    rulesBar.hidden = false;
-    rulesBar.onclick = () => openRulesSheet(peer);
-  } else {
-    rulesBar.hidden = true;
-  }
-
-  banner.style.display = isRequest ? "flex" : "none";
-
-  const nearBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120;
+  const nearBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 140;
   const oldTop = stream.scrollTop;
   stream.textContent = "";
-
-  if (!msgs.length) {
-    const empty = document.createElement("div");
-    empty.className = "empty";
-    empty.textContent = "Noch keine Nachrichten.";
-    stream.appendChild(empty);
+  if (!r.msgs.length) {
+    stream.appendChild(el("div", "empty", c.keep ? "Noch keine Nachrichten." : "Keine Nachrichten. Was hier geschrieben wird, verschwindet von selbst."));
     return;
   }
-
-  const start = Math.max(0, msgs.length - STATE.showCount);
-  if (start > 0) {
-    const more = document.createElement("button");
-    more.className = "ghost small older-btn";
-    more.textContent = `Ältere Nachrichten anzeigen (${start})`;
-    more.addEventListener("click", () => { STATE.showCount += SHOW_STEP; renderChat(); stream.scrollTop = 0; });
-    stream.appendChild(more);
-  }
-
-  // Medien von Adressen, die noch kein Kontakt sind, erst nach Klick laden.
-  const autoMedia = contact || STATE.mediaAllowed.has(peer);
-  // Reine Reihenfolge, bewusst ohne Datum und Uhrzeit.
   let prevMe = null;
-  for (let i = start; i < msgs.length; i++) {
-    const m = msgs[i];
-    const row = messageRow(m, autoMedia || !!m.me, peer);
+  for (const m of r.msgs) {
+    const row = messageRow(c, m);
     if (prevMe !== null && prevMe !== !!m.me) row.classList.add("gap");
     prevMe = !!m.me;
     stream.appendChild(row);
   }
-  if (forceBottom || nearBottom) stream.scrollTop = stream.scrollHeight;
-  else stream.scrollTop = oldTop;
-}
-
-function avatarColor(addr) {
-  // Farbe aus der Adresse (rein optisch, damit Chats leichter zu unterscheiden sind).
-  let h = 0;
-  for (let i = 0; i < addr.length; i++) h = (h * 31 + addr.charCodeAt(i)) % 360;
-  return `linear-gradient(135deg, hsl(${h} 70% 52%), hsl(${(h + 40) % 360} 75% 42%))`;
-}
-
-function messageRow(m, autoMedia, peer) {
-  const row = document.createElement("div");
-  row.className = "msg-row" + (m.me ? " me" : "");
-  row.dataset.id = m.id;
-  const bubble = document.createElement("div");
-  bubble.className = "bubble";
-
-  if (m.k === "text") {
-    const body = document.createElement("span");
-    body.className = "body";
-    body.textContent = m.x;
-    bubble.appendChild(body);
-  } else {
-    bubble.appendChild(mediaElement(m, autoMedia, peer));
-    if (m.a && m.a.c) {
-      const cap = document.createElement("div");
-      cap.className = "body";
-      cap.textContent = m.a.c;
-      bubble.appendChild(cap);
-    }
-  }
-  if (m.u) {
-    const note = document.createElement("span");
-    note.className = "unverified";
-    note.textContent = "Ältere Version: Absender nicht geprüft";
-    bubble.appendChild(note);
-  }
-  const meta = document.createElement("span");
-  meta.className = "ts";
-  if (m.e) { const t = svgEl(ICON.timer); t.title = "Verschwindet nach Ablauf der Löschfrist"; meta.appendChild(t); }
-  if (m.q) { const e = svgEl(ICON.eye); e.title = "Einmal-Ansicht"; meta.appendChild(e); }
-  if (m.me) { const tick = document.createElement("span"); tick.className = "tick"; tick.title = "Gesendet"; tick.textContent = "✓"; meta.appendChild(tick); }
-  if (meta.childNodes.length) bubble.appendChild(meta);
-  // Antippen (bzw. Rechtsklick) öffnet die Aktionen zur Nachricht.
-  bubble.addEventListener("click", (e) => {
-    if (e.target.closest("button, a, audio, video, .media-action")) return;
-    openMessageMenu(peer, m);
-  });
-  row.appendChild(bubble);
-  return row;
+  if (forceBottom || nearBottom) stream.scrollTop = stream.scrollHeight; else stream.scrollTop = oldTop;
 }
 
 function fmtSize(n) {
   if (!n) return "";
   if (n < 1024) return n + " B";
-  if (n < 1024 * 1024) return (n / 1024).toFixed(0) + " KB";
-  return (n / 1024 / 1024).toFixed(1) + " MB";
+  if (n < 1048576) return Math.round(n / 1024) + " KB";
+  return (n / 1048576).toFixed(1) + " MB";
 }
 
-function mediaElement(m, autoMedia, peer) {
-  const a = m.a || {};
+function messageRow(c, m) {
+  const row = el("div", "msg-row" + (m.me ? " me" : ""));
+  const bubble = el("div", "bubble" + (m.st === "failed" ? " failed" : ""));
+  if (m.k === "text") bubble.appendChild(el("span", "body", m.x));
+  else bubble.appendChild(mediaNode(c, m));
+  const meta = el("span", "ts");
+  if (m.exp) { const cd = el("span", "countdown", fmtClock((m.exp - Date.now()) / 1000)); cd.dataset.exp = String(m.exp); cd.title = "So lange bleibt die Nachricht noch sichtbar"; meta.appendChild(cd); }
+  if (m.me) {
+    const st = m.st === "seen" ? "✓✓" : (m.st === "sent" ? "✓" : (m.st === "failed" ? "nicht gesendet" : "…"));
+    const tick = el("span", "tick", st);
+    tick.title = m.st === "seen" ? "Gelesen" : (m.st === "sent" ? "Gesendet" : (m.st === "failed" ? "Antippen zum Wiederholen" : "Wird gesendet"));
+    meta.appendChild(tick);
+  }
+  if (meta.childNodes.length) bubble.appendChild(meta);
+  bubble.addEventListener("click", (e) => {
+    if (e.target.closest("button, a, audio, video")) return;
+    messageMenu(c, m);
+  });
+  row.appendChild(bubble);
+  return row;
+}
+
+function mediaNode(c, m) {
   const labels = { image: "Bild", video: "Video", voice: "Sprachnachricht", file: "Datei" };
   const label = labels[m.k] || "Datei";
-  const allowed = MEDIA_MIMES[m.k] || [];
-  const mime = m.k === "file" ? "application/octet-stream" : (allowed.includes(a.m) ? a.m : null);
-  if (!mime || !TOKEN_RE.test(a.t || "") || !a.k || !a.i) {
-    const note = document.createElement("div");
-    note.className = "pending";
-    note.textContent = `[${label} kann nicht angezeigt werden]`;
-    return note;
-  }
-  const wrap = document.createElement("div");
-  wrap.className = "media";
-
-  // Dateien (z. B. PDF) werden nie im Browser dargestellt, nur auf Klick
-  // entschlüsselt und gespeichert.
-  if (m.k === "file") {
-    const btn = document.createElement("button");
+  const wrap = el("div", "media");
+  if (m.gone) { wrap.appendChild(el("div", "pending", `[${label} nicht mehr verfügbar]`)); return wrap; }
+  if (!m.url) { wrap.appendChild(el("div", "pending", `${label} wird entschlüsselt …`)); return wrap; }
+  const show = (SHOW_MIMES[m.k] || []).includes(m.a.m);
+  if (m.k === "file" || !show) {
+    const btn = el("button", "file-card");
     btn.type = "button";
-    btn.className = "file-card media-action";
     btn.appendChild(svgEl(ICON.file));
-    const txt = document.createElement("span");
-    txt.className = "file-meta";
-    const nm = document.createElement("span"); nm.className = "file-name"; nm.textContent = a.n || "datei";
-    const sz = document.createElement("span"); sz.className = "file-size"; sz.textContent = (fmtSize(a.s) + " · verschlüsselt").replace(/^ · /, "");
-    txt.appendChild(nm); txt.appendChild(sz);
+    const txt = el("span", "file-meta");
+    txt.appendChild(el("span", "file-name", m.k === "file" ? (m.a.n || "datei") : label));
+    txt.appendChild(el("span", "file-size", (fmtSize(m.a.s) + " · verschlüsselt übertragen").replace(/^ · /, "")));
     btn.appendChild(txt);
-    btn.addEventListener("click", async () => {
-      if (!m.me && !confirm("Diese Datei entschlüsseln und auf deinem Gerät speichern?\n\nÖffne Dateien nur von Leuten, denen du vertraust. Auf dem Gerät liegt sie danach unverschlüsselt.")) return;
-      sz.textContent = "wird entschlüsselt …";
-      try {
-        const url = await loadMediaUrl(a, "application/octet-stream");
-        const link = document.createElement("a");
-        link.href = url;
-        link.download = safeFileName(a.n);
-        document.body.appendChild(link);
-        link.click();
-        setTimeout(() => { try { document.body.removeChild(link); } catch (e) {} }, 200);
-        sz.textContent = (fmtSize(a.s) + " · gespeichert").replace(/^ · /, "");
-      } catch (e) {
-        sz.textContent = "nicht mehr verfügbar";
-      }
+    btn.addEventListener("click", () => {
+      if (!c.shots && !m.me) { toast("Speichern ist in diesem Kanal nicht erlaubt (wie Screenshots).", "err"); return; }
+      const a = document.createElement("a");
+      a.href = m.url; a.download = m.k === "file" ? safeName(m.a.n) : "datei";
+      document.body.appendChild(a); a.click();
+      setTimeout(() => a.remove(), 200);
     });
     wrap.appendChild(btn);
     return wrap;
   }
-
-  if (!autoMedia) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "ghost small media-action";
-    btn.textContent = `${label} laden`;
-    btn.title = "Diese Adresse ist noch kein Kontakt. Medien werden erst nach deinem Klick geladen.";
-    btn.addEventListener("click", () => { STATE.mediaAllowed.add(peer); renderChat(); });
-    wrap.appendChild(btn);
-    return wrap;
-  }
-  const note = document.createElement("div");
-  note.className = "pending";
-  note.textContent = `${label} wird entschlüsselt …`;
-  wrap.appendChild(note);
-  loadMediaUrl(a, mime).then(url => {
-    const tag = m.k === "video" ? "video" : (m.k === "voice" ? "audio" : "img");
-    const el = document.createElement(tag);
-    if (tag === "img") el.alt = "Bild"; else { el.controls = true; el.preload = "metadata"; }
-    el.src = url;
-    attachDownloadWarning(el);
-    wrap.textContent = "";
-    wrap.appendChild(el);
-  }).catch(() => {
-    note.textContent = `[${label} nicht mehr verfügbar]`;
-  });
+  const tag = m.k === "video" ? "video" : (m.k === "voice" ? "audio" : "img");
+  const node = document.createElement(tag);
+  if (tag === "img") { node.alt = "Bild"; node.draggable = false; }
+  else { node.controls = true; node.preload = "metadata"; node.setAttribute("controlsList", "nodownload noplaybackrate"); node.disablePictureInPicture = true; }
+  node.src = m.url;
+  wrap.appendChild(node);
   return wrap;
 }
 
-function loadMediaUrl(a, mime) {
-  if (MEDIA_URLS.has(a.t)) return MEDIA_URLS.get(a.t);
-  const p = (async () => {
-    const enc = await API.fetchAttachment(a.t);
-    const fileKey = new Uint8Array(LehnoCrypto.unb64(a.k));
-    const iv = LehnoCrypto.unb64(a.i);
-    const plain = await LehnoCrypto.decryptFile(fileKey, iv, enc);
-    return URL.createObjectURL(new Blob([plain], { type: mime }));
-  })();
-  MEDIA_URLS.set(a.t, p);
-  p.catch(() => MEDIA_URLS.delete(a.t));
-  return p;
-}
-
-// =========================================================================
-// SENDEN
-// Der Empfänger (peer) wird immer vom Aufrufer festgehalten, nie mitten im
-// Vorgang neu aus dem gerade offenen Chat gelesen.
-// =========================================================================
-let _lastFailed = null;   // { peer, text, id } eines gescheiterten Sendeversuchs
-let _sendChain = Promise.resolve();
-
-class SessionChanged extends Error {}
-
-// me und sid werden vom Aufrufer am Anfang festgehalten. Wechselt die Sitzung
-// zwischendurch (Abmelden, anderes Konto), wird abgebrochen: nie darf eine
-// Nachricht mit dem Schlüssel eines anderen Kontos rausgehen.
-async function sendBody(me, sid, peer, body, opts) {
-  const recipientPub = await fetchPubKey(peer);
-  if (sid !== STATE.sid) throw new SessionChanged();
-  const enc = await LehnoCrypto.encryptMessage(me, recipientPub, {
-    ...body,
-    is_contact_request: !isContact(peer),
-  }, opts);
-  if (sid !== STATE.sid) throw new SessionChanged();
-  const packet = {
-    v: 2,
-    recipient_address: peer,
-    ephemeral_pub_b64: enc.ephemeral_pub_b64,
-    nonce_b64: enc.nonce_b64,
-    ciphertext_b64: enc.ciphertext_b64,
-  };
-  enc.proof = await proofIdOf(packet);
-  await transmit(packet);
-  if (sid !== STATE.sid) throw new SessionChanged();
-  return enc;
-}
-
-// Öffentliche Beweis-Kennung: Hash über genau die Felder, die der Server
-// speichert. Auf der Beweis-Seite kann jeder nachsehen, was dazu gespeichert ist.
-async function proofIdOf(packet) {
-  const h = new Uint8Array(await crypto.subtle.digest("SHA-256",
-    LehnoCrypto.utf8(packet.ephemeral_pub_b64 + "|" + packet.nonce_b64 + "|" + packet.ciphertext_b64)));
-  let hex = "";
-  for (let i = 0; i < 12; i++) hex += h[i].toString(16).padStart(2, "0");
-  return hex;
-}
-
-// Mit Tarnverkehr geht ein Paket nicht sofort raus, sondern im nächsten Takt
-// (dort wo sonst ein Tarnpaket gegangen wäre). Ohne Tarnverkehr sofort.
-function transmit(packet) {
-  if (!STATE.cover) return API.sendPacket(packet);
-  return new Promise((resolve, reject) => { STATE.outQueue.push({ packet, resolve, reject }); });
-}
-
-async function afterSent(sid, peer, msg) {
-  if (sid !== STATE.sid) return;          // inzwischen abgemeldet: nichts in fremden Zustand schreiben
-  addMessage(peer, msg);
-  ensureContact(peer);
-  if (STATE.activeChat === peer) {
-    markRead(peer, false);
-  } else if (msg.q) {
-    // Der Chat wurde schon verlassen: eine eigene Einmal-Nachricht taucht dann
-    // gar nicht mehr auf (und Ungesehenes des Gegenübers gilt nicht als gesehen).
-    removeMessages(peer, [msg.id], false);
-  }
-  STATE.historyDirty = true;
-  renderSidebar();
-  if (STATE.activeChat === peer) renderChat(true);
-  const saved = await saveHistory();
-  if (!saved && sid === STATE.sid) toast("Gesendet, aber der Verlauf konnte noch nicht gesichert werden. Neuer Versuch folgt.", "err");
-}
-
-function ruleBody(rule) {
-  const b = {};
-  if (rule.ttl) { b.ttl = rule.ttl; b.exp = rule.exp; }
-  if (rule.once) b.once = 1;
-  return b;
-}
-
-async function sendText(peer, text) {
-  const sid = STATE.sid;
-  const me = STATE.me;
-  // Wiederholung derselben Nachricht nach einem Fehler: gleiche Kennung, damit
-  // der Empfänger sie nicht doppelt bekommt, falls der erste Versuch doch ankam.
-  const reuse = (_lastFailed && _lastFailed.peer === peer && _lastFailed.text === text) ? _lastFailed : null;
-  const opts = { msgId: reuse ? reuse.id : LehnoCrypto.b64(LehnoCrypto.randomBytes(16)) };
-  const rule = outgoingRules(peer);
-  let enc;
-  try {
-    enc = await sendBody(me, sid, peer, { msg_type: "text", text, ...ruleBody(rule) }, opts);
-  } catch (e) {
-    if (sid === STATE.sid && !(e instanceof SessionChanged)) _lastFailed = { peer, text, id: opts.msgId };
-    throw e;
-  }
-  if (sid === STATE.sid) _lastFailed = null;
-  // Anzeige sofort, das Sichern läuft im Hintergrund weiter (die nächste
-  // Nachricht muss darauf nicht warten).
-  afterSent(sid, peer, { id: enc.msg_id, me: 1, k: "text", x: text, p: enc.proof, ...ruleFields(rule), o: nextOrder() }).catch(() => {});
-}
-
-// Bild, Video, Sprachnachricht oder beliebige Datei: wird im Browser mit einem
-// eigenen Zufallsschlüssel verschlüsselt, auf Einheitsgröße aufgefüllt und
-// hochgeladen. Schlüssel, Dateiname und Art stehen nur in der verschlüsselten Nachricht.
-async function sendMedia(peer, blob, mime, msgType, extra={}) {
-  const sid = STATE.sid;
-  const me = STATE.me;
-  if (msgType !== "file" && !(MEDIA_MIMES[msgType] || []).includes(mime)) throw new Error("Dieses Format wird hier nicht unterstützt.");
-  if (blob.size > 16 * 1024 * 1024 - 64) throw new Error("Die Datei ist zu groß (höchstens 16 MB).");
-  toast("Verschlüsseln und senden …");
-  const fileBytes = new Uint8Array(await blob.arrayBuffer());
-  const encFile = await LehnoCrypto.encryptFile(fileBytes);
-  if (sid !== STATE.sid) throw new SessionChanged();
-  const up = await API.uploadAttachment(new Blob([encFile.ciphertext], { type: "application/octet-stream" }));
-  const a = { t: up.token, k: LehnoCrypto.b64(encFile.fileKey), i: LehnoCrypto.b64(encFile.iv), m: mime, c: extra.caption || "" };
-  if (msgType === "file") { a.n = safeFileName(extra.name); a.s = fileBytes.byteLength; }
-  const rule = outgoingRules(peer);
-  let enc;
-  try {
-    if (sid !== STATE.sid) throw new SessionChanged();
-    enc = await sendBody(me, sid, peer, {
-      msg_type: msgType, attachment_token: a.t, file_key_b64: a.k, file_iv_b64: a.i, mime, caption: a.c,
-      ...(msgType === "file" ? { file_name: a.n, file_size: a.s } : {}),
-      ...ruleBody(rule),
-    });
-  } catch (e) {
-    // Nachricht ging nicht raus: die hochgeladene Datei wieder entfernen.
-    API.deleteAttachment(up.token).catch(() => {});
-    throw e;
-  }
-  afterSent(sid, peer, { id: enc.msg_id, me: 1, k: msgType, x: "", a, p: enc.proof, ...ruleFields(rule), o: nextOrder() }).catch(() => {});
-  if (sid === STATE.sid) toast("Gesendet", "ok");
+function updateCountdowns() {
+  const now = Date.now();
+  for (const e of $$("#chat-stream .countdown")) e.textContent = fmtClock((Number(e.dataset.exp) - now) / 1000);
 }
 
 // =========================================================================
 // SPRACHNACHRICHT
 // =========================================================================
-let _rec = null;      // { recorder, stream, chunks, peer, sid, cancelled }
-let _recStarting = false;
-
+let _rec = null, _recStarting = false;
 async function startRecording() {
-  const peer = STATE.activeChat;
-  const sid = STATE.sid;
-  if (!peer || _rec || _recStarting) return;
+  const c = S.active ? chan(S.active) : null;
+  const sid = S.sid;
+  if (!c || _rec || _recStarting) return;
   if (!navigator.mediaDevices || typeof MediaRecorder === "undefined") { toast("Dieser Browser kann keine Sprachnachrichten aufnehmen.", "err"); return; }
   _recStarting = true;
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
   catch (e) { _recStarting = false; toast("Kein Zugriff auf das Mikrofon.", "err"); return; }
   _recStarting = false;
-  // Während der Mikrofon-Abfrage abgemeldet oder den Chat gewechselt: abbrechen.
-  if (sid !== STATE.sid || STATE.activeChat !== peer) {
-    try { stream.getTracks().forEach(t => t.stop()); } catch (e) {}
-    return;
-  }
+  if (sid !== S.sid || S.active !== c.id) { try { stream.getTracks().forEach(t => t.stop()); } catch (e) {} return; }
   const mime = ["audio/webm", "audio/ogg", "audio/mp4"].find(t => MediaRecorder.isTypeSupported(t)) || "";
   const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
-  const rec = { recorder, stream, chunks: [], peer, sid, cancelled: false };
+  const rec = { recorder, stream, chunks: [], id: c.id, sid, cancelled: false };
   _rec = rec;
   recorder.ondataavailable = (e) => { if (e.data && e.data.size) rec.chunks.push(e.data); };
   recorder.onstop = async () => {
     if (_rec === rec) _rec = null;
     try { rec.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
     updateRecordUI();
-    if (rec.cancelled || rec.sid !== STATE.sid || !rec.chunks.length) return;
+    const ch = chan(rec.id);
+    if (rec.cancelled || rec.sid !== S.sid || !rec.chunks.length || !ch || S.active !== rec.id) return;
     const type = (recorder.mimeType || mime || "audio/webm").split(";")[0];
-    try { await sendMedia(rec.peer, new Blob(rec.chunks, { type }), type, "voice"); }
-    catch (err) { if (rec.sid === STATE.sid && !(err instanceof SessionChanged)) toast("Nicht gesendet: " + humanError(err), "err"); }
+    try { await sendMedia(ch, new File(rec.chunks, "aufnahme", { type }), "voice", ""); }
+    catch (err) { toast("Nicht gesendet: " + (err.message || ""), "err"); }
   };
   recorder.start();
   updateRecordUI();
 }
-
 function stopRecording(cancel) {
   const rec = _rec;
   if (!rec) return;
   rec.cancelled = !!cancel;
   try { rec.recorder.stop(); }
-  catch (e) {
-    try { rec.stream.getTracks().forEach(t => t.stop()); } catch (e2) {}
-    _rec = null;
-    updateRecordUI();
-  }
+  catch (e) { try { rec.stream.getTracks().forEach(t => t.stop()); } catch (e2) {} _rec = null; updateRecordUI(); }
 }
-
 function updateRecordUI() {
   const btn = $("#btn-record"), bar = $("#record-bar");
   if (!btn || !bar) return;
@@ -2096,185 +2134,17 @@ function updateRecordUI() {
 }
 
 // =========================================================================
-// TARNVERKEHR: gleichmäßiger Takt
-// In jedem Takt geht genau ein Paket in Einheitsgröße raus (echte Nachricht
-// oder Tarnpaket) und das Postfach wird abgefragt (Antwort in fester Größe).
-// Zusätzlich gibt es in zufälligen Takten denselben Ablauf wie nach einer
-// echten Nachricht (Verlauf sichern, bestätigen), auch wenn nichts passiert ist.
-// Von außen sieht man einen gleichförmigen Strom, in dem einzelne Nachrichten
-// nicht erkennbar sind.
+// BEDIENUNG
 // =========================================================================
-let _tickTimer = null;
-
-function randInt(n) {
-  const r = new Uint32Array(1);
-  crypto.getRandomValues(r);
-  return r[0] % n;
-}
-
-function startTick() {
-  if (_tickTimer) { clearTimeout(_tickTimer); _tickTimer = null; }
-  const sid = STATE.sid;
-  const run = async () => {
-    _tickTimer = null;
-    if (!STATE.me || sid !== STATE.sid) return;
-    if (STATE.cover) {
-      try { await tickOnce(sid); } catch (e) {}
-    } else {
-      // Tarnverkehr abgeschaltet: Wartendes sofort senden.
-      while (STATE.outQueue.length) {
-        const item = STATE.outQueue.shift();
-        API.sendPacket(item.packet).then(item.resolve, item.reject);
-      }
-    }
-    if (STATE.me && sid === STATE.sid) _tickTimer = setTimeout(run, 2500 + randInt(2000));
-  };
-  _tickTimer = setTimeout(run, 400);
-}
-
-function decoyPacket() {
-  const C = LehnoCrypto;
-  // Zufallsdaten in genau der Form eines echten kleinen Pakets.
-  const eph = C.randomBytes(65);
-  eph[0] = 4;
-  return {
-    v: 2,
-    recipient_address: DECOY_ADDRESS,
-    ephemeral_pub_b64: C.b64(eph),
-    nonce_b64: C.b64(C.randomBytes(12)),
-    ciphertext_b64: C.b64(C.randomBytes(C.PAYLOAD_BUCKETS[0] + 16)),
-  };
-}
-
-async function tickOnce(sid) {
-  const item = STATE.outQueue.shift();
-  if (item) {
-    try { item.resolve(await API.sendPacket(item.packet)); } catch (e) { item.reject(e); }
-  } else {
-    try { await API.sendPacket(decoyPacket()); } catch (e) {}
+function toggleSidebar() {
+  const view = $("#view-chat");
+  if (window.matchMedia("(max-width: 720px)").matches) {
+    if (S.active) view.classList.add("peek-chat"); else toast("Wähle erst einen Kanal aus.");
+    return;
   }
-  if (sid !== STATE.sid) return;
-  await pollInbox();
-  if (sid !== STATE.sid) return;
-  // Schein-Ablauf in zufälligen Takten (im Schnitt etwa jeder zwölfte).
-  if (randInt(12) === 0 && STATE.historyLoaded && !STATE.historyDirty) {
-    await saveHistory();
-    if (sid !== STATE.sid) return;
-    const fake = Array.from(LehnoCrypto.randomBytes(16)).map(b => b.toString(16).padStart(2, "0")).join("");
-    try { await API.post("/api/packets/ack", { packet_ids: [fake] }); } catch (e) {}
-  }
-  flushControls();
+  view.classList.toggle("sidebar-collapsed");
 }
 
-// =========================================================================
-// LIVE-VERBINDUNG + REGELMÄSSIGER ABRUF
-// =========================================================================
-function startWebSocket() {
-  if (!STATE.me || STATE.ws) return;
-  let ws;
-  try {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${proto}//${location.host}/ws`);
-  } catch (e) { console.warn("ws err", e); return; }
-  STATE.ws = ws;
-  ws.onopen = () => {
-    // Token als erste Nachricht, nicht in der Adresse.
-    try { ws.send(JSON.stringify({ type: "auth", token: STATE.me.jwt })); } catch (e) {}
-  };
-  ws.onmessage = (evt) => {
-    if (evt.data === "pong") return;
-    let payload = null;
-    try { payload = JSON.parse(evt.data); } catch (e) { return; }
-    if (payload.type === "ready") { STATE.wsRetry = 0; ws._ready = true; pollInbox(); }
-    else if (payload.type === "new_packet") pollInbox();
-    // Ein anderes Gerät dieses Kontos hat den Verlauf geändert.
-    else if (payload.type === "history" && payload.version !== STATE.historyVersion) pollInbox();
-  };
-  ws.onclose = (evt) => {
-    if (STATE.ws === ws) STATE.ws = null;
-    if (!STATE.me) return;
-    // 4001 = Token nicht mehr gültig (Konto gelöscht oder woanders wiederhergestellt).
-    // Ein Abruf klärt das sofort und meldet uns gegebenenfalls ab.
-    if (evt && evt.code === 4001) pollInbox();
-    STATE.wsRetry = Math.min(STATE.wsRetry + 1, 6);
-    const sid = STATE.sid;
-    setTimeout(() => { if (sid === STATE.sid && !STATE.cover) startWebSocket(); }, 2000 * STATE.wsRetry);
-  };
-  ws.onerror = () => {};
-}
-
-function startTimers() {
-  for (const t of STATE.timers) clearInterval(t);
-  STATE.timers = [];
-  // Löschfristen: alle 5 Sekunden prüfen.
-  STATE.timers.push(setInterval(() => { purgeExpired(); }, 5000));
-  let tick = 0;
-  STATE.timers.push(setInterval(() => {
-    if (!STATE.me) return;
-    tick++;
-    const live = STATE.ws && STATE.ws._ready && STATE.ws.readyState === 1;
-    if (live) { try { STATE.ws.send("ping"); } catch (e) {} }
-    // Mit Tarnverkehr fragt der Takt selbst ab. Sonst: ohne Live-Verbindung alle
-    // 15 Sekunden, mit Live-Verbindung zur Sicherheit einmal pro Minute.
-    if (!STATE.cover && (!live || tick % 4 === 0)) pollInbox();
-    if (!STATE.cover) flushControls();
-    // Ungesichertes erneut versuchen.
-    if ((STATE.historyDirty || !STATE.historyLoaded) && !_histTimer) saveHistory().then(ok => { if (ok) { renderSidebar(); renderChat(); } });
-    if (!_userdataLoaded) {
-      const hadChanges = STATE.contacts.length > 0 || STATE.declined.length > 0 || Object.keys(STATE.nicknames).length > 0;
-      reloadUserdataMerging().then(() => { if (hadChanges) STATE.userdataDirty = true; renderSidebar(); }).catch(() => {});
-    } else if (STATE.userdataDirty && !_saveTimer) {
-      saveUserdata();
-    }
-  }, 15000));
-}
-
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden || !STATE.me) return;
-  purgeExpired();
-  pollInbox();
-  if (STATE.activeChat) { markRead(STATE.activeChat); renderSidebar(); }
-});
-
-// Beim Schließen des Tabs warnen, solange etwas noch nicht gesichert ist.
-window.addEventListener("beforeunload", (e) => {
-  if (STATE.me && (STATE.historyDirty || STATE.userdataDirty)) { e.preventDefault(); e.returnValue = ""; }
-});
-
-// =========================================================================
-// MEDIA-DOWNLOAD-WARNUNG
-// =========================================================================
-function attachDownloadWarning(el) {
-  el.addEventListener("contextmenu", (e) => {
-    if (!confirm(
-      "ACHTUNG: Wenn du diese Datei jetzt speicherst, liegt sie ENTSCHLÜSSELT auf deinem Gerät.\n\n" +
-      "In chatmesh bleibt sie verschlüsselt und ist nur für euch beide lesbar.\n\n" +
-      "Trotzdem das Menü zum Speichern öffnen?"
-    )) e.preventDefault();
-  });
-  el.addEventListener("dragstart", e => e.preventDefault());
-}
-
-// =========================================================================
-// KONTO LÖSCHEN
-// =========================================================================
-async function deleteAccount() {
-  if (!STATE.me) return;
-  if (!confirm("Dein Konto wirklich endgültig löschen?\n\nAdresse, Kontakte, Verlauf und wartende Nachrichten werden auf dem Server gelöscht. Das lässt sich nicht rückgängig machen.")) return;
-  const typed = prompt("Zur Bestätigung bitte LÖSCHEN eintippen:");
-  if ((typed || "").trim().toUpperCase() !== "LÖSCHEN") { toast("Abgebrochen"); return; }
-  try {
-    await API.del("/api/account");
-    setRemember(null);
-    logout("Konto gelöscht.");
-  } catch (e) {
-    toast("Löschen fehlgeschlagen: " + humanError(e), "err");
-  }
-}
-
-// =========================================================================
-// UI BINDINGS
-// =========================================================================
 function bindUI() {
   $$("#view-auth .tab").forEach(t => t.addEventListener("click", () => {
     $$("#view-auth .tab").forEach(x => x.classList.remove("active"));
@@ -2284,286 +2154,96 @@ function bindUI() {
     $("#auth-msg").textContent = "";
   }));
 
-  $$(".sidebar-tabs .tab").forEach(t => t.addEventListener("click", () => {
-    $$(".sidebar-tabs .tab").forEach(x => x.classList.remove("active"));
-    t.classList.add("active");
-    currentList = t.dataset.list;
-    renderSidebar();
-  }));
-
   $("#form-login").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const addr = normalizeAddressInput(e.target.address.value);
-    const p = e.target.password.value;
-    const remember = $("#remember-address").checked;
-    if (!addr) { $("#auth-msg").textContent = "Das ist keine gültige Adresse (sie beginnt mit mesh:)."; return; }
-    $("#auth-msg").textContent = "Einloggen …";
-    $("#auth-msg").className = "msg";
-    try {
-      await loginWithPassword(addr, p);
-      setRemember(remember ? addr : null);
-      await afterLogin();
-      $("#auth-msg").textContent = "";
-    } catch (err) {
-      if (STATE.me) logout();
-      $("#auth-msg").textContent = "Login fehlgeschlagen: " + humanError(err);
-    }
+    const msg = $("#auth-msg");
+    msg.textContent = "Anmelden …";
+    try { await doLogin(e.target.words.value); msg.textContent = ""; e.target.words.value = ""; }
+    catch (err) { if (S.me) logout(); msg.textContent = err.message || "Anmeldung nicht möglich"; }
   });
-
   $("#form-register").addEventListener("submit", async (e) => {
     e.preventDefault();
-    const p = e.target.password.value;
-    const p2 = e.target.password2.value;
-    if (p !== p2) { $("#auth-msg").textContent = "Passwörter stimmen nicht überein"; return; }
-    if (p.length < MIN_PASSWORD) { $("#auth-msg").textContent = `Das Passwort braucht mindestens ${MIN_PASSWORD} Zeichen.`; return; }
-    $("#auth-msg").textContent = "Schlüssel werden erzeugt …";
-    try {
-      await doRegister(p);
-      $("#auth-msg").textContent = "";
-    } catch (err) {
-      if (STATE.me) logout();
-      $("#auth-msg").textContent = "Registrierung fehlgeschlagen: " + humanError(err);
-    }
+    const msg = $("#auth-msg");
+    msg.textContent = "Konto wird angelegt …";
+    try { await doRegister(); msg.textContent = ""; }
+    catch (err) { S.me = null; msg.textContent = "Konto konnte nicht angelegt werden: " + (err.message || ""); }
   });
-
-  $("#form-recover").addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const addr = normalizeAddressInput(e.target.address.value);
-    const mnemonic = e.target.mnemonic.value.trim().toLowerCase().replace(/\s+/g, " ");
-    const newPw = e.target.password.value;
-    const newPw2 = e.target.password2.value;
-    if (!addr) { $("#recover-msg").textContent = "Das ist keine gültige Adresse (sie beginnt mit mesh:)."; return; }
-    if (newPw !== newPw2) { $("#recover-msg").textContent = "Passwörter stimmen nicht überein"; return; }
-    if (newPw.length < MIN_PASSWORD) { $("#recover-msg").textContent = `Das Passwort braucht mindestens ${MIN_PASSWORD} Zeichen.`; return; }
-    const wordCount = mnemonic ? mnemonic.split(" ").filter(Boolean).length : 0;
-    if (wordCount !== 24) {
-      $("#recover-msg").textContent = `Genau 24 Wörter nötig (du hast ${wordCount}).`;
-      return;
-    }
-    $("#recover-msg").textContent = "Wiederherstellen …";
-    $("#recover-msg").className = "msg";
-    try {
-      await doRecover(addr, mnemonic, newPw);
-      $("#recover-msg").textContent = "";
-      toast("Account wiederhergestellt", "ok");
-    } catch (err) {
-      if (STATE.me) logout();
-      show("recover");
-      $("#recover-msg").textContent = "Wiederherstellung fehlgeschlagen: " + humanError(err);
-    }
-  });
-
-  $("#mnemonic-confirm").addEventListener("change", e => {
-    $("#mnemonic-continue").disabled = !e.target.checked;
-  });
-  $("#mnemonic-continue").addEventListener("click", () => afterLogin());
-
-  $("#btn-copy-addr").addEventListener("click", () => {
-    navigator.clipboard.writeText($("#my-address-display").textContent).then(() => toast("Adresse kopiert", "ok")).catch(() => {});
-  });
-
-  $("#btn-download-backup").addEventListener("click", downloadAccountBackup);
+  $("#words-confirm").addEventListener("change", e => { $("#words-continue").disabled = !e.target.checked; });
+  $("#words-continue").addEventListener("click", () => { _backup = null; $("#words-login").textContent = ""; $("#words-wipe").textContent = ""; startSession(); });
+  $("#btn-download-words").addEventListener("click", downloadWords);
 
   $("#btn-logout").addEventListener("click", async () => {
-    // Laufende und offene Speichervorgänge abwarten (höchstens 8 Sekunden), dann abmelden.
     const btn = $("#btn-logout");
     btn.disabled = true;
-    stopRecording(true);
-    leaveChat();
-    try {
-      const pending = (async () => {
-        if (STATE.userdataDirty) await saveUserdata();
-        await saveHistory();
-      })();
-      await Promise.race([pending, new Promise(r => setTimeout(r, 8000))]);
-    } catch (e) {}
+    closeChannel(true);
+    for (const r of Object.values(S.run)) { if (r.flush) { try { await r.flush; } catch (e) {} } }
+    try { await Promise.race([saveAccount(), sleep(6000)]); } catch (e) {}
     btn.disabled = false;
-    if (STATE.me && (STATE.historyDirty || STATE.userdataDirty)) {
-      if (!confirm("Ein Teil deines Verlaufs konnte noch nicht gesichert werden (Server gerade nicht erreichbar).\n\nTrotzdem abmelden? Ungesichertes geht dabei verloren.")) return;
-    }
     logout();
   });
+  $("#btn-main-menu").addEventListener("click", toggleSidebar);
+  $("#btn-sidebar-open").addEventListener("click", toggleSidebar);
+  $("#btn-settings").addEventListener("click", settingsSheet);
+  $("#btn-new-channel").addEventListener("click", newChannelSheet);
+  $("#btn-join-channel").addEventListener("click", joinChannelSheet);
 
-  $("#me-pill").addEventListener("click", () => {
-    if ($("#addr-reveal").hidden) showMyAddress(); else hideMyAddress();
-  });
-  $("#btn-addr-copy").addEventListener("click", () => {
-    if (!STATE.me) return;
-    navigator.clipboard.writeText(STATE.me.address).then(() => toast("Adresse kopiert", "ok")).catch(() => toast("Kopieren nicht möglich", "err"));
-  });
-  $("#btn-addr-hide").addEventListener("click", hideMyAddress);
-  $("#btn-delete-account").addEventListener("click", deleteAccount);
-
-  $("#btn-new-chat").addEventListener("click", async () => {
-    const addr = normalizeAddressInput($("#new-chat-address").value);
-    if (!addr) { toast("Das ist keine gültige Adresse (sie beginnt mit mesh:)", "err"); return; }
-    try {
-      await fetchPubKey(addr);
-      $("#new-chat-address").value = "";
-      await openChat(addr);
-    } catch (e) {
-      toast(e.status === 404 ? "Adresse nicht gefunden" : humanError(e), "err");
-    }
-  });
-  $("#new-chat-address").addEventListener("keydown", e => {
-    if (e.key === "Enter") { e.preventDefault(); $("#btn-new-chat").click(); }
-  });
-
-  $("#btn-accept").addEventListener("click", () => { if (STATE.activeChat) acceptRequest(STATE.activeChat); });
-  $("#btn-decline").addEventListener("click", () => { if (STATE.activeChat) declineRequest(STATE.activeChat); });
-
-  // Sende-Warteschlange: wer schnell hintereinander schreibt, verliert nichts,
-  // und die Nachrichten gehen in genau der getippten Reihenfolge raus.
   $("#form-send").addEventListener("submit", (e) => {
     e.preventDefault();
     const input = $("#msg-input");
     const text = input.value.trim();
-    const peer = STATE.activeChat;       // Empfänger jetzt festhalten
-    const sid = STATE.sid;
-    if (!text || !peer) return;
-    input.value = "";
-    _sendChain = _sendChain.then(async () => {
-      if (sid !== STATE.sid) return;
-      try {
-        await sendText(peer, text);
-      } catch (err) {
-        // Nicht gesendet: Text zurück ins Feld, damit nichts verloren geht.
-        if (sid !== STATE.sid) return;
-        if (STATE.activeChat === peer) {
-          input.value = input.value ? text + " " + input.value : text;
-          toast("Nicht gesendet: " + humanError(err), "err");
-        } else {
-          // Inzwischen in einem anderen Chat: Text als Entwurf im richtigen Chat ablegen.
-          STATE.drafts[peer] = STATE.drafts[peer] ? text + " " + STATE.drafts[peer] : text;
-          toast("Eine Nachricht wurde nicht gesendet. Der Text liegt im betreffenden Chat bereit. (" + humanError(err) + ")", "err");
-        }
-      }
-    });
+    const c = S.active ? chan(S.active) : null;
+    if (!text || !c || !runOf(c).kMsg) return;
+    S.lastInput = Date.now();
+    if (sendText(c, text)) input.value = "";
   });
-
   $("#btn-attach").addEventListener("click", () => $("#file-input").click());
   $("#file-input").addEventListener("change", async (e) => {
-    const peer = STATE.activeChat;       // alle gewählten Dateien gehen an DIESEN Chat
-    const sid = STATE.sid;
+    const c = S.active ? chan(S.active) : null;       // alle gewählten Dateien gehen an DIESEN Kanal
+    const sid = S.sid;
     const files = Array.from(e.target.files);
     e.target.value = "";
-    if (!peer) return;
+    if (!c) return;
     for (const f of files) {
-      if (sid !== STATE.sid) return;
-      // Bilder, Videos und Tonaufnahmen in bekannten Formaten werden im Chat
-      // angezeigt bzw. abgespielt. Alles andere (PDF usw.) geht als Datei.
+      if (sid !== S.sid || S.active !== c.id) return;
       const type = (f.type || "").split(";")[0];
       let kind = "file";
-      if (MEDIA_MIMES.image.includes(type)) kind = "image";
-      else if (MEDIA_MIMES.video.includes(type)) kind = "video";
-      else if (MEDIA_MIMES.voice.includes(type)) kind = "voice";
-      try { await sendMedia(peer, f, kind === "file" ? "application/octet-stream" : type, kind, { name: f.name }); }
-      catch (err) { if (sid === STATE.sid && !(err instanceof SessionChanged)) toast("Nicht gesendet: " + humanError(err), "err"); }
+      if (MIMES.image.includes(type)) kind = "image";
+      else if (MIMES.video.includes(type)) kind = "video";
+      else if (MIMES.voice.includes(type)) kind = "voice";
+      try { await sendMedia(c, f, kind, f.name); }
+      catch (err) { if (sid === S.sid) toast("Nicht gesendet: " + (err.message || ""), "err"); }
     }
   });
-
-  // Sprachnachricht: Mikrofon antippen startet, noch einmal antippen sendet.
   $("#btn-record").addEventListener("click", () => { if (_rec) stopRecording(false); else startRecording(); });
   $("#btn-record-cancel").addEventListener("click", () => stopRecording(true));
   $("#btn-record-send").addEventListener("click", () => stopRecording(false));
 
-  // Menüs
-  $("#btn-main-menu").addEventListener("click", toggleSidebar);
-  $("#btn-sidebar-open").addEventListener("click", toggleSidebar);
-  $("#sheet-bg").addEventListener("click", (e) => { if (e.target.id === "sheet-bg") closeSheet(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeSheet(); });
+  $("#sheet-bg").addEventListener("click", (e) => { if (e.target.id === "sheet-bg" && !$("#sheet .sheet-form") && !$("#sheet .sheet-choice")) closeSheet(); });
+  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#sheet .sheet-choice")) closeSheet(); });
 
-  $("#link-recover").addEventListener("click", e => { e.preventDefault(); show("recover"); });
-  $("#btn-back-to-auth").addEventListener("click", () => show("auth"));
+  for (const ev of ["pointerdown", "keydown", "touchstart", "wheel"]) {
+    document.addEventListener(ev, () => { S.lastInput = Date.now(); }, { passive: true, capture: true });
+  }
+  window.addEventListener("beforeunload", (e) => { if (S.me && S.urgent) { e.preventDefault(); e.returnValue = ""; } });
+  window.addEventListener("pagehide", () => { if (S.me && S.dirty) saveAccount(); });
 
   // Erst jetzt lassen sich die Formulare absenden (ohne JavaScript bleiben die
-  // Knöpfe gesperrt, damit nie ein Passwort als normale Formularanfrage rausgeht).
+  // Knöpfe gesperrt, damit nie Wörter als normale Formularanfrage rausgehen).
   $$("button[data-needs-js]").forEach(b => { b.disabled = false; });
 }
 
-// =========================================================================
-// BACKUP-DATEI DOWNLOAD
-// =========================================================================
-let _lastMnemonic = null;
-let _lastAddress = null;
-
-function setLastBackupData(addr, mnemonic) {
-  _lastAddress = addr;
-  _lastMnemonic = mnemonic;
-}
-
-function downloadAccountBackup() {
-  if (!_lastAddress || !_lastMnemonic) {
-    toast("Backup-Daten nicht verfügbar", "err");
-    return;
-  }
-  const content = [
-    "chatmesh - Account-Backup",
-    "=".repeat(60),
-    "",
-    "DEINE ADRESSE (öffentlich, kannst du teilen):",
-    _lastAddress,
-    "",
-    "DEIN 24-WORT-BACKUP-CODE (GEHEIM, niemals teilen!):",
-    "",
-    _lastMnemonic.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"),
-    "",
-    "=".repeat(60),
-    "WICHTIG:",
-    "",
-    "- Wer den 24-Wort-Code hat, hat vollen Zugriff auf deinen Account und deinen Verlauf.",
-    "- Speichere diese Datei OFFLINE (USB-Stick, Papier-Ausdruck, sicherer Tresor).",
-    "- NIEMALS in der Cloud (iCloud, Google Drive, Dropbox, E-Mail).",
-    "- NIEMALS als Foto/Screenshot.",
-    "- Vergisst du Passwort UND Backup-Code = Account für immer weg.",
-    "",
-    "Wiederherstellung: chatmesh öffnen, unter dem Login auf \"Passwort vergessen?\" gehen,",
-    "Adresse + 24 Wörter + neues Passwort eingeben.",
-    "",
-    "Open-Source-Code: github.com/aliecommerce123-web/lehno-mesh",
-  ].join("\n");
-
-  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `chatmesh-backup-${_lastAddress.replace(/^mesh:/, "").slice(0, 10)}.txt`;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 100);
-  toast("Backup heruntergeladen", "ok");
-}
-
-// =========================================================================
-// INIT
-// =========================================================================
-window.LehnoApp = { show, STATE };
+// Nur in der lokalen Testumgebung: Zugriff für automatische Prüfungen.
+if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM };
 
 document.addEventListener("DOMContentLoaded", () => {
   bindUI();
+  bindShield();
   show("auth");
   renderChat();
-
-  const last = getRememberedAddress();
-  if (last) {
-    $$("#form-login input[name=address], #form-recover input[name=address]").forEach(el => { el.value = last; });
-    $("#remember-address").checked = true;
-  }
-  // Im normalen Browser: kurzer Hinweis auf den zusätzlichen Schutz durch Tor.
   if (!location.host.endsWith(".onion")) $("#tor-hint").hidden = false;
-
-  // Früher gab es einen Service Worker als Offline-Zwischenspeicher. Er wird
-  // nicht mehr gebraucht und könnte veralteten Code festhalten: entfernen und
-  // seine Zwischenspeicher löschen.
-  if ("serviceWorker" in navigator) {
-    navigator.serviceWorker.getRegistrations().then(regs => {
-      regs.forEach(r => r.unregister());
-    }).catch(()=>{});
-  }
-  if (typeof caches !== "undefined") {
-    caches.keys().then(keys => Promise.all(keys.map(k => caches.delete(k)))).catch(()=>{});
-  }
+  // Reste früherer Fassungen entfernen: Service Worker, Zwischenspeicher, Browser-Speicher.
+  if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(() => {});
+  if (typeof caches !== "undefined") caches.keys().then(ks => Promise.all(ks.map(k => caches.delete(k)))).catch(() => {});
+  try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}
 });
+})();

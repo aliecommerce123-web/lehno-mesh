@@ -746,7 +746,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .tor-hint a { color: var(--accent); }
 .bubble .ts { display: inline; margin-left: 8px; }
 
-/* =================== STARTSEITE HANDY (17.11.2026) =================== */
+/* =================== STARTSEITE HANDY =================== */
 /* Die Karten waren senkrecht mittig in einem festen Fenster. War die Karte
    höher als der Bildschirm, rutschte ihr oberer Teil unerreichbar aus dem Bild.
    Jetzt: die Ansicht scrollt selbst, die Karte ist nur mittig, wenn Platz ist. */
@@ -768,7 +768,7 @@ html, body { height: 100%; height: 100dvh; }
 }
 
 /* =====================================================================
-   chatmesh Phase 1.9: neues Aussehen (wie eine richtige Messenger-App)
+   neues Aussehen (wie eine richtige Messenger-App)
    Dieser Block überschreibt die älteren Regeln weiter oben.
    ===================================================================== */
 :root {
@@ -955,20 +955,7 @@ button.primary:hover { filter: brightness(1.06); background: linear-gradient(135
 @media (max-width: 380px) { #btn-logout { padding: 6px 8px; font-size: 11.5px; } }
 
 
-/* ---------- Leiste einklappen, Adresse kurz einblenden (17.11.2026) ---------- */
-button.me-pill { border: 0; cursor: pointer; text-align: left; color: var(--text-dim); font-size: 13px; }
-button.me-pill:hover { background: var(--line); color: var(--text); }
-#me-address-label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.addr-reveal { margin: 0 10px 10px; padding: 10px 12px 8px; background: var(--bg-3); border: 1px solid rgba(35, 213, 171, 0.35); border-radius: 14px; }
-.addr-reveal[hidden] { display: none; }
-.addr-reveal-text { font-family: ui-monospace, "JetBrains Mono", monospace; font-size: 12px; line-height: 1.4; color: var(--text); word-break: break-all; user-select: all; }
-.addr-reveal-row { display: flex; gap: 8px; margin-top: 8px; }
-.addr-reveal-row button { flex: 1; border-radius: 999px; }
-.addr-reveal-bar { height: 3px; background: var(--line); border-radius: 3px; margin-top: 8px; overflow: hidden; }
-.addr-reveal-bar span { display: block; height: 100%; width: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transform-origin: left; }
-.addr-reveal.counting .addr-reveal-bar span { animation: addrCount 10s linear forwards; }
-@keyframes addrCount { from { transform: scaleX(1); } to { transform: scaleX(0); } }
-
+/* ---------- Leiste einklappen ---------- */
 .sidebar-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); font-size: 12px; }
 .sidebar-foot a { color: var(--text-dim); text-decoration: none; }
 .sidebar-foot a:hover { color: var(--accent); }
@@ -983,4 +970,115 @@ button.me-pill:hover { background: var(--line); color: var(--text); }
   #view-chat.active.sidebar-collapsed .sidebar { display: none; }
   #view-chat.active.sidebar-collapsed .sidebar-open { display: inline-flex; }
   #view-chat.active.sidebar-collapsed .chat-header { padding-left: 56px; min-height: 57px; }
+}
+
+
+/* =====================================================================
+   Konto mit 12 Wörtern, Kanäle mit Passwort,
+   verschwindende Nachrichten, Sichtschutz
+   ===================================================================== */
+#view-words {
+  align-items: flex-start; justify-content: center; overflow-y: auto; -webkit-overflow-scrolling: touch;
+  padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+  background:
+    radial-gradient(900px 500px at 15% -10%, rgba(35, 213, 171, 0.13), transparent 60%),
+    radial-gradient(800px 500px at 100% 110%, rgba(58, 160, 255, 0.12), transparent 60%),
+    var(--bg);
+}
+@media (max-width: 480px) { #view-words { padding: 12px 10px calc(16px + env(safe-area-inset-bottom)); } }
+.words-title { margin: 18px 0 2px; font-size: 15.5px; }
+.small-note { margin: 0; font-size: 12.5px; color: var(--text-dim); }
+.mnemonic-grid { margin: 10px 0 6px; }
+.mnemonic-grid.wipe { border-color: rgba(255, 107, 138, 0.45); background: rgba(255, 107, 138, 0.06); }
+.mnemonic-grid.wipe .w-text { color: #ff8fa6; }
+.danger-text { color: #ff8fa6; }
+.btn-row { display: flex; gap: 8px; margin: 14px 0; }
+button.danger-fill, button.primary.danger-fill { background: linear-gradient(135deg, #ff5d7d, #d93a5c); color: #fff; }
+button.danger-fill:hover, button.primary.danger-fill:hover { background: linear-gradient(135deg, #ff5d7d, #d93a5c); filter: brightness(1.08); }
+.plain-list { margin: 4px 0 10px; padding-left: 18px; font-size: 13.5px; color: var(--text-dim); text-align: left; }
+.plain-list li { margin: 6px 0; line-height: 1.45; }
+.plain-list b { color: var(--text); }
+.tabs .tab { font-size: 13.5px; padding-left: 6px; padding-right: 6px; }
+.auth-form .check-row { flex-direction: row; }
+
+/* ---------- Seitenleiste ---------- */
+.side-title { flex: 1; min-width: 0; font-weight: 700; font-size: 17px; letter-spacing: -0.3px; padding-left: 2px; }
+.side-actions { display: flex; gap: 8px; padding: 2px 10px 10px; }
+.side-actions button { flex: 1; border-radius: 999px; padding: 9px 10px; font-size: 13.5px; white-space: nowrap; }
+.notes { padding: 0 10px; }
+.note { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 8px; padding: 9px 10px; font-size: 12.5px; line-height: 1.4; color: #ffe3b8; background: rgba(255, 179, 71, 0.1); border: 1px solid rgba(255, 179, 71, 0.35); border-radius: 12px; }
+.note span { flex: 1; min-width: 0; }
+.note-x { padding: 0 4px; font-size: 18px; line-height: 1; color: inherit; background: transparent; }
+.sync-state { color: var(--text-dimmer); font-size: 11.5px; white-space: nowrap; }
+.contact-list .meta .last.warn { color: #ffb347; }
+
+/* ---------- Chat ---------- */
+.rules-bar { cursor: default; }
+.chip { line-height: 1.35; border-radius: 12px; }
+.chip .ico { flex-shrink: 0; }
+.bubble.failed { opacity: 0.75; outline: 1px dashed rgba(255, 107, 138, 0.8); }
+.bubble .countdown { font-variant-numeric: tabular-nums; opacity: 0.85; }
+.bubble .countdown::before { content: "noch "; }
+.bubble .media img, .bubble .media video { display: block; max-width: 100%; }
+body.no-select #chat-stream, body.no-select #chat-stream * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+#chat-stream img { pointer-events: none; }
+
+/* ---------- Sichtschutz: Inhalt weg, sobald das Fenster nicht vorne ist ---------- */
+.shield { display: none; }
+body.shielded #chat-stream, body.shielded #chat-header, body.shielded #info-bar, body.shielded .composer,
+body.shielded .sidebar, body.shielded #sheet-bg, body.shielded .toast { visibility: hidden !important; }
+body.shielded .shield { display: flex !important; position: absolute; inset: 0; z-index: 50; align-items: center; justify-content: center; background: var(--bg); color: var(--text-dimmer); font-size: 13px; }
+body.shielded { background: var(--bg); }
+@media print { body * { display: none !important; } body { background: #fff; } }
+
+/* ---------- Fenster mit Eingaben ---------- */
+.sheet-form { display: flex; flex-direction: column; gap: 10px; padding: 0 4px 4px; }
+.sheet-field { display: flex; flex-direction: column; gap: 5px; padding: 0 8px; font-size: 13px; color: var(--text-dim); }
+.sheet-field input, .sheet-field textarea { width: 100%; background: var(--bg-3); border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; color: var(--text); font: inherit; font-size: 16px; }
+.sheet-field textarea { resize: vertical; font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; font-size: 14.5px; }
+.sheet-field input:focus, .sheet-field textarea:focus { outline: none; border-color: rgba(35, 213, 171, 0.6); }
+.sheet-field small { font-size: 11.5px; color: var(--text-dimmer); line-height: 1.4; }
+.sheet-form .check-row { padding: 0 8px; font-size: 13px; color: var(--text-dim); display: flex; gap: 10px; align-items: flex-start; cursor: pointer; line-height: 1.4; }
+.sheet-form .check-row input { width: 18px; height: 18px; margin-top: 1px; accent-color: var(--accent); flex-shrink: 0; }
+.sheet-form .sheet-section { padding: 8px 8px 0; }
+.sheet-error { min-height: 18px; padding: 0 8px; font-size: 13px; color: #ff8fa6; }
+.sheet-error.busy { color: var(--text-dim); }
+.sheet-row { display: flex; gap: 8px; justify-content: flex-end; padding: 0 8px 4px; }
+.sheet-row button { border-radius: 999px; padding: 10px 18px; font-size: 14px; }
+.sheet-info.center { text-align: center; }
+.sheet-choice { display: block; width: calc(100% - 16px); margin: 8px; padding: 14px 12px; border-radius: 14px; font-size: 15.5px; font-weight: 600; text-align: center; background: var(--bg-3); color: var(--text); border: 1px solid var(--line); }
+.sheet-choice.danger-fill { border-color: transparent; }
+.qr-canvas { display: block; margin: 6px auto 10px; width: min(260px, 70vw); height: auto; border-radius: 12px; image-rendering: pixelated; }
+.code-words { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin: 0 8px 10px; padding: 12px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 12px; font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; font-size: 14px; }
+.code-words span { color: var(--accent); font-weight: 600; }
+.code-words span::before { content: attr(data-n) ". "; color: var(--text-dimmer); font-weight: 400; }
+.sheet > button.ghost.small { display: block; margin: 0 auto 8px; border-radius: 999px; padding: 9px 16px; }
+.scan-wrap { padding: 0 8px; display: flex; flex-direction: column; gap: 8px; align-items: stretch; }
+.scan-wrap button { border-radius: 999px; padding: 10px 14px; }
+.scan-video { width: 100%; max-height: 260px; border-radius: 12px; background: #000; object-fit: cover; }
+.scan-video[hidden] { display: none; }
+@media (max-width: 480px) { .code-words { grid-template-columns: repeat(3, 1fr); font-size: 13px; padding: 10px 8px; } }
+.sheet-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; padding: 0 8px; }
+.sheet-grid .sheet-field { padding: 0; }
+.sheet-grid .sheet-field input { padding: 11px 8px; text-align: center; }
+
+/* ---------- Nach der Abnahme: Tippflächen, Schriftgrößen, Passwort-Felder ---------- */
+input.pw { -webkit-text-security: disc; font-family: ui-monospace, Menlo, monospace; letter-spacing: 1px; }
+.sheet-field textarea { font-size: 16px; }
+.chat-header .head-sec { font-size: 12px; }
+.bubble .ts { font-size: 12px; }
+.chip { font-size: 12.5px; }
+.sheet-item.static { cursor: default; }
+.sheet-item.static:hover { background: transparent; }
+.sym-row { font-size: 24px; letter-spacing: 3px; line-height: 1.5; }
+.note-x { min-width: 44px; min-height: 44px; margin: -10px -8px -10px 0; display: inline-flex; align-items: center; justify-content: center; font-size: 22px; }
+.sync-state { max-width: 55%; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 720px) {
+  #btn-main-menu { display: none; }
+  .side-title { padding-left: 8px; }
+  #btn-logout { min-height: 44px; padding: 8px 14px; font-size: 13px; }
+  .record-bar button { min-height: 44px; padding: 8px 16px; }
+  .side-actions button { min-height: 44px; }
+  .sheet-row button { min-height: 44px; }
+  .icon-btn { width: 44px; height: 44px; }
 }

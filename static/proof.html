@@ -4,6 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b141c" />
+  <meta name="referrer" content="no-referrer" />
   <title>chatmesh: Beweis</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2323d5ab'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
   <style>
@@ -42,6 +43,7 @@
     li b { color: var(--text); }
     .small { font-size: 12.5px; color: var(--dimmer); }
     .files a { font-family: ui-monospace, monospace; }
+    .to-app { margin-left: auto; }
   </style>
 </head>
 <body>
@@ -49,20 +51,24 @@
   <header>
     <div class="dot"></div>
     <h1>chatmesh: Beweis</h1>
-    <a href="/" style="margin-left:auto">Zur App</a>
+    <a href="/" class="to-app">Zur App</a>
   </header>
-  <p class="lead">Hier kann jeder nachprüfen, was dieser Server speichert und wie. Nichts auf dieser Seite ist von Hand geschrieben: Zahlen, Speicherformat und Quelltext liest der laufende Server selbst aus seiner echten Datenbank und seinen echten Dateien.</p>
+  <p class="lead">Hier kann jeder nachprüfen, was dieser Server speichert und wie. Zahlen, Speicherformat und Quelltext auf dieser Seite sind nicht von Hand eingetragen: Der laufende Server liest sie selbst aus seiner echten Datenbank und seinen echten Dateien. Nur die Erklärungen dazwischen sind geschrieben.</p>
 
   <div class="card">
     <h2>1. Was auf dem Server liegt <span class="pill" id="live-pill">Momentaufnahme</span></h2>
-    <p>Das ist der komplette Bestand, als Summen. Mehr gibt es nicht: keine Namen, keine Nummern, keine E-Mail, keine IP-Adressen, keine Gerätekennungen, keine Absender.</p>
-    <p class="small">Die Zahlen werden alle 10 Minuten neu gelesen und absichtlich nur als Summen gezeigt. Würden wir sie sekundengenau und je Konto zeigen, könnte jeder ablesen, wann jemand online ist. Genau das soll niemand können.</p>
+    <p>Das ist der komplette Bestand, als grobe Summen. Mehr gibt es nicht: keine Namen, keine Nummern, keine E-Mail, keine Adressen, keine IP-Adressen, keine Gerätekennungen, keine Absender, keine Empfänger, keine Uhrzeiten.</p>
+    <p class="small">Die Zahlen werden nur alle paar Minuten neu gelesen und absichtlich gerundet. Genaue, sekundenaktuelle Zahlen würden verraten, wann jemand etwas tut. Einzelne Nachrichten, Kanäle oder Konten lassen sich hier bewusst nicht nachschlagen.</p>
     <div class="grid" id="stats"></div>
 
-    <h3>Konten</h3>
-    <p>Ein Konto ist nur eine zufällige Adresse mit verschlüsselten Schlüsseln. Hier stehen die letzten 4 Zeichen jeder Adresse. Wann ein Konto angelegt wurde, speichern wir nicht: Die Zeitmarke ist bei allen Konten gleich.</p>
-    <div class="tails" id="tails"></div>
-    <p class="small" id="markers"></p>
+    <h3>So ist es aufgebaut</h3>
+    <ul>
+      <li><b>Konto-Block:</b> ein verschlüsselter Block in fester Größe unter einer Zufallskennung. Kennung und Schlüssel entstehen im Browser aus den 12 Anmeldewörtern. Der Server kann weder die Wörter noch den Inhalt zurückrechnen.</li>
+      <li><b>Der Haufen:</b> Jede Nachricht ist ein namenloser Block in fester Größe unter einer neuen Zufallsmarke. Es gibt keinen Absender und keinen Empfänger. Jeder lädt den ganzen Haufen und findet seine Blöcke selbst. Der Server bekommt deshalb keine Angabe, für wen ein Block ist, und speichert nicht, wer ihn löscht.</li>
+      <li><b>Schein-Blöcke:</b> Jede geöffnete App und ein eigener Dienst auf dem Server legen ständig Blöcke ab und löschen sie wieder, in unregelmäßigen Abständen. Sie sehen genauso aus wie echte. Wie viele der Blöcke oben echt sind, wissen wir selbst nicht.</li>
+      <li><b>Löschen:</b> Ein Block wird gelöscht, sobald das Gegenüber den Chat öffnet. Liegen gebliebene Blöcke verschwinden nach ein bis zwei Wochen von selbst.</li>
+      <li><b>Rechenaufgabe:</b> Weil der Server niemanden an einer IP-Adresse erkennt, muss jede Einlieferung eine kleine Rechenaufgabe mitbringen. Im Alltag dauert sie Millisekunden. Je voller der Speicher wird, desto schwerer wird sie. So lässt sich der Server nicht billig mit Müll füllen.</li>
+    </ul>
 
     <h3>Was in welcher Größe gespeichert ist</h3>
     <p>Alles liegt als unlesbarer Geheimtext in wenigen festen Größen vor. So lässt sich nicht einmal an der Größe ablesen, was oder wie viel jemand schreibt.</p>
@@ -70,48 +76,38 @@
   </div>
 
   <div class="card">
-    <h2>2. Eine eigene Nachricht nachprüfen</h2>
-    <p>Jede Nachricht hat eine Beweis-Kennung. In der App: eigene Nachricht antippen, „Beweis ansehen“. Wartet die Nachricht bei der letzten Momentaufnahme noch auf Abholung, siehst du hier genau, was der Server dazu gespeichert hat: unlesbarer Geheimtext, kein Absender. Ist sie abgeholt, ist sie vom Server gelöscht, und auch das siehst du hier. Eine Liste aller Kennungen gibt es nicht, niemand kann fremde Nachrichten durchsehen.</p>
-    <div class="row">
-      <input id="pid" placeholder="Beweis-Kennung (24 Zeichen)" autocomplete="off" spellcheck="false" />
-      <button id="btn-check">Prüfen</button>
-    </div>
-    <div id="check-out"></div>
-  </div>
-
-  <div class="card">
-    <h2>3. So speichert der Server (Speicherformat)</h2>
-    <p>Das ist der echte Bauplan der Datenbank, aus ihr selbst ausgelesen. Jede Spalte, die es gibt, steht hier. Es gibt keine Spalte für Absender, IP-Adresse oder Gerät.</p>
+    <h2>2. So speichert der Server (Speicherformat)</h2>
+    <p>Das ist der echte Bauplan der Datenbank, aus ihr selbst ausgelesen. Jede Spalte, die es gibt, steht hier.</p>
     <p class="small" id="schema-facts"></p>
     <pre id="schema">lädt …</pre>
-    <p class="small">Zeitangaben, ehrlich aufgezählt: Wartende Nachrichten und Anhänge tragen nur die Kalenderwoche (zum Aufräumen nach einigen Wochen). Eine laufende Konto-Wiederherstellung trägt für 5 Minuten ihren Ablaufzeitpunkt. Sonst gibt es keine Zeitangaben. Legt jemand in der App eine Löschfrist fest, steht der Löschzeitpunkt nur verschlüsselt in der Nachricht und im verschlüsselten Verlauf.</p>
+    <p class="small">Zeitangaben, ehrlich aufgezählt: Blöcke und Anhänge tragen nur die Kalenderwoche, damit Liegengebliebenes nach einiger Zeit verschwindet. Ein Konto-Block trägt nur einen groben Abschnitt von vier Wochen (wann er zuletzt gespeichert wurde), damit ein Jahr lang unbenutzte Konten entfernt werden können. Die laufende Nummer eines Blocks ist nur eine Reihenfolge. Sonst gibt es keine Zeitangaben. Wie lange eine Nachricht sichtbar bleibt, steht nur verschlüsselt in der Nachricht selbst.</p>
   </div>
 
   <div class="card">
-    <h2>4. Der Quelltext, der gerade läuft</h2>
-    <p>Die komplette Technik ist offen, von A bis Z: Server, App und Verschlüsselung. Unten steht jede Datei mit ihrer Prüfsumme (SHA-256). Ein Klick zeigt die Datei so, wie sie gerade läuft. Dieselben Dateien liegen im öffentlichen <a id="repo" href="#" target="_blank" rel="noopener">Quelltext-Verzeichnis</a>, dort kann jeder die Prüfsummen vergleichen. Der Server startet nur, wenn seine Dateien zu den hinterlegten Prüfsummen passen.</p>
+    <h2>3. Der Quelltext, der gerade läuft</h2>
+    <p>Die komplette Technik ist offen, von A bis Z: Server, App, Verschlüsselung und der Dienst für die Schein-Blöcke. Unten steht jede Datei mit ihrer Prüfsumme (SHA-256). Ein Klick zeigt die Datei so, wie sie gerade läuft. Dieselben Dateien liegen im öffentlichen <a id="repo" href="#" target="_blank" rel="noopener">Quelltext-Verzeichnis</a>, dort kann jeder die Prüfsummen vergleichen. Der Server startet nur, wenn seine Dateien zu den hinterlegten Prüfsummen passen.</p>
     <div class="scroll"><table id="t-files" class="files"></table></div>
   </div>
 
   <div class="card">
-    <h2>5. Was mit deiner IP-Adresse passiert</h2>
+    <h2>4. Was mit deiner IP-Adresse passiert</h2>
     <p>Anfragen aus dem normalen Internet laufen durch eine Schleuse, bevor sie die App erreichen. Laut der echten Einstellung dieser Schleuse (vom Server ausgelesen) werden dort diese Angaben entfernt:</p>
     <pre id="proxy">lädt …</pre>
     <p class="small">Die App selbst liest an keiner Stelle eine IP-Adresse oder Gerätekennung aus. Das lässt sich im Quelltext oben nachprüfen.</p>
   </div>
 
   <div class="card">
-    <h2>6. Wer sieht was?</h2>
+    <h2>5. Wer sieht was?</h2>
     <ul>
-      <li><b>Wir als Betreiber:</b> sehen nur das, was oben unter 1 steht. Nachrichten, Bilder, Sprachnachrichten, Dateien, Kontakte und Verläufe können wir nicht öffnen, weil die Schlüssel nie auf dem Server sind. Passwörter sehen wir nie, sie verlassen dein Gerät nicht.</li>
-      <li><b>Dein Internetanbieter:</b> sieht, dass dein Gerät mit chatmesh verbunden ist. Die Verbindung ist verschlüsselt, er sieht also nicht, was du schreibst oder an wen. Der Tarnverkehr sendet in gleichmäßigem Takt gleich große Pakete, egal ob du schreibst. Das macht es von außen sehr schwer zu erkennen, ob und wann du eine Nachricht sendest. Bilder, Videos, Dateien und sehr lange Texte fallen als größere Übertragung auf, ihr Inhalt bleibt unlesbar.</li>
+      <li><b>Wir als Betreiber:</b> sehen nur das, was oben unter 1 steht. Nachrichten, Bilder, Sprachnachrichten, Dateien, Kanäle und Verläufe können wir nicht öffnen, weil die Schlüssel nie auf dem Server sind. Die Wörter und die Kanal-Passwörter verlassen dein Gerät nie.</li>
+      <li><b>Dein Internetanbieter:</b> sieht, dass dein Gerät mit chatmesh verbunden ist. Die Verbindung ist verschlüsselt, er sieht also nicht, was du schreibst oder an wen. Die App ruft ständig den Haufen ab und legt Schein-Blöcke ab, in unregelmäßigen Abständen, egal ob du schreibst. Das macht es von außen sehr schwer zu erkennen, ob und wann du eine Nachricht sendest. Bilder, Videos und Dateien fallen als größere Übertragung auf, ihr Inhalt bleibt unlesbar.</li>
       <li><b>Netzdienste zwischen dir und uns:</b> Im normalen Internet läuft die Verbindung über einen vorgeschalteten Netzdienst. Er sieht deine IP-Adresse und die verschlüsselten Pakete, aber keine Inhalte. Wer das ausschließen will, nutzt den Tor-Browser.</li>
       <li><b>Mit dem Tor-Browser:</b> sieht nicht einmal dein Internetanbieter, dass du chatmesh nutzt, und kein Netzdienst sieht deine IP-Adresse. <a href="/tor">Anleitung</a></li>
-      <li><b>Dein Gegenüber:</b> sieht deine Nachrichten und deine Adresse, sonst nichts über dich.</li>
+      <li><b>Dein Gegenüber:</b> sieht deine Nachrichten und ob du sie geöffnet hast (Lesebestätigung). Es gibt keine Adresse, keinen Namen und kein Profil. Den Namen eines Kanals vergibt jeder für sich selbst.</li>
     </ul>
-    <p class="small">Ehrliche Grenzen: Die App kommt als Webseite von diesem Server. Deshalb ist der Quelltext oben offen und mit Prüfsummen versehen, damit jeder kontrollieren kann, was ausgeliefert wird. Und: Löschfristen und „bei beiden löschen“ setzt die App deines Gegenübers um. Wer vorher ein Bildschirmfoto macht, behält den Inhalt, das kann kein Messenger verhindern.</p>
+    <p class="small">Ehrliche Grenzen: Die App kommt als Webseite von diesem Server. Deshalb ist der Quelltext oben offen und mit Prüfsummen versehen, damit jeder kontrollieren kann, was ausgeliefert wird. Alles oben beschreibt, was dieser Quelltext tut: Er speichert und wertet nichts aus. Ein heimlich veränderter Server könnte mehr mitschreiben, zum Beispiel wann welche Verbindung einen Block löscht. Genau dagegen helfen die Prüfsummen und der Tor-Browser. Das Verschwinden von Nachrichten setzt die App deines Gegenübers um. Ein Screenshot-Versuch am Rechner löst den Kanal auf, sicher verhindern kann eine Webseite Bildschirmfotos aber nicht, vor allem nicht am Handy, und niemand kann verhindern, dass jemand den Bildschirm abfotografiert. Bei gewöhnlichen Dateien (zum Beispiel PDF) können eingebettete Angaben nicht entfernt werden, bei Bildern, Videos und Sprachnachrichten schon.</p>
   </div>
 </div>
-<script src="/s/proof.js?v=20261117-phase1.9b"></script>
+<script src="/s/proof.js?v=2"></script>
 </body>
 </html>

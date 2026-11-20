@@ -279,3 +279,5 @@ input.pw { -webkit-text-security: disc; font-family: ui-monospace, SFMono-Regula
   .note-x { min-width: 44px; min-height: 44px; }
 }
 .sheet-item button.small { margin-top: 8px; }
+.sheet-btn-row { padding: 0 8px; }
+.sheet-btn-row button { min-height: 44px; }

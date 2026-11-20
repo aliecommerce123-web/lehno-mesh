@@ -8,7 +8,7 @@
   <title>chatmesh</title>
   <link rel="manifest" href="/manifest.json" />
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2314171a'/%3E%3Ctext x='32' y='43' font-size='34' text-anchor='middle' fill='%23ffffff' font-family='Arial,sans-serif' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/s/style.css?v=13" />
+  <link rel="stylesheet" href="/s/style.css?v=16" />
 </head>
 <body>
 <noscript>
@@ -16,7 +16,7 @@
 </noscript>
 
 <!-- ================= ANMELDEN ================= -->
-<section id="view-auth" class="view active">
+<section id="view-auth" class="view">
   <div class="auth-card">
     <div class="brand">
       <div class="brand-dot"></div>
@@ -65,7 +65,7 @@
     <div id="words-login" class="mnemonic-grid"></div>
 
     <h3 class="words-title danger-text">Für den Notfall: Löschwörter</h3>
-    <p class="small-note">Gibst du diese Wörter bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, ohne Rückfrage. Es gibt dafür keinen eigenen Knopf. Nicht mit deinen 12 Wörtern verwechseln.</p>
+    <p class="small-note">Gibst du diese Wörter bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, ohne Rückfrage. Es öffnet sich ein leeres Konto, wie bei einer normalen Anmeldung. Auch dein altes Konto ist danach leer, und deine Kanäle verschwinden bei den anderen. Nicht mit deinen 12 Wörtern verwechseln.</p>
     <div id="words-wipe" class="mnemonic-grid wipe"></div>
 
     <div class="btn-row">
@@ -165,11 +165,11 @@
 </div>
 
 <!-- Kein Inline-Script (strenge CSP). -->
-<script src="/s/vendor/qrcode.js?v=13"></script>
-<script src="/s/vendor/jsqr.js?v=13"></script>
-<script src="/s/bip39.js?v=13"></script>
-<script src="/s/crypto.js?v=13"></script>
-<script src="/s/media.js?v=13"></script>
-<script src="/s/app.js?v=13"></script>
+<script defer src="/s/vendor/qrcode.js?v=16"></script>
+<script defer src="/s/vendor/jsqr.js?v=16"></script>
+<script src="/s/bip39.js?v=16"></script>
+<script src="/s/crypto.js?v=16"></script>
+<script src="/s/media.js?v=16"></script>
+<script src="/s/app.js?v=16"></script>
 </body>
 </html>

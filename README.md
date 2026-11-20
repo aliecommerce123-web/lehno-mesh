@@ -14,8 +14,10 @@ er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
 1. **Konto = 12 Wörter.** Es gibt keinen Namen und kein Passwort. Aus den
    12 Anmeldewörtern entstehen im Browser eine Zufallskennung und ein Schlüssel.
    Dazu gibt es 12 Löschwörter: Wer sie bei „Anmelden“ eingibt, löscht alles
-   unwiderruflich. Einen eigenen Knopf gibt es dafür nicht, und es sieht
-   danach aus, als hätte es das Konto nie gegeben.
+   unwiderruflich. Einen eigenen Knopf gibt es dafür nicht. Es öffnet sich ein
+   leeres Konto wie bei einer normalen Anmeldung, das alte Konto ist danach
+   ebenfalls leer, und die Kanäle verschwinden bei den Gegenübern wie bei
+   einem gewöhnlichen Löschen.
 2. **Kanal = Einmal-Code.** Wer mit jemandem schreiben will, legt einen Kanal
    an und bekommt einen Einmal-Schlüssel (24 Zeichen oder QR-Code). Das Gegenüber gibt
    ihn ein. Danach ist der Code für alle ungültig. Jeder Kanal hat bei jedem

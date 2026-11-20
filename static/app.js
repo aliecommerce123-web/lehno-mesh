@@ -201,7 +201,7 @@ function sanitizeChannel(c) {
   return c;
 }
 function sanitizeAccount(a) {
-  const out = { v: 2, set: {}, wk: typeof a.wk === "string" ? a.wk : "", wp: typeof a.wp === "string" ? a.wp : "", wq: typeof a.wq === "string" ? a.wq : "", ch: [], gone: strList(a.gone, 300), notes: [], n: Number.isFinite(a.n) ? a.n : 1 };
+  const out = { v: 2, set: {}, wk: typeof a.wk === "string" ? a.wk : "", wp: typeof a.wp === "string" ? a.wp : "", wq: typeof a.wq === "string" ? a.wq : "", wl: typeof a.wl === "string" ? a.wl : "", ch: [], gone: strList(a.gone, 300), notes: [], n: Number.isFinite(a.n) ? a.n : 1 };
   const s = a.set && typeof a.set === "object" ? a.set : {};
   out.set.view = Math.max(VIEW_MIN, Math.min(VIEW_MAX, Math.floor(Number(s.view) || VIEW_DEFAULT)));
   out.set.lockOn = s.lockOn === 0 ? 0 : 1;
@@ -219,9 +219,11 @@ function sanitizeAccount(a) {
 // Kanäle beim Gegenüber nötig ist, je Kanal verschlossen an einen Schlüssel,
 // den nur die 12 Löschwörter öffnen. Das Konto selbst kann die Einträge nicht lesen.
 async function wipeBlobFor(acct) {
-  const entries = acct.ch.filter(c => !c.pend && c.wb).map(c => c.wb);
+  // Je Kanal: der verschlossene Eintrag plus die Zähler, damit beim Löschen auch
+  // liegengebliebene Blöcke dieses Kanals vom Server entfernt werden können.
+  const entries = acct.ch.filter(c => !c.pend && c.wb).map(c => ({ b: c.wb, d: c.dir, s: c.sn || 0, c: c.cn || 0, r: c.rn || 0, q: c.rc || 0 }));
   for (;;) {
-    try { return C.b64(await C.sealJson(C.unb64(acct.wk), { p: acct.wp, q: acct.wq, e: entries }, C.WIPE)); }
+    try { return C.b64(await C.sealJson(C.unb64(acct.wk), { p: acct.wp, q: acct.wq, l: acct.wl || "", e: entries }, C.WIPE)); }
     catch (e) { if (!entries.length) throw e; entries.pop(); }
   }
 }
@@ -368,12 +370,15 @@ function saveSoon() {
 // des Speicherns nicht, wann eine Nachricht kam oder ging.
 function saveLazy() { S.dirty = true; }
 
-async function doRegister() {
-  await loadConfig();
-  const L = C.rand(16), W = C.rand(16);
+// Legt ein leeres Konto an. L = die 16 geheimen Bytes hinter den 12 Wörtern,
+// W = die 16 Bytes hinter den Löschwörtern dieses Kontos.
+async function createAccount(L, W) {
   const ak = await C.accountKeys(L), wk = await C.wipeKeys(W);
   const box = await C.newExchangeKey();
   const acct = emptyAccount(wk.encKey, box.pub, await C.seal(wk.innerKey, C.utf8(JSON.stringify(box.privJwk))));
+  // Für die Löschwörter hinterlegt: damit sich das Konto nach dem Löschen leer
+  // wieder anlegen lässt. Öffnen kann das nur, wer die Löschwörter hat.
+  acct.wl = C.b64(await C.seal(wk.innerKey, L));
   const blob = C.b64(await C.sealJson(ak.encKey, acct, C.ACCOUNT));
   const wipe_blob = await wipeBlobFor(acct);
   let r = null;
@@ -382,10 +387,17 @@ async function doRegister() {
     try { r = await api("POST", "/api/v2/account", { json: { id: ak.id, auth_hash: ak.authHash, wipe_hash: wk.wipeHash, blob, wipe_blob, work } }); }
     catch (e) { if (e.status !== 428 || i === 2) throw e; await loadConfig(); }
   }
+  return { ak, acct, version: r.version };
+}
+
+async function doRegister() {
+  await loadConfig();
+  const L = C.rand(16), W = C.rand(16);
+  const made = await createAccount(L, W);
   S.sid++;
-  S.me = { id: ak.id, token: ak.token, encKey: ak.encKey };
-  S.acct = acct;
-  S.version = r.version;
+  S.me = { id: made.ak.id, token: made.ak.token, encKey: made.ak.encKey };
+  S.acct = made.acct;
+  S.version = made.version;
   _pendingLogin = L;
   showWords(await C.bytesToWords(L), await C.bytesToWords(W));
 }
@@ -406,23 +418,27 @@ async function loginWithBytes(L, fromWords) {
   const ak = await C.accountKeys(L);
   S.sid++;
   S.me = { id: ak.id, token: ak.token, encKey: ak.encKey };
-  let r;
-  try { r = await api("GET", "/api/v2/account", { auth: true, noLogout: true }); }
-  catch (e) {
-    S.me = null;
-    if (e.status !== 401) throw new Error(e.message || "Anmeldung nicht möglich");
-    // Kein Konto zu diesen Wörtern. Sind es die Löschwörter eines Kontos, wird
-    // jetzt alles unwiderruflich gelöscht. Von außen und auf dem Bildschirm sieht
-    // beides gleich aus: Es gibt kein Konto zu diesen Wörtern.
-    if (fromWords) {
-      // Kommt die Lösch-Anfrage nicht durch, darf das nicht wie "kein Konto"
-      // aussehen: sonst glaubt man, es sei gelöscht, obwohl nichts passiert ist.
-      try { await wipeWith(L); }
-      catch (e2) { throw new Error("Keine Verbindung zum Server. Bitte noch einmal versuchen."); }
+  let r = null;
+  for (let round = 0; round < 2 && !r; round++) {
+    try { r = await api("GET", "/api/v2/account", { auth: true, noLogout: true }); }
+    catch (e) {
+      if (e.status !== 401) { S.me = null; throw new Error(e.message || "Anmeldung nicht möglich"); }
+      // Kein Konto zu diesen Wörtern. Sind es die Löschwörter eines Kontos, wird
+      // jetzt alles unwiderruflich gelöscht, und es öffnet sich ein leeres Konto.
+      let wiped = false;
+      if (fromWords && round === 0) {
+        // Kommt die Lösch-Anfrage nicht durch, darf das nicht wie "kein Konto"
+        // aussehen: sonst glaubt man, es sei gelöscht, obwohl nichts passiert ist.
+        try { wiped = await wipeWith(L); }
+        catch (e2) { S.me = null; throw new Error("Keine Verbindung zum Server. Bitte noch einmal versuchen."); }
+      }
+      if (!wiped) {
+        S.me = null;
+        const err = new Error("Zu diesen Wörtern gibt es kein Konto.");
+        err.gone = true;
+        throw err;
+      }
     }
-    const err = new Error("Zu diesen Wörtern gibt es kein Konto.");
-    err.gone = true;
-    throw err;
   }
   S.acct = sanitizeAccount(await C.openJson(ak.encKey, C.unb64(r.blob), C.ACCOUNT));
   S.version = r.version;
@@ -460,7 +476,7 @@ function showCode(mode) {
   $("#code-title").textContent = set ? "Lege deinen Code fest" : "Gib deinen Code ein";
   $("#code-info").textContent = set
     ? "Diesen Code wählst du selbst: mindestens 8 Zeichen, auch nur Zahlen sind möglich. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter."
-    : "Du bist noch angemeldet. Gib deinen Code ein, um weiterzumachen.";
+    : "Du bist noch angemeldet. Gib deinen Code ein, um weiterzumachen. Code vergessen? Dann auf „Abmelden“ tippen und mit deinen 12 Wörtern neu anmelden.";
   $("#code-repeat").hidden = !set;
   $("#code-submit").textContent = set ? "Weiter" : "Entsperren";
   $("#code-msg").textContent = "";
@@ -524,15 +540,20 @@ function wordError(e, count) {
 }
 
 // Unwiderrufliches Löschen mit den 12 Löschwörtern. Es gibt dafür keinen eigenen
-// Knopf: Wer bei "Anmelden" die Löschwörter eingibt, löscht alles. Die Anfrage
-// geht bei jeder fehlgeschlagenen Anmeldung raus, egal welche Wörter es waren.
-// Gibt die Zahl der benachrichtigten Kanäle zurück, -1 wenn es kein Konto gab.
+// Knopf: Wer bei "Anmelden" die Löschwörter eingibt, löscht alles. Danach
+// - gibt es das alte Konto weiter, aber leer (die alten 12 Wörter öffnen es),
+// - öffnen auch die Löschwörter ein eigenes, leeres Konto,
+// - verschwinden die Kanäle bei den Gegenübern wie bei einem gewöhnlichen Löschen,
+// - werden liegengebliebene Blöcke der alten Kanäle vom Server entfernt.
+// Auf dem Bildschirm sieht es aus wie eine normale Anmeldung in ein leeres Konto.
+// Die Anfrage geht bei jeder fehlgeschlagenen Anmeldung raus, egal welche Wörter
+// es waren. Gibt true zurück, wenn gelöscht wurde und ein leeres Konto bereitsteht.
 async function wipeWith(W) {
   const wk = await C.wipeKeys(W);
   const r = await api("POST", "/api/v2/wipe", { json: { token: wk.token } });
   await loadConfig();
   if (!r.ok) {
-    // Kein Treffer. Damit es von außen gleich aussieht wie ein echtes Löschen,
+    // Kein Treffer. Damit es von außen ähnlich aussieht wie ein echtes Löschen,
     // gehen auch hier ein, zwei Blöcke raus (Schein-Blöcke, die wieder verschwinden).
     try {
       const k = 1 + randInt(2);
@@ -541,27 +562,63 @@ async function wipeWith(W) {
         if ((await pilePost(tag, C.rand(4124), token, 20)) === 200) queueDelete(tag, token, randBetween(20000, 120000));
       }
     } catch (e) {}
-    return -1;
+    return false;
   }
-  // Die Gegenüber benachrichtigen: jeder gemeinsame Kanal wird bei ihnen aufgelöst.
-  let n = 0;
+  let ready = false;
   try {
     const data = await C.openJson(wk.encKey, C.unb64(String(r.wipe_blob).replace(/\.+$/, "")), C.WIPE);
-    const priv = JSON.parse(C.fromUtf8(await C.open(wk.innerKey, C.unb64(data.q))));
-    const pub = C.unb64(data.p);
-    for (const entry of (data.e || [])) {
+    // 1. Beide Konten leer neu anlegen: das alte (zu den alten 12 Wörtern) und
+    //    eines zu den Löschwörtern. Keines hat danach noch nutzbare Löschwörter.
+    if (data.l) {
       try {
-        const own = JSON.parse(C.fromUtf8(await C.boxOpen(priv, pub, C.unb64(entry))));
-        for (let i = 0; i < 4; i++) {
-          let code = 0;
-          try { code = await postDissolve(own, "wipe"); } catch (e) {}
-          if (code === 200 || code === 409) { n++; break; }
-          await sleep(1500 * (i + 1));
-        }
+        const oldL = await C.open(wk.innerKey, C.unb64(data.l));
+        try { await createAccount(oldL, C.rand(16)); } catch (e) {}
       } catch (e) {}
     }
+    try { await createAccount(W, C.rand(16)); ready = true; } catch (e) { ready = false; }
+    // 2. Die Gegenüber benachrichtigen und Reste vom Server entfernen (im Hintergrund).
+    (async () => {
+      try {
+        const priv = JSON.parse(C.fromUtf8(await C.open(wk.innerKey, C.unb64(data.q))));
+        const pub = C.unb64(data.p);
+        for (const entry of (data.e || [])) {
+          try {
+            const e = typeof entry === "string" ? { b: entry } : entry;
+            const own = JSON.parse(C.fromUtf8(await C.boxOpen(priv, pub, C.unb64(e.b))));
+            for (let i = 0; i < 5; i++) {
+              let code = 0;
+              // Für das Gegenüber sieht es aus wie ein gewöhnlich gelöschter Kanal.
+              try { code = await postDissolve(own, "deleted"); } catch (e2) {}
+              if (code === 200 || code === 409) break;
+              await sleep(1500 * (i + 1));
+            }
+            if (own.kt && own.kd && (e.d === "a" || e.d === "b")) await removeLeftovers(own, e);
+          } catch (e3) {}
+        }
+      } catch (e4) {}
+    })();
   } catch (e) {}
-  return n;
+  return ready;
+}
+
+// Entfernt liegengebliebene Blöcke eines gelöschten Kanals vom Server: eigene,
+// die das Gegenüber noch nicht geöffnet hat, und fremde, die hier noch warteten.
+async function removeLeftovers(own, e) {
+  const kt = C.unb64(own.kt), kd = C.unb64(own.kd);
+  const me = e.d, peer = me === "a" ? "b" : "a";
+  const jobs = [];
+  const add = async (dir, from, to) => {
+    from = Math.max(0, Math.floor(from)); to = Math.max(from, Math.floor(to));
+    const tags = await C.msgTags(kt, dir, from, to);
+    for (let n = from; n < to; n++) jobs.push([tags[n - from], await C.msgDelToken(kd, dir, n)]);
+  };
+  await add(me, (e.s || 0) - 64, e.s || 0);
+  await add(me + "c", (e.c || 0) - 64, e.c || 0);
+  await add(peer, e.r || 0, (e.r || 0) + 64);
+  await add(peer + "c", e.q || 0, (e.q || 0) + 64);
+  let i = 0;
+  const worker = async () => { while (i < jobs.length) { const [tag, token] = jobs[i++]; try { await pileDelete(tag, token); } catch (e2) {} } };
+  await Promise.all([worker(), worker(), worker(), worker(), worker(), worker()]);
 }
 
 function showWords(login, wipe) {
@@ -587,12 +644,12 @@ function downloadWords() {
     "chatmesh - Konto-Sicherung", "=".repeat(60), "",
     "DEINE 12 WÖRTER (damit meldest du dich an):", "",
     _backup.login.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"), "",
-    "FÜR DEN NOTFALL: LÖSCHWÖRTER (bei \"Anmelden\" eingeben = alles wird sofort unwiderruflich gelöscht):", "",
+    "FÜR DEN NOTFALL: LÖSCHWÖRTER (bei \"Anmelden\" eingeben = alles wird sofort unwiderruflich gelöscht, es öffnet sich ein leeres Konto):", "",
     _backup.wipe.split(" ").map((w, i) => `${String(i + 1).padStart(2, " ")}.  ${w}`).join("\n"), "",
     "=".repeat(60),
     "- Wer deine 12 Wörter hat, hat Zugriff auf dein Konto.",
     "- Wer die Löschwörter bei \"Anmelden\" eingibt, löscht alles: sofort, ohne Rückfrage.",
-    "- Danach sieht es so aus, als hätte es das Konto nie gegeben.",
+    "- Danach sind beide Konten leer. Es sieht aus wie eine normale Anmeldung.",
     "- Offline aufbewahren (Papier, USB-Stick). Niemals Cloud, niemals Foto.",
     "- Es gibt keine Wiederherstellung.",
   ].join("\n");
@@ -1353,7 +1410,7 @@ async function installKeys(c, keys, pwKey, salt) {
   c.kt = C.b64(keys.kTag);
   c.pd = await dissolvePart(keys.kDis, peerDir(c));
   c.wrap = await C.wrapWithKey(pwKey, salt, C.utf8(JSON.stringify({ m: C.b64(keys.kMsg), d: C.b64(keys.kDel), o: own })));
-  c.wb = C.b64(await C.boxSeal(C.unb64(S.acct.wp), C.utf8(JSON.stringify(own))));
+  c.wb = C.b64(await C.boxSeal(C.unb64(S.acct.wp), C.utf8(JSON.stringify({ t: own.t, k: own.k, d: own.d, kt: C.b64(keys.kTag), kd: C.b64(keys.kDel) }))));
   c.sym = keys.symbols;
   c.sn = 0; c.cn = 0; c.sr = 0; c.cr = 0; c.rn = 0; c.rc = 0; c.rp = []; c.rpc = [];
   c.keep = 0; c.shots = 0; c.rq = []; c.ro = []; c.hist = ""; c.rv = 0;
@@ -1887,6 +1944,40 @@ function fmtClock(sec) {
   return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
 }
 
+// Eigenen Code ändern: zur Sicherheit mit den 12 Wörtern bestätigen.
+function codeChangeButton() {
+  const b = el("button", "ghost small code-change", "Code ändern");
+  b.type = "button";
+  b.addEventListener("click", changeCodeSheet);
+  const wrap = el("div", "sheet-btn-row");
+  wrap.appendChild(b);
+  return wrap;
+}
+function changeCodeSheet() {
+  formSheet("Code ändern", {
+    info: "Bestätige mit deinen 12 Wörtern und lege einen neuen Code fest. Der Code gilt für diese Anmeldung: Nach dem Neu-Laden der Seite gibst du ihn ein.",
+    fields: [
+      { name: "words", type: "textarea", label: "Deine 12 Wörter" },
+      { name: "code", type: "password", label: "Neuer Code (mindestens 8 Zeichen)" },
+      { name: "code2", type: "password", label: "Neuen Code wiederholen" },
+    ],
+    submit: "Code ändern",
+    busy: "Einen Moment …",
+    onSubmit: async (v) => {
+      let L;
+      try { L = await C.wordsToBytes(v.words, 16); }
+      catch (e) { throw new Error(wordError(e, 12)); }
+      // Nur prüfen, ob die Wörter zu diesem Konto gehören. Hier wird nie etwas gelöscht.
+      if ((await C.accountKeys(L)).id !== S.me.id) throw new Error("Diese Wörter gehören nicht zu diesem Konto.");
+      if (!v.code || v.code.length < CODE_MIN) throw new Error("Der Code braucht mindestens " + CODE_MIN + " Zeichen.");
+      if (v.code !== v.code2) throw new Error("Die beiden Eingaben stimmen nicht überein.");
+      await storeSession(L, v.code);
+      closeSheet();
+      toast("Neuer Code gespeichert.", "ok");
+    },
+  });
+}
+
 function settingsSheet() {
   const set = S.acct.set;
   const v = set.view;
@@ -1901,6 +1992,7 @@ function settingsSheet() {
       { node: el("div", "sheet-section", "Kanal-Sperre") },
       { name: "lockOn", type: "checkbox", label: "Kanal-Passwort jedes Mal verlangen: beim Öffnen und immer, wenn du einen Kanal verlassen hast. Ausgeschaltet fragt jeder Kanal nur einmal je Anmeldung.", value: set.lockOn },
       { node: infoNode("Lädst du die Seite neu, bleibst du angemeldet und gibst nur deinen Code ein. Schließt du das Fenster, bist du abgemeldet. chatmesh beobachtet nicht, ob du die Maus bewegst oder tippst.") },
+      { node: codeChangeButton() },
     ],
     submit: "Speichern",
     onSubmit: async (val) => {
@@ -2472,7 +2564,10 @@ function bindUI() {
 // Nur in der lokalen Testumgebung: Zugriff für automatische Prüfungen.
 if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth };
 
-document.addEventListener("DOMContentLoaded", () => {
+// Start. Dieses Skript steht am Ende der Seite: alle Bausteine sind schon da.
+// Es wird sofort entschieden, welche Ansicht erscheint. Liegt in diesem Fenster
+// eine Anmeldung, kommt direkt die Code-Eingabe und nie die Anmelde-Seite.
+function init() {
   bindUI();
   bindShield();
   if (readSession()) showCode("unlock"); else show("auth");
@@ -2482,5 +2577,6 @@ document.addEventListener("DOMContentLoaded", () => {
   if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(() => {});
   if (typeof caches !== "undefined") caches.keys().then(ks => Promise.all(ks.map(k => caches.delete(k)))).catch(() => {});
   try { localStorage.clear(); for (const k of Object.keys(sessionStorage)) if (k !== SESSION_KEY) sessionStorage.removeItem(k); } catch (e) {}
-});
+}
+init();
 })();

@@ -21,7 +21,7 @@
     try {
       const d = await getJson("/api/proof/schema");
       const lines = [];
-      lines.push("-- Hauptdatenbank (Konto-Blöcke und der gemeinsame Haufen)");
+      lines.push("-- Hauptdatenbank (Konto-Blöcke und Nachrichten-Blöcke)");
       for (const t of d.main_db) lines.push(t.sql + ";\n");
       lines.push("-- Datenbank für Anhänge");
       for (const t of d.attachments_db) lines.push(t.sql + ";\n");

@@ -7,8 +7,10 @@
 //   Anmeldewörter allein nicht, um Nachrichten zu lesen, zu senden oder zu
 //   löschen. Ohne Passwort genügen sie.
 // - Jede Nachricht liegt als namenloser Block unter einer neuen Zufallsmarke
-//   auf dem gemeinsamen Haufen. Dieses Gerät lädt den ganzen Haufen und findet
-//   seine Blöcke selbst. Der Server bekommt keine Angabe, für wen ein Block ist.
+//   auf dem Server. Dieses Gerät lädt nur ein Verzeichnis (je Block die ersten
+//   5 Bytes der Marke), erkennt daran selbst, was für es da ist, und holt genau
+//   diese Blöcke mit der vollen Marke ab. Fremde Blöcke kann niemand laden. Der
+//   Server bekommt keine Angabe, für wen ein Block ist.
 // - Standard: Nachrichten werden beim Öffnen vom Server gelöscht, sind nur im
 //   Arbeitsspeicher sichtbar und verschwinden nach der eingestellten Zeit oder
 //   sofort beim Verlassen des Chats. Verlauf behalten nur, wenn beide zustimmen.
@@ -20,7 +22,10 @@
 const C = window.CM;
 const APP_NAME = "chatmesh";
 const WINDOW_BACK = 32, WINDOW_AHEAD = 256, RESERVE = 8;
-const LIM = { keep: 6000, bytes: 24 * 1024 * 1024 };         // nicht zugeordnete Blöcke im Arbeitsspeicher
+const LIM = { keep: 300000 };            // so viele Verzeichnis-Einträge bleiben höchstens im Arbeitsspeicher
+const INDEX_MAX = 60000;                 // so viele Einträge schickt der Server höchstens je Antwort
+const PFX = 10;                          // ein Verzeichnis-Eintrag: die ersten 5 Bytes einer Marke (10 Hex-Zeichen)
+const FETCH_MAX = 4;                     // so viele Marken werden am Stück verarbeitet (jede in einem eigenen Abruf)
 const VIEW_MIN = 5, VIEW_MAX = 30 * 86400, VIEW_DEFAULT = 600;
 const INVITE_SECONDS = 24 * 3600;
 const HIST_BYTES = 200000;              // Verlauf je Chat-Kanal (verschlüsselt im Konto)
@@ -49,8 +54,8 @@ const S = {
   blobClass: 0,
   work: { salt: "", pile: [12, 16], delete: 8, account: [17, 19, 21, 23, 25], account_wipe_extra: 2, upload: [16, 18, 20, 22] },
   wipeBig: false,
-  pile: new Map(),     // Marke -> Block (noch nicht zugeordnet)
-  pileBytes: 0,
+  index: new Map(),    // Verzeichnis: Anfang (5 Bytes) der Marke -> Platz in der Reihenfolge der Einlieferung
+  indexN: 0,
   cursor: 0,
   synced: false,
   expect: new Map(),   // Marke -> { id, kind, lane, n }
@@ -105,8 +110,17 @@ async function api(method, path, opt = {}) {
   let r;
   const init = { method, headers, body, cache: "no-store" };
   if (opt.keepalive && typeof body === "string" && body.length < 60000) init.keepalive = true;
+  // Mit Zeitgrenze: Ein hängender Abruf darf die folgenden nicht aufhalten.
+  let stop = null;
+  if (opt.timeout && typeof AbortController !== "undefined") {
+    const ac = new AbortController();
+    init.signal = ac.signal;
+    stop = setTimeout(() => { try { ac.abort(); } catch (e) {} }, opt.timeout);
+  }
   try { r = await fetch(path, init); }
-  catch (e) { throw new ApiError("Keine Verbindung zum Server", 0); }
+  catch (e) { if (stop) clearTimeout(stop); throw new ApiError("Keine Verbindung zum Server", 0); }
+  if (stop && !opt.raw) clearTimeout(stop);
+  if (stop && opt.raw) r.__stop = stop;
   if (!r.ok) {
     let detail = r.statusText;
     try { const j = await r.json(); if (j && j.detail) detail = String(j.detail); } catch (e) {}
@@ -735,7 +749,7 @@ function logout(message) {
   stopScan();
   for (const r of Object.values(S.run)) freeUrls(r);
   S.me = null; S.acct = null; S.version = 0; S.dirty = false; S.urgent = false; S.blobLen = 0;
-  S.pile = new Map(); S.pileBytes = 0; S.cursor = 0; S.synced = false; S.expect = new Map(); S.run = {}; S.active = null;
+  S.index = new Map(); S.indexN = 0; S.cursor = 0; S.synced = false; S.expect = new Map(); S.run = {}; S.active = null;
   _saveChain = Promise.resolve(true);
   _backup = null;
   for (const id of ["#chat-stream", "#chat-header", "#channel-list", "#notes", "#words-login", "#words-wipe"]) $(id).textContent = "";
@@ -759,8 +773,7 @@ async function startSession() {
   renderChat();
   setSync("Synchronisiere …");
   await loadConfig();
-  // Erst ausrechnen, welche Marken uns gehören, dann den Haufen laden. So geht
-  // auch bei einem sehr großen Haufen nichts Eigenes verloren.
+  // Erst ausrechnen, welche Marken uns gehören, dann das Verzeichnis laden.
   await rebuildExpect();
   if (sid !== S.sid) return;
   try { await pileSync(true); } catch (e) {}
@@ -772,7 +785,7 @@ async function startSession() {
 }
 // Fassung dieser App. Der Server nimmt Speicherungen älterer Fassungen nicht mehr an,
 // damit ein altes, noch offenes Fenster keine neueren Angaben überschreibt.
-const CLIENT_VER = 1;
+const CLIENT_VER = 2;
 let _reloadTold = false;
 // Der Server verlangt eine neuere Fassung: Ab hier würde nichts mehr gespeichert.
 // Deshalb wird die Bedienung angehalten, bis die Seite neu geladen ist. Die
@@ -817,111 +830,169 @@ const unlocked = (c) => !!(S.run[c.id] && S.run[c.id].kMsg);
 // angenommen: ein alter Block lässt sich nicht noch einmal unterschieben.
 async function refreshExpect(c) {
   const r = runOf(c);
+  // Erst alles ausrechnen, dann in einem Zug tauschen: So gibt es keinen Augenblick,
+  // in dem ein gerade abgeholter Block zu keiner Erwartung passt.
+  const next = [];
+  if (c.pend) {
+    if (!c.pend.ans) next.push([c.pend.tb, { id: c.id, kind: "ans" }]);
+  } else {
+    const kt = C.unb64(c.kt), p = peerDir(c);
+    const tops = {};
+    for (const [lane, base, map, done] of [["", c.rn || 0, r.wait, c.rp], ["c", c.rc || 0, r.cwait, c.rpc]]) {
+      let top = base;
+      for (const k of map.keys()) if (k + 1 > top) top = k + 1;
+      const from = Math.max(0, base - WINDOW_BACK), to = top + WINDOW_AHEAD;
+      tops[lane] = to;
+      const tags = await C.msgTags(kt, p + lane, from, to);
+      next.push({ lane, from, to, tags });
+    }
+    if (chan(c.id) !== c || c.pend) return;        // inzwischen gelöscht oder ersetzt
+    const out = [];
+    for (const g of next) {
+      const map = g.lane ? r.cwait : r.wait;
+      const used = new Set(g.lane ? c.rpc : c.rp);
+      r.top[g.lane] = tops[g.lane];
+      for (let n = g.from; n < g.to; n++) {
+        if (map.has(n) || used.has(n)) continue;
+        out.push([g.tags[n - g.from], { id: c.id, kind: "msg", lane: g.lane, n }]);
+      }
+    }
+    out.push([c.pd.t, { id: c.id, kind: "dis" }]);
+    next.length = 0;
+    for (const e of out) next.push(e);
+  }
+  if (chan(c.id) !== c) return;
   for (const t of r.tags) S.expect.delete(t);
   r.tags = [];
-  const add = (tag, info) => { S.expect.set(tag, info); r.tags.push(tag); };
-  if (c.pend) {
-    if (!c.pend.ans) add(c.pend.tb, { id: c.id, kind: "ans" });
-    return;
-  }
-  const kt = C.unb64(c.kt), p = peerDir(c);
-  for (const [lane, base, map, done] of [["", c.rn || 0, r.wait, c.rp], ["c", c.rc || 0, r.cwait, c.rpc]]) {
-    let top = base;
-    for (const k of map.keys()) if (k + 1 > top) top = k + 1;
-    const from = Math.max(0, base - WINDOW_BACK), to = top + WINDOW_AHEAD;
-    r.top[lane] = to;
-    const used = new Set(done);
-    const tags = await C.msgTags(kt, p + lane, from, to);
-    for (let n = from; n < to; n++) {
-      if (map.has(n) || used.has(n)) continue;
-      add(tags[n - from], { id: c.id, kind: "msg", lane, n });
-    }
-  }
-  add(c.pd.t, { id: c.id, kind: "dis" });
+  for (const [tag, info] of next) { S.expect.set(tag, info); r.tags.push(tag); }
 }
 async function rebuildExpect() {
-  S.expect = new Map();
   if (!S.acct) return;
-  for (const c of S.acct.ch) { runOf(c).tags = []; await refreshExpect(c); }
+  const sid = S.sid;
+  for (const c of [...S.acct.ch]) { await refreshExpect(c); if (sid !== S.sid || !S.acct) return; }
+  // Erwartungen von Chat-Kanälen, die es nicht mehr gibt, entfernen.
+  const ids = new Set(S.acct.ch.map(c => c.id));
+  for (const [tag, info] of S.expect) if (!ids.has(info.id)) S.expect.delete(tag);
   await matchPile();
 }
-// Sucht im schon geladenen Haufen nach vorgemerkten Marken.
+// Vergleicht die vorgemerkten Marken mit dem Verzeichnis. Steht der Anfang einer
+// eigenen Marke darin, wird genau dieser Block geholt: jeder in einem eigenen Abruf
+// und streng in der Reihenfolge, in der die Blöcke eingeliefert wurden. So kommen
+// Nachrichten und Lösch-Aufträge in derselben Folge an, in der sie gesendet wurden.
+let _matching = null, _matchAgain = false, _matchRetry = false;
 async function matchPile() {
-  const hits = [];
-  for (const [tag, info] of S.expect) { if (S.pile.has(tag)) hits.push([tag, info]); }
-  for (const [tag, info] of hits) await onMatch(tag, info, S.pile.get(tag));
+  const sid = S.sid;
+  if (_matching === sid) { _matchAgain = true; return; }
+  _matching = sid;
+  try {
+    for (let pass = 0; pass < 200; pass++) {
+      _matchAgain = false;
+      _matchRetry = false;
+      const hits = [];
+      for (const tag of S.expect.keys()) { const at = S.index.get(tag.slice(0, PFX)); if (at !== undefined) hits.push([at, tag]); }
+      hits.sort((x, y) => x[0] - y[0]);
+      let progress = false;
+      // Wenige Abrufe laufen gleichzeitig, verarbeitet wird trotzdem streng der Reihe nach.
+      for (let i = 0; i < hits.length; i += FETCH_MAX) {
+        if (sid !== S.sid || !S.me) return;
+        const part = hits.slice(i, i + FETCH_MAX).map(h => h[1]).filter(tag => S.expect.has(tag));
+        const res = await Promise.all(part.map(tag => fetchBlocks([tag]).then(m => ({ block: m.get(tag) }), () => ({ failed: true }))));
+        if (sid !== S.sid || !S.me) return;
+        for (let k = 0; k < part.length; k++) {
+          const tag = part[k];
+          // Scheitert ein Abruf, wird hier angehalten und beim nächsten Mal an derselben Stelle
+          // weitergemacht: Spätere Blöcke dürfen frühere nicht überholen.
+          if (res[k].failed) { _matchRetry = true; _matchAgain = false; return; }
+          const block = res[k].block;
+          // Nichts da: Der Block wurde inzwischen gelöscht, oder ein fremder Eintrag fing zufällig gleich an.
+          if (!block) { S.index.delete(tag.slice(0, PFX)); continue; }
+          const info = S.expect.get(tag);
+          if (!info) continue;                               // wird nicht mehr erwartet
+          await onMatch(tag, info, block);
+          progress = true;
+          if (sid !== S.sid || !S.me) return;
+        }
+      }
+      // Nach Treffern rückt das Fenster der erwarteten Marken weiter: noch einmal vergleichen.
+      if (!progress && !_matchAgain) break;
+    }
+  } finally {
+    if (_matching === sid) _matching = null;
+    if (_matchAgain) _matchRetry = true;
+  }
 }
 
 // =========================================================================
-// DER HAUFEN: abrufen und zuordnen
+// VERZEICHNIS UND ABRUF
+// Alle Apps laden dasselbe Verzeichnis: je Block nur die ersten 5 Bytes seiner
+// Marke. Daran erkennt jede App für sich, ob etwas für sie da ist, ohne dass der
+// Server erfährt, worauf sie wartet. Den Block selbst gibt der Server nur gegen
+// die volle Marke heraus. Fremde Blöcke kann deshalb niemand herunterladen.
 // =========================================================================
-function parsePile(buf) {
+function parseBlocks(buf) {
   const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
-  const out = [];
+  const out = new Map();
   let o = 0;
-  while (o + 28 <= buf.length) {
-    const seq = dv.getUint32(o) * 4294967296 + dv.getUint32(o + 4);
-    const len = dv.getUint32(o + 24);
-    if (o + 28 + len > buf.length) break;
-    out.push([seq, C.hex(buf.subarray(o + 8, o + 24)), buf.slice(o + 28, o + 28 + len)]);
-    o += 28 + len;
+  while (o + 20 <= buf.length) {
+    const len = dv.getUint32(o + 16);
+    if (o + 20 + len > buf.length) break;
+    out.set(C.hex(buf.subarray(o, o + 16)), buf.slice(o + 20, o + 20 + len));
+    o += 20 + len;
   }
   return out;
 }
-function pileStore(tag, block) {
-  const old = S.pile.get(tag);
-  if (old) S.pileBytes -= old.byteLength;
-  S.pile.set(tag, block);
-  S.pileBytes += block.byteLength;
+// Holt Blöcke zu genau diesen Marken. Liefert Marke -> Block; was es nicht gibt, fehlt.
+// Jede Marke geht in einem eigenen Abruf: So sehen alle Abrufe gleich aus, auch die der
+// Schein-Blöcke, und der Server erfährt nicht, welche Blöcke zusammengehören.
+async function fetchBlocks(tags) {
+  const out = new Map();
+  for (const tag of tags) {
+    const resp = await api("POST", "/api/v2/pile/fetch", { raw: true, timeout: 30000, json: { tags: [tag] } });
+    let buf;
+    try { buf = new Uint8Array(await resp.arrayBuffer()); } finally { if (resp.__stop) clearTimeout(resp.__stop); }
+    for (const [t, block] of parseBlocks(buf)) if (t === tag) out.set(t, block);
+  }
+  return out;
 }
-function pileDrop(tag) {
-  const old = S.pile.get(tag);
-  if (old) { S.pileBytes -= old.byteLength; S.pile.delete(tag); }
-}
-let _syncing = false;
+function pileDrop(tag) { S.index.delete(tag.slice(0, PFX)); }
+let _syncing = null, _indexFloor = 0;
 async function pileSync(initial) {
-  if (_syncing || !S.me) return;
-  _syncing = true;
   const sid = S.sid;
+  if (_syncing === sid || !S.me) return;
+  _syncing = sid;
+  let fresh = false;
+  const fromZero = S.cursor === 0;
   try {
     for (let round = 0; round < 400; round++) {
-      const resp = await api("GET", "/api/v2/pile?since=" + S.cursor, { raw: true });
-      const state = String(resp.headers.get("X-Pile") || "ende:" + S.cursor + ":0").split(":");
-      const buf = new Uint8Array(await resp.arrayBuffer());
+      const resp = await api("GET", "/api/v2/pile/index?since=" + S.cursor, { raw: true, timeout: 30000 });
+      const state = String(resp.headers.get("X-Pile") || "ende:" + S.cursor).split(":");
+      let buf;
+      try { buf = new Uint8Array(await resp.arrayBuffer()); } finally { if (resp.__stop) clearTimeout(resp.__stop); }
       if (sid !== S.sid) return;
-      for (const [seq, tag, block] of parsePile(buf)) {
-        if (seq > S.cursor) S.cursor = seq;
-        const info = S.expect.get(tag);
-        if (info) await onMatch(tag, info, block);
-        else pileStore(tag, block);
-        if (sid !== S.sid) return;
+      const step = PFX / 2;
+      if (buf.length % step || buf.length > INDEX_MAX * step) throw new Error("Verzeichnis ungültig");
+      for (let o = 0; o + step <= buf.length; o += step) {
+        const p = C.hex(buf.subarray(o, o + step));
+        if (!S.index.has(p)) S.index.set(p, S.indexN++);
+        fresh = true;
       }
-      // Arbeitsspeicher begrenzen: die ältesten nicht zugeordneten Blöcke fallen weg.
-      if (S.pile.size > LIM.keep || S.pileBytes > LIM.bytes) {
-        for (const k of S.pile.keys()) {
-          if (S.pile.size <= LIM.keep * 0.9 && S.pileBytes <= LIM.bytes * 0.9) break;
-          pileDrop(k);
-        }
-      }
-      if (initial) setSync("Synchronisiere … " + S.pile.size + " Blöcke");
+      const last = Number(state[1]);
+      if (Number.isFinite(last) && last > S.cursor) S.cursor = last;
       if (state[0] !== "weiter") break;
     }
-  } finally { _syncing = false; }
+    if (fromZero) _indexFloor = S.index.size;
+  } finally { if (_syncing === sid) _syncing = null; }
+  if (initial) { matchPile().catch(() => {}); }
+  else if (fresh || _matchRetry) await matchPile();
+  // Arbeitsspeicher begrenzen: Im Lauf einer langen Sitzung sammeln sich Einträge längst
+  // gelöschter Blöcke. Dann wird das Verzeichnis einmal frisch geholt.
+  if (sid === S.sid && S.me && S.index.size > Math.max(LIM.keep, _indexFloor * 2)) { S.index = new Map(); S.indexN = 0; S.cursor = 0; }
 }
-// Sucht gezielt nach bestimmten Marken im ganzen Haufen (für das Einlösen
-// eines Einmal-Codes). Verändert nichts am eigenen Stand.
+// Fragt gezielt nach bestimmten Marken (für das Einlösen eines Einmal-Schlüssels).
+// Verändert nichts am eigenen Stand.
 async function scanFor(tags) {
   const found = {};
-  let cursor = 0;
-  for (let round = 0; round < 400; round++) {
-    const resp = await api("GET", "/api/v2/pile?since=" + cursor, { raw: true });
-    const state = String(resp.headers.get("X-Pile") || "ende:0:0").split(":");
-    for (const [seq, tag, block] of parsePile(new Uint8Array(await resp.arrayBuffer()))) {
-      if (seq > cursor) cursor = seq;
-      if (tags.includes(tag)) found[tag] = block;
-    }
-    if (state[0] !== "weiter") break;
-  }
+  for (const [tag, block] of await fetchBlocks(tags)) found[tag] = block;
   return found;
 }
 
@@ -1167,7 +1238,7 @@ function reserveNumbers(c, key) {
   return _reserving[slot];
 }
 
-// Verschließt einen Inhalt und legt ihn als Block auf den Haufen.
+// Verschließt einen Inhalt und legt ihn als Block auf dem Server ab.
 // lane "" = Nachricht, lane "c" = stilles Steuerzeichen (gelesen, gelöscht, Antwort).
 // Gibt die Nummer zurück, unter der er liegt.
 async function sendObj(c, obj, lane = "") {
@@ -1943,14 +2014,21 @@ function loop(fn, nextDelay) {
 }
 
 function startLoops() {
-  // Haufen abrufen
+  // Verzeichnis abrufen
   loop(() => pileSync(false), () => randBetween(600, 1700));
   // Schein-Blöcke: sehen aus wie echte, werden nach kurzer Zeit wieder gelöscht
   loop(async () => {
     const big = randInt(40) === 0;
     const tag = C.hex(C.rand(16)), token = C.hex(C.rand(16));
     const code = await pilePost(tag, C.rand(big ? 65564 : 4124), token, 24);
-    if (code === 200) queueDelete(tag, token, randBetween(4000, 90000));
+    if (code === 200) {
+      // Meist wird er vorher abgeholt, so wie eine echte Nachricht vom Gegenüber abgeholt wird.
+      if (randInt(5) !== 0) {
+        const sid = S.sid, t = setTimeout(() => { S.timers.delete(t); if (S.me && sid === S.sid) fetchBlocks([tag]).catch(() => {}); }, randBetween(700, 3500));
+        S.timers.add(t);
+      }
+      queueDelete(tag, token, randBetween(4000, 90000));
+    }
   }, () => Math.round(randExp(10000, 1200, 45000)));
   // Ablauf der Anzeige-Zeit und der Einmal-Schlüssel
   loop(async () => { tickExpiry(); expireInvites(); expireUnread(); }, () => 1000);

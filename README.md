@@ -23,11 +23,18 @@ er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
    ihn ein. Danach ist der Code für alle ungültig. Jeder der beiden kann dem
    Chat-Kanal für sich ein eigenes Passwort geben. Das ist freiwillig und lässt
    sich später festlegen, ändern oder entfernen.
-3. **Der Haufen.** Jede Nachricht ist ein namenloser Block fester Größe unter
-   einer neuen Zufallsmarke. Alle Blöcke aller Nutzer liegen auf einem
-   gemeinsamen Haufen. Jede App lädt den ganzen Haufen und findet ihre Blöcke
-   selbst. Der Server bekommt keine Angabe, für wen ein Block ist, und
-   speichert nicht, wer ihn löscht.
+3. **Das Verzeichnis.** Jede Nachricht ist ein namenloser Block fester Größe
+   unter einer neuen Zufallsmarke (16 Bytes), die nur die beiden Geräte des
+   Chat-Kanals ausrechnen können. Der Server führt ein Verzeichnis, das zu
+   jedem Block nur die ersten 5 Bytes seiner Marke nennt. Jede App lädt
+   dasselbe Verzeichnis und erkennt selbst, ob etwas für sie da ist. So
+   erfährt der Server nicht, worauf eine App wartet. Den Block selbst gibt er
+   nur gegen die volle Marke heraus: Fremde Blöcke kann niemand herunterladen.
+   Der Server bekommt keine Angabe, für wen ein Block ist, und speichert
+   nicht, wer ihn abholt oder löscht. Die App fragt je Abruf genau eine Marke
+   ab, auch bei Schein-Blöcken: So sieht jeder Abruf gleich aus.
+   Übergang: Für ältere, noch offene Fenster liefert die frühere
+   Komplett-Abfrage noch bis 23.11.2026, 0 Uhr UTC. Danach bleibt sie leer.
 4. **Verschwinden.** Öffnet das Gegenüber den Chat, wird der Block sofort vom
    Server gelöscht. Die Nachricht ist dann nur noch im Arbeitsspeicher des
    Browsers und verschwindet nach der eingestellten Zeit (Standard 10 Minuten)
@@ -35,7 +42,8 @@ er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
 5. **Verlauf behalten** gibt es nur, wenn beide zustimmen. Dann liegt der
    Verlauf verschlüsselt im Konto-Block.
 6. **Schein-Verkehr.** Jede offene App und ein eigener Dienst auf dem Server
-   legen ständig Blöcke ab und löschen sie wieder, in unregelmäßigen Abständen.
+   legen ständig Blöcke ab, holen sie ab und löschen sie wieder, in
+   unregelmäßigen Abständen.
    Ein Schein-Block ist von einem echten nicht zu unterscheiden. Der Dienst
    legt außerdem laufend neue Schein-Konten an und benutzt sie wie ein Mensch.
    Er merkt sich nichts dauerhaft: Es gibt keine Liste, aus der sich ablesen
@@ -120,8 +128,9 @@ bekommt nur Geheimtext.
 
 - Einliefern und Löschen eines Blocks sehen gleich aus: gleiche Länge der
   Anfrage, immer Status 200, gleiche Länge und Mindestdauer der Antwort.
-- Abrufe des Haufens, Schein-Blöcke und das Speichern des Kontos laufen in
-  zufälligen Abständen, mit und ohne Anlass.
+- Abrufe des Verzeichnisses, Schein-Blöcke (sie werden wie echte auch wieder
+  abgeholt) und das Speichern des Kontos laufen in zufälligen Abständen, mit
+  und ohne Anlass.
 - Der Server setzt keine Cookies, schreibt kein Zugriffsprotokoll und liest
   keine IP-Adresse oder Gerätekennung.
 - Im Browser liegt nur die Anmeldung, verschlossen mit dem eigenen Code des
@@ -155,7 +164,15 @@ bekommt nur Geheimtext.
   niemand kann das Abfotografieren eines Bildschirms verhindern.
 - Wer den Datenverkehr über lange Zeit beobachtet, sieht, wann ein Gerät mit
   chatmesh verbunden ist. Große Anhänge fallen als größere Übertragung auf.
-- Jede App lädt den ganzen Haufen. Das kostet Datenvolumen.
+- Holt eine App einen Block ab, sieht der Server, dass genau dieser Block
+  abgeholt wurde, aber nicht von wem: Er liest keine IP-Adresse und es gibt
+  dabei keine Anmeldung. Wer davor am Netz die IP-Adressen mitliest, könnte
+  Einliefern und Abholen desselben Blocks zwei Anschlüssen zuordnen. Dagegen
+  hilft der Zugang über Tor.
+- Warten mehrere Nachrichten auf ein Gerät, holt die App sie kurz
+  hintereinander ab. Der Server könnte aus der zeitlichen Nähe schließen, dass
+  diese Blöcke an dasselbe Gerät gehen, und sieht am Abholen, dass ein
+  Empfänger gerade da ist. An wen, sieht er nicht.
 
 ## Schutz des Servers
 
@@ -183,7 +200,9 @@ ausliefert, und vergleicht sie mit dem öffentlichen Stand. Es braucht nur
 Python.
 
 Der Server zeigt und zählt bewusst keine Mengen: nicht, wie viele Konten es
-gibt, nicht, wie viele Blöcke oder Anhänge. Die Seite `/beweis` zeigt nur
+gibt, nicht, wie viele Blöcke oder Anhänge. Am Verzeichnis lässt sich
+abzählen, wie viele Blöcke gerade liegen. Darunter sind Schein-Blöcke, und
+welche echt sind, steht nirgends. Die Seite `/beweis` zeigt nur
 Speicherformat, Quelltext und Prüfsummen.
 
 ## Selbst betreiben und prüfen

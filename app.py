@@ -4,12 +4,14 @@ Grundidee:
 - Es gibt keine Adressen, keine Benutzernamen, keine Passwörter auf dem Server.
 - Ein Konto ist ein verschlüsselter Block, der unter einer Zufallskennung liegt.
   Kennung und Schlüssel entstehen im Browser aus 12 Wörtern.
-- Alle Nachrichten aller Nutzer liegen als gleich aussehende Blöcke auf EINEM
-  gemeinsamen Haufen. Ein Block trägt nur eine Zufallsmarke. Kein Absender,
+- Alle Nachrichten aller Nutzer liegen als gleich aussehende Blöcke in EINEM
+  gemeinsamen Speicher. Ein Block trägt nur eine Zufallsmarke. Kein Absender,
   kein Empfänger, kein Konto. Welche Blöcke zusammengehören, können nur die
   zwei Geräte ausrechnen, die den Kanal miteinander geöffnet haben.
-- Jeder holt den ganzen Haufen (bzw. ganze Reihen davon) ab. Der Server sieht
-  nie, für wen ein Block bestimmt ist.
+- Jeder holt dasselbe Verzeichnis ab: je Block nur die ersten 5 Bytes seiner
+  Marke. Daran erkennt eine App selbst, ob etwas für sie da ist. Der Server
+  erfährt nicht, worauf sie wartet. Den Block gibt er nur gegen die volle Marke
+  heraus; fremde Blöcke kann niemand herunterladen.
 - Löschen darf, wer das Lösch-Geheimnis des Blocks kennt (Absender und
   Empfänger). Auch das läuft ohne Anmeldung.
 - Im Hintergrund erzeugen Schein-Nutzer (bots.py) ständig gleich aussehenden
@@ -41,6 +43,8 @@ import aiosqlite
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from typing import List
+
 from pydantic import BaseModel, Field, constr
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -156,7 +160,7 @@ def limit_ok(key: str, limit: int, window: int) -> bool:
 # Grenzen: der Dienst darf nie die Platte füllen.
 # ---------------------------------------------------------------------------
 MIN_FREE_BYTES     = 3 * 1024**3          # darunter wird nichts Neues angenommen
-MAX_PILE_BYTES     = 200 * 1024**2        # alle Blöcke auf dem Haufen zusammen
+MAX_PILE_BYTES     = 200 * 1024**2        # alle Nachrichten-Blöcke zusammen
 MAX_ACCOUNT_BYTES  = 300 * 1024**2        # alle Konto-Blöcke zusammen
 MAX_UPLOADS_BYTES  = 500 * 1024**2        # alle Anhänge zusammen
 
@@ -195,7 +199,7 @@ BLOCK_B64 = [b64_len(n) for n in BLOCK_BYTES]
 ACCOUNT_B64 = [b64_len(p + 28) for p in ACCOUNT_PLAIN]
 WIPE_B64 = [b64_len(p + 28) for p in WIPE_PLAIN]
 
-# Der Haufen kann später in Reihen geteilt werden (Anfang der Zufallsmarke).
+# Nur für die alte Komplett-Abfrage (Übergang): Reihen nach dem Anfang der Zufallsmarke.
 # 0 heißt: eine Reihe, jeder holt alles ab.
 BUCKET_HEX = max(0, min(4, int(os.environ.get("LEHNO_MESH_BUCKET_HEX", "0"))))
 
@@ -472,6 +476,8 @@ BIG_ROUTES = {
     ("PUT", "/api/v2/account"):   ("account", 48, 300, MAX_BODY_ACCOUNT, True),
     ("POST", "/api/attachments"): ("upload", 16, 330, MAX_BODY_ATTACHMENT, False),
 }
+# Wege, die nur winzige Anfragen brauchen.
+SMALL_BODIES = {("POST", "/api/v2/pile/fetch"): 2048}
 # Kopfzeilen, mit denen sich das Änderungsdatum von Dateien erfragen ließe.
 STRIP_REQUEST_HEADERS = (b"if-modified-since", b"if-none-match", b"if-range", b"range", b"if-unmodified-since")
 DEFAULT_TIMEOUT = 60
@@ -497,7 +503,7 @@ async def guard(request: Request, call_next):
             resp = _json(403, "unknown host")
         elif method in ("POST", "PUT", "PATCH", "DELETE"):
             big = BIG_ROUTES.get((method, path))
-            cap = big[3] if big else MAX_BODY_DEFAULT
+            cap = big[3] if big else SMALL_BODIES.get((method, path), MAX_BODY_DEFAULT)
             cl = request.headers.get("content-length")
             if method != "DELETE" and (cl is None or not cl.isdigit()):
                 resp = _json(411, "content-length required")
@@ -579,6 +585,10 @@ class AccountCreateReq(StrictModel):
 # Fassungen ohne diese Angabe (0) dürfen weiter speichern: Sie würden eine
 # Ablehnung nicht verstehen, und Angelegtes (etwa ein Einmal-Schlüssel) ginge verloren.
 MIN_CLIENT = max(0, int(os.environ.get("LEHNO_MESH_MIN_CLIENT", "0")))
+# Ab dieser Fassung holt die App ihre Blöcke gezielt ab. Offene Fenster mit einer
+# älteren Fassung, die den Hinweis schon kennen, werden gebeten, neu zu laden.
+# Speichern dürfen sie weiter.
+RELOAD_HINT = 2
 
 
 class AccountPutReq(StrictModel):
@@ -756,7 +766,7 @@ async def account_wipe(req: WipeReq, con: aiosqlite.Connection = Depends(db)):
 
 
 # ---------------------------------------------------------------------------
-# Der Haufen
+# Die Nachrichten-Blöcke
 # Jede Nachricht (und jede Schein-Nachricht) ist ein Block in fester Größe mit
 # einer Zufallsmarke. Ohne Anmeldung, ohne Absender, ohne Empfänger.
 # ---------------------------------------------------------------------------
@@ -784,6 +794,10 @@ class PilePostReq(StrictModel):
     data: str = Field(..., min_length=1, max_length=90_000)
     del_hash: constr(pattern=HEX64)
     work: str = Field("", max_length=16)
+
+
+class PileFetchReq(StrictModel):
+    tags: List[constr(pattern=HEX32)] = Field(..., min_length=1, max_length=16)
 
 
 class PileDeleteReq(StrictModel):
@@ -841,11 +855,78 @@ async def pile_delete(req: PileDeleteReq, con: aiosqlite.Connection = Depends(db
 
 
 PILE_CHUNK_BYTES = 2 * 1024 * 1024
+# Verzeichnis: Je Block werden nur die ersten 5 Bytes seiner Marke genannt. Das
+# genügt, damit eine App erkennt, ob etwas für sie da ist, aber nicht, um einen
+# fremden Block abzurufen: Dafür braucht es die volle Marke (16 Bytes).
+INDEX_HEX = 10
+INDEX_MAX = 60000
+FETCH_MAX = 16
+# Übergang: Bis zu diesem Zeitpunkt (23.11.2026, 0 Uhr UTC) liefert die alte
+# Abfrage noch ganze Blöcke, damit noch offene Fenster mit einer älteren Fassung
+# weiter empfangen. Danach bleibt sie leer.
+OLD_PILE_END = 1795392000
+try:
+    OLD_PILE_UNTIL = min(int(os.environ.get("LEHNO_MESH_OLD_PILE_UNTIL", "") or OLD_PILE_END), OLD_PILE_END)
+except ValueError:
+    OLD_PILE_UNTIL = OLD_PILE_END
+# Das vollständige Verzeichnis (ab Nummer 0) wird einen Augenblick lang gemerkt,
+# damit viele gleichzeitige Abrufe den Server nicht aufhalten.
+_index0 = {"at": 0.0, "body": b"", "state": ""}
+
+
+@app.get("/api/v2/pile/index")
+async def pile_index(since: int = 0, con: aiosqlite.Connection = Depends(db)):
+    """Verzeichnis aller Blöcke nach einer laufenden Nummer: je Block nur die
+    ersten 5 Bytes seiner Marke, hintereinander weg. Jede App ruft dasselbe
+    Verzeichnis ab; daraus ist nicht zu erkennen, worauf sie wartet.
+    Kopfzeile X-Pile: 'weiter' (es gibt noch mehr) oder 'ende', dazu die höchste Nummer."""
+    if not limit_ok("pile:index", 600000, 60):
+        raise HTTPException(429, "too many requests")
+    if since < 0 or since > 2**62:
+        raise HTTPException(400, "invalid cursor")
+    if since == 0 and _index0["state"] and time.monotonic() - _index0["at"] < 0.5:
+        resp = Response(content=_index0["body"], media_type="application/octet-stream")
+        resp.headers["X-Pile"] = _index0["state"]
+        return resp
+    # Die Datenbank fügt die Anfänge selbst zusammen: ein Ergebnis statt vieler Zeilen.
+    cur = await con.execute(
+        "SELECT COUNT(*) AS n, MAX(seq) AS last, group_concat(p, '') AS hx FROM "
+        "(SELECT seq, substr(tag, 1, ?) AS p FROM pile WHERE seq > ? ORDER BY seq ASC LIMIT ?)",
+        (INDEX_HEX, since, INDEX_MAX),
+    )
+    row = await cur.fetchone()
+    count = row["n"] or 0
+    out = bytes.fromhex(row["hx"] or "")
+    last = row["last"] if count else since
+    state = ("weiter" if count >= INDEX_MAX else "ende") + ":" + str(last)
+    if since == 0:
+        _index0["at"], _index0["body"], _index0["state"] = time.monotonic(), out, state
+    resp = Response(content=out, media_type="application/octet-stream")
+    resp.headers["X-Pile"] = state
+    return resp
+
+
+@app.post("/api/v2/pile/fetch")
+async def pile_fetch(req: PileFetchReq, con: aiosqlite.Connection = Depends(db)):
+    """Gibt Blöcke nur gegen ihre volle Marke heraus, als Binärstrom:
+    je Block: Marke (16 Bytes) | Länge (4 Bytes) | Block. Marken, zu denen es
+    nichts gibt, fehlen einfach. Wer fragt, wird nicht festgehalten."""
+    if not limit_ok("pile:fetch", 600000, 60):
+        raise HTTPException(429, "too many requests")
+    tags = list(dict.fromkeys(req.tags))
+    cur = await con.execute(
+        "SELECT tag, data FROM pile WHERE tag IN (%s)" % ",".join("?" * len(tags)), tags)
+    out = bytearray()
+    async for r in cur:
+        data = bytes(r["data"])
+        out += bytes.fromhex(r["tag"]) + struct.pack(">I", len(data)) + data
+    return Response(content=bytes(out), media_type="application/octet-stream")
 
 
 @app.get("/api/v2/pile")
 async def pile_get(since: int = 0, b: str = "", con: aiosqlite.Connection = Depends(db)):
-    """Liefert alle Blöcke nach einer laufenden Nummer, als Binärstrom:
+    """Alte Komplett-Abfrage, nur noch für den Übergang (siehe OLD_PILE_UNTIL), danach leer.
+    Liefert alle Blöcke nach einer laufenden Nummer, als Binärstrom:
     je Block: Nummer (8 Bytes) | Marke (16 Bytes) | Länge (4 Bytes) | Block.
     Die laufende Nummer ist nur eine Reihenfolge, keine Uhrzeit.
     Kopfzeile X-Pile: 'weiter' (es gibt noch mehr) oder 'ende', dazu die höchste Nummer."""
@@ -856,6 +937,11 @@ async def pile_get(since: int = 0, b: str = "", con: aiosqlite.Connection = Depe
     prefix = b.lower()
     if len(prefix) != BUCKET_HEX or not re.match(r"^[0-9a-f]*$", prefix):
         raise HTTPException(400, "invalid row")
+    if time.time() >= OLD_PILE_UNTIL:
+        # Der Übergang ist vorbei: Niemand kann mehr fremde Blöcke herunterladen.
+        resp = Response(content=b"", media_type="application/octet-stream")
+        resp.headers["X-Pile"] = "ende:" + str(since) + ":0"
+        return resp
     if prefix:
         cur = await con.execute(
             "SELECT seq, tag, data FROM pile WHERE seq > ? AND tag >= ? AND tag < ? ORDER BY seq ASC LIMIT 2000",
@@ -885,7 +971,8 @@ async def config():
     """Öffentliche Einstellungen, dazu die gerade geforderte Schwere der Rechenaufgabe."""
     return {
         "row_hex": BUCKET_HEX, "block_bytes": BLOCK_BYTES, "keep_weeks": PILE_KEEP_WEEKS,
-        "min_client": MIN_CLIENT,
+        "min_client": max(MIN_CLIENT, RELOAD_HINT),
+        "index_hex": INDEX_HEX, "fetch_max": FETCH_MAX,
         "work": {
             "salt": _work_salts[0].hex(),
             "pile": [work_bits_pile(n) for n in BLOCK_BYTES],

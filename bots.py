@@ -3,8 +3,8 @@
 
 Dieses Programm läuft als eigener Dienst neben dem Server. Es benimmt sich wie
 eine wechselnde Zahl von Menschen, die chatmesh benutzen: Neue kommen dazu und
-legen sich ein Konto an, sie kommen und gehen, rufen den Haufen ab, legen Blöcke
-ab, "lesen" sie (= löschen sie wieder), schicken ab und zu etwas Größeres und
+legen sich ein Konto an, sie kommen und gehen, rufen das Verzeichnis ab, legen Blöcke
+ab, "lesen" sie (= holen sie ab und löschen sie wieder), schicken ab und zu etwas Größeres und
 speichern ihr Konto. Manche bleiben lange, manche hören nach kurzer Zeit auf,
 einige löschen ihr Konto wieder. Alles in unregelmäßigen Abständen.
 
@@ -49,7 +49,7 @@ MAX_LINGER = 400                         # so viele Blöcke dürfen ohne Löschu
 MAX_ATTACHMENTS = 2                      # so viele Schein-Anhänge gleichzeitig unterwegs
 MAX_LINGER_ATTACHMENTS = 30              # so viele kleine Schein-Anhänge dürfen liegen bleiben
 MAX_WORK_BITS = 24                       # wird die Rechenaufgabe schwerer, pausieren die Bots (wie die Schein-Blöcke der App)
-CLIENT_VER = 1            # dieselbe Fassungs-Angabe wie die App
+CLIENT_VER = 2            # dieselbe Fassungs-Angabe wie die App
 
 PEOPLE_MIN, PEOPLE_MAX = 5, 24           # so viele Schein-Menschen gibt es gleichzeitig
 NEW_PER_DAY_MAX = 6                      # mehr neue Schein-Konten entstehen nie an einem Tag
@@ -177,10 +177,17 @@ class Api:
             except Exception:
                 pass
 
+    async def fetch_block(self, tag: str):
+        """Holt einen Block gezielt ab, so wie die App des Gegenübers."""
+        try:
+            await self.client.post("/api/v2/pile/fetch", json={"tags": [tag]})
+        except Exception:
+            pass
+
     async def fetch_pile(self, cursor: int) -> int:
-        """Ruft den Haufen ab wie die App. Gibt die neue Lesemarke zurück."""
+        """Ruft das Verzeichnis ab wie die App. Gibt die neue Lesemarke zurück."""
         for _ in range(400):
-            r = await self.client.get("/api/v2/pile", params={"since": cursor})
+            r = await self.client.get("/api/v2/pile/index", params={"since": cursor})
             if r.status_code != 200:
                 return cursor
             state = (r.headers.get("x-pile") or "ende:%d:0" % cursor).split(":")
@@ -360,11 +367,18 @@ async def session(api: Api, account: Account, spawn):
 
     def schedule_read(got):
         life = lifetime()
+        # Ist das "Gegenüber" gerade da, holt seine App den Block beim nächsten Blick ins
+        # Verzeichnis ab; sonst erst, wenn es wiederkommt.
+        early = rng.random() < 0.55
         if life >= 0:
-            spawn(later(life, read_block, api, got, spawn))
+            spawn(later(0, read_block, api, got, spawn, life, early, account))
+        elif early:
+            spawn(later(poll_gap(), api.fetch_block, got[0]))
+            spawn(linger_slot())
         else:
             spawn(linger_slot())
 
+    await api.load_config()                       # wie die App nach dem Anmelden
     cursor = await api.fetch_pile(0)
     loop = asyncio.get_running_loop()
     end = loop.time() + lognorm(420 * mood.level, 1.0, 25, 4 * 3600)
@@ -383,7 +397,12 @@ async def session(api: Api, account: Account, spawn):
                 next_decoy = expo(10, 1.2, 45)
                 got = await api.post_block(BIG if rng.random() < 0.025 else SMALL)
                 if got:
+                    if rng.random() < 0.8:
+                        spawn(later(0.7 + rng.random() * 2.8, api.fetch_block, got[0]))
                     spawn(later(4 + rng.random() * 86, api.delete_block, *got))
+            if rng.random() < 0.0004:
+                # selten: ein Einmal-Schlüssel wird angelegt und eingelöst
+                spawn(later(0, invite_like, api, spawn))
             next_post -= step
             if next_post <= 0:
                 # "schreibt" eine Nachricht; in einem Gespräch folgen weitere dicht hintereinander
@@ -455,15 +474,56 @@ async def person(api: Api, tasks: set):
         _people -= 1
 
 
-async def read_block(api: Api, got, spawn):
-    """Das "Gegenüber" liest: Block löschen, oft folgt kurz darauf eine Lesebestätigung."""
+def poll_gap() -> float:
+    """So lange dauert es, bis eine offene App einen neuen Block im Verzeichnis sieht:
+    irgendwann innerhalb ihres nächsten Abruf-Abstands."""
+    return 0.02 + rng.random() * (0.6 + rng.random() * 1.1)
+
+
+async def read_block(api: Api, got, spawn, life=0.0, early=False, account=None):
+    """Das "Gegenüber" holt den Block ab (sofort, wenn es gerade da ist, sonst wenn es
+    wiederkommt), liest ihn später und löscht ihn. Oft folgt eine Lesebestätigung."""
+    if early:
+        gap = poll_gap()
+        await asyncio.sleep(gap)
+        await api.fetch_block(got[0])
+        await asyncio.sleep(max(0.0, life - gap))
+    else:
+        await asyncio.sleep(life)
+        await api.fetch_block(got[0])
+        await asyncio.sleep(0.2 + rng.random() * 2.5)
+    if account is not None and rng.random() < 0.7:
+        try:
+            await account.save()                  # die App sichert den Stand, bevor sie löscht
+        except Exception:
+            pass
     await api.delete_block(*got)
     if rng.random() < 0.8:
         await asyncio.sleep(0.05 + rng.random() * 0.6)
         receipt = await api.post_block(SMALL)
         if receipt:
+            if rng.random() < 0.6:
+                spawn(later(poll_gap(), api.fetch_block, receipt[0]))
             # Die Bestätigung wird immer wieder entfernt.
             spawn(later(lognorm(60, 1.2, 2, 6 * 3600), api.delete_block, *receipt))
+
+
+async def invite_like(api: Api, spawn):
+    """Sieht aus wie ein Einmal-Schlüssel: Angebot ablegen, das "Gegenüber" fragt nach
+    Angebot und (noch nicht vorhandener) Antwort, legt die Antwort ab, beide räumen auf."""
+    offer = await api.post_block(SMALL)
+    if not offer:
+        return
+    await asyncio.sleep(lognorm(90, 1.0, 8, 3600))
+    await api.fetch_block(offer[0])
+    await api.fetch_block(secrets.token_hex(16))
+    await asyncio.sleep(0.3 + rng.random() * 2.0)
+    answer = await api.post_block(SMALL)
+    if answer:
+        await asyncio.sleep(poll_gap())
+        await api.fetch_block(answer[0])
+        spawn(later(2 + rng.random() * 28, api.delete_block, *answer))
+    spawn(later(15 + rng.random() * 75, api.delete_block, *offer))
 
 
 async def send_attachment(api: Api):

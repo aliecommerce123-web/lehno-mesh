@@ -24,6 +24,8 @@ const VIEW_MIN = 5, VIEW_MAX = 30 * 86400, VIEW_DEFAULT = 600;
 const INVITE_SECONDS = 24 * 3600;
 const HIST_BYTES = 200000;              // Verlauf je Kanal (verschlüsselt im Konto)
 const PW_MIN = 6;
+const UNREAD_MIN = 60;                 // kürzeste Frist für ungeöffnete Nachrichten (Sekunden)
+const CLOCK_SLACK = 90;                // so viel dürfen die Uhren zweier Geräte auseinander liegen
 const MIMES = {
   image: ["image/jpeg", "image/png", "image/gif", "image/webp"],
   video: ["video/mp4", "video/webm", "video/quicktime"],
@@ -157,6 +159,22 @@ async function pileDelete(tag, token) {
   } catch (e) { return false; }
 }
 
+// Wie pileDelete, sagt aber, ob der Block noch da war: "ok", "gone" oder "fail".
+async function pileDeleteState(tag, token) {
+  try {
+    if (!S.work.salt) await loadConfig();
+    const bits = S.work.delete || 0;
+    if (bits > 24) return "fail";
+    const work = await C.work(subject(tag, "d"), bits);
+    const base = JSON.stringify({ tag, token, work, pad: "" }).length;
+    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "x".repeat(Math.max(0, POST_LEN - base)) } });
+    if (r && r.ok) return "ok";
+    if (r && r.code === 404) return "gone";
+    if (r && r.code === 428) await loadConfig();
+    return "fail";
+  } catch (e) { return "fail"; }
+}
+// Löschen mit Wiederholung: geht ein Versuch verloren, folgen weitere.
 function queueDelete(tag, token, delay = 0) {
   const sid = S.sid;
   const waits = [2000, 6000, 20000, 60000, 180000];
@@ -173,7 +191,7 @@ function queueDelete(tag, token, delay = 0) {
 // KONTO
 // =========================================================================
 function emptyAccount(wipeOuterKey, wipePub, wipePrivSealed) {
-  return { v: 2, set: { view: VIEW_DEFAULT, lockOn: 1, rv: 0 }, wk: C.b64(wipeOuterKey), wp: C.b64(wipePub), wq: C.b64(wipePrivSealed), ch: [], gone: [], notes: [], n: 1 };
+  return { v: 2, set: { view: VIEW_DEFAULT, unread: 0, lockOn: 1, rv: 0 }, wk: C.b64(wipeOuterKey), wp: C.b64(wipePub), wq: C.b64(wipePrivSealed), ch: [], gone: [], notes: [], n: 1 };
 }
 const strList = (v, max) => (Array.isArray(v) ? v : []).filter(x => typeof x === "string").slice(-max);
 const numList = (v) => (Array.isArray(v) ? v : []).filter(x => Number.isInteger(x) && x >= 0).slice(-WINDOW_BACK * 2);
@@ -195,6 +213,7 @@ function sanitizeChannel(c) {
   c.rp = numList(c.rp); c.rpc = numList(c.rpc);
   c.keep = c.keep ? 1 : 0; c.shots = c.shots ? 1 : 0;
   c.rq = modeList(c.rq); c.ro = modeList(c.ro);
+  c.pu = (Array.isArray(c.pu) ? c.pu : []).filter(e => e && typeof e.t === "string" && typeof e.d === "string" && Number.isFinite(e.x)).slice(-300);
   c.hist = typeof c.hist === "string" ? c.hist : "";
   c.sym = typeof c.sym === "string" ? c.sym.slice(0, 80) : "";
   delete c.open;
@@ -204,6 +223,7 @@ function sanitizeAccount(a) {
   const out = { v: 2, set: {}, wk: typeof a.wk === "string" ? a.wk : "", wp: typeof a.wp === "string" ? a.wp : "", wq: typeof a.wq === "string" ? a.wq : "", wl: typeof a.wl === "string" ? a.wl : "", ch: [], gone: strList(a.gone, 300), notes: [], n: Number.isFinite(a.n) ? a.n : 1 };
   const s = a.set && typeof a.set === "object" ? a.set : {};
   out.set.view = Math.max(VIEW_MIN, Math.min(VIEW_MAX, Math.floor(Number(s.view) || VIEW_DEFAULT)));
+  out.set.unread = Math.max(0, Math.min(VIEW_MAX, Math.floor(Number(s.unread) || 0)));
   out.set.lockOn = s.lockOn === 0 ? 0 : 1;
   out.set.rv = Number.isInteger(s.rv) ? s.rv : 0;
   const ids = new Set();
@@ -228,6 +248,7 @@ async function wipeBlobFor(acct) {
   }
 }
 async function accountBlobs() {
+  await flushChains();
   S.acct.n = (S.acct.n || 0) + 1;
   const plainLen = C.utf8(JSON.stringify(S.acct)).byteLength + 4;
   S.blobClass = Math.max(0, C.ACCOUNT.findIndex(x => plainLen <= x));
@@ -256,6 +277,12 @@ function mergeChannel(l, r) {
     l[k] = Array.from(new Set([...(l[k] || []), ...(r[k] || [])])).filter(n => n >= l[base] - WINDOW_BACK).sort((a, b) => a - b);
   }
   if (!r.ib) delete l.ib;
+  if (r.wrap && l.wrap && r.wrap.c !== l.wrap.c) {
+    const lr = S.run[l.id];
+    if (lr && lr.ch && lr.pwKey) _wrapMerges.push([l.id, r.wrap]);          // hier geöffnet: je Kette den weiteren Stand nehmen
+    else if ((r.wp || 0) > (l.wp || 0)) { l.wrap = r.wrap; l.wp = r.wp || 0; }   // hier gesperrt: das weitere Päckchen gilt
+  }
+  { const seen = new Set(); l.pu = [...(l.pu || []), ...(r.pu || [])].filter(e => e && !seen.has(e.t) && seen.add(e.t)).slice(-300); }
   const run = S.run[l.id];
   const open = S.active === l.id && run && run.loaded;
   const newer = (r.rv || 0) > (l.rv || 0);
@@ -281,6 +308,19 @@ function mergeChannel(l, r) {
   }
 }
 let _mergeRender = false;
+const _wrapMerges = [];
+async function applyWrapMerges() {
+  while (_wrapMerges.length) {
+    const [id, wrap] = _wrapMerges.shift();
+    const c = chan(id), r = c && S.run[id];
+    if (!c || !r || !r.ch || !r.pwKey) continue;
+    try {
+      const plain = JSON.parse(C.fromUtf8(await C.open(r.pwKey, C.unb64(wrap.c))));
+      if (plain && plain.ch && chainMerge(r.ch, plain.ch)) r.chDirty = true;
+      else r.chDirty = true;      // eigener Stand ist der weitere: wieder zurückschreiben
+    } catch (e) {}
+  }
+}
 
 function mergeAccount(local, remote) {
   const gone = new Set([...remote.gone, ...local.gone]);
@@ -348,6 +388,7 @@ async function doSave() {
         S.version = r.version;
         for (const c of S.acct.ch) runOf(c);
         await applyHistMerges();
+        await applyWrapMerges();
         if (_mergeRender) { _mergeRender = false; renderChat(); }
         await rebuildExpect();
         renderList();
@@ -719,7 +760,8 @@ function runOf(c) {
   // wait: wartende Nachrichten, cwait: wartende stille Steuerzeichen.
   // ps: Geheimnisse einer offenen Einladung (nur in dieser Sitzung).
   // ok: bis zu welcher Nummer diese Sitzung bestätigt reserviert hat (je Spur).
-  if (!S.run[c.id]) S.run[c.id] = { kMsg: null, kDel: null, own: null, ps: null, ok: {}, msgs: [], wait: new Map(), cwait: new Map(), top: {}, seen: new Set(), urls: [], tags: [], loaded: false, flush: null };
+  // ch: die Schlüssel-Ketten (je Richtung und Spur), pwKey: zum Zurückschreiben der Ketten.
+  if (!S.run[c.id]) S.run[c.id] = { kMsg: null, kDel: null, own: null, ch: null, pwKey: null, chDirty: false, rewrapP: null, ps: null, ok: {}, msgs: [], wait: new Map(), cwait: new Map(), top: {}, seen: new Set(), urls: [], tags: [], loaded: false, flush: null };
   return S.run[c.id];
 }
 const peerDir = (c) => c.dir === "a" ? "b" : "a";
@@ -861,6 +903,7 @@ async function onMatch(tag, info, block) {
   }
   // Nachricht oder Steuerzeichen: bleibt verschlossen liegen, bis der Chat geöffnet wird.
   (info.lane ? r.cwait : r.wait).set(info.n, block);
+  if (!info.lane) { r.arr = r.arr || new Map(); r.arr.set(info.n, Date.now()); }
   if (info.n + 32 >= (r.top[info.lane] || 0)) await refreshExpect(c);
   if (S.active === c.id && r.kMsg) await processWaiting(c);
   else renderList();
@@ -873,7 +916,7 @@ async function processWaiting(c) {
   const r = runOf(c);
   if (_processing || !r.kMsg || S.active !== c.id) return;
   _processing = true;
-  const sid = S.sid, kMsg = r.kMsg, kDel = r.kDel;
+  const sid = S.sid, kMsg = r.kMsg, kDel = r.kDel, ch = r.ch;
   const alive = () => sid === S.sid && S.active === c.id && r.kMsg === kMsg;
   try {
     const p = peerDir(c), kt = C.unb64(c.kt);
@@ -890,22 +933,38 @@ async function processWaiting(c) {
         const n = Math.min(...map.keys());
         const block = map.get(n);
         let body = null;
-        try { body = await C.openJson(await C.msgKey(kMsg, p + lane, n), block, C.BLOCK); } catch (e) { body = null; }
+        try { const mk = await chainPeek(ch[p + lane], n); body = mk ? await C.openJson(mk, block, C.BLOCK) : null; } catch (e) { body = null; }
         if (!alive()) break;                 // Chat inzwischen verlassen: Block bleibt verschlossen liegen
         map.delete(n);
+        if (!body || typeof body !== "object") {
+          // Nicht zu öffnen (untergeschoben oder beschädigt): Nur diese eine Nummer
+          // wird gesperrt. Zähler und Schlüssel-Kette rücken dadurch NICHT vor.
+          c[doneKey] = (c[doneKey] || []).filter(x => x !== n);
+          c[doneKey].push(n);
+          if (c[doneKey].length > WINDOW_BACK * 2) c[doneKey] = c[doneKey].slice(-WINDOW_BACK * 2);
+          advanced = true;
+          saveLazy();
+          continue;
+        }
+        // Schlüssel dieser Nachricht verbrauchen: Die Kette rückt weiter, der alte Stand ist weg.
+        try { await chainUse(ch[p + lane], n, true); r.chDirty = true; } catch (e) {}
         // Nummer als verarbeitet merken: sie wird nie wieder angenommen.
         if (n + 1 > (c[key] || 0)) c[key] = n + 1;
         c[doneKey] = (c[doneKey] || []).filter(x => x !== n && x >= c[key] - WINDOW_BACK);
         c[doneKey].push(n);
         advanced = true;
+        // Einzel-Schlüssel, die nicht mehr gebraucht werden können, sofort wegwerfen.
+        if (chainPrune(ch[p + lane], Math.max(c[key] - WINDOW_BACK, lane ? 0 : (c.cf || 0)), c[doneKey])) r.chDirty = true;
         jobs.push([p + lane, n]);
-        if (!body || typeof body !== "object") continue;
         if (!lane && n < (c.cf || 0)) {            // vom Gegenüber gelöscht (auch wenn sie verspätet ankommt)
           if (body.t === "m" && body.a) { const a = cleanAtt(body.a); if (a) dropAttachment(a.t); }
           continue;
         }
+        if (!lane && r.arr) { body.__arr = r.arr.get(n); r.arr.delete(n); }
         const shown = await handleIncoming(c, body);
         if (shown) seenIds.push(shown);
+        // Wurde der Chat genau in diesem Augenblick verlassen, bleibt nichts sichtbar zurück.
+        if (!alive() && !c.keep) { r.msgs = []; break; }
       }
     }
     if (jobs.length) {
@@ -950,6 +1009,16 @@ async function handleIncoming(c, body) {
     if (r.seen.size > 5000) r.seen.clear();
     r.seen.add(id);
     const kind = ["image", "video", "voice", "file"].includes(body.k) ? body.k : "text";
+    // Vom Absender nur bis zu einem Zeitpunkt gültig, solange ungeöffnet: danach wird sie nie gezeigt.
+    // Geprüft wird zweifach: nach der Uhr (mit etwas Spielraum für falsch gehende Uhren)
+    // und nach der Zeit, die der Block schon hier auf dem Gerät gewartet hat.
+    const waited = Number.isFinite(body.__arr) ? (Date.now() - body.__arr) / 1000 : 0;
+    const lateByClock = Number.isFinite(body.xu) && body.xu > 0 && nowSec() > body.xu + CLOCK_SLACK;
+    const lateByWait = Number.isFinite(body.xd) && body.xd > 0 && waited > body.xd;
+    if (lateByClock || lateByWait) {
+      if (kind !== "text") { const gone = cleanAtt(body.a); if (gone) dropAttachment(gone.t); }
+      return null;
+    }
     const m = { i: id, me: 0, k: kind, x: kind === "text" ? String(body.x || "").slice(0, 60000) : "", vs: clampView(body.vs) };
     if (kind !== "text") { m.a = cleanAtt(body.a); if (!m.a) return null; }
     if (!c.keep) m.exp = Date.now() + m.vs * 1000;       // Zeit läuft ab dem Öffnen
@@ -961,6 +1030,7 @@ async function handleIncoming(c, body) {
   if (t === "seen") {
     const ids = new Set((Array.isArray(body.ids) ? body.ids : []).filter(x => typeof x === "string"));
     for (const m of r.msgs) if (m.me && ids.has(m.i)) m.st = "seen";
+    if (c.pu && c.pu.length) { c.pu = c.pu.filter(e => !ids.has(e.i)); saveLazy(); }     // geöffnet: Frist erledigt
     if (c.keep) saveHistorySoon(c);
     return null;
   }
@@ -1052,8 +1122,8 @@ function reserveNumbers(c, key) {
 // Gibt die Nummer zurück, unter der er liegt.
 async function sendObj(c, obj, lane = "") {
   const r = runOf(c);
-  const kMsg = r.kMsg, kDel = r.kDel;
-  if (!kMsg) throw new Error("Kanal ist gesperrt");
+  const kMsg = r.kMsg, kDel = r.kDel, ch = r.ch;
+  if (!kMsg || !ch) throw new Error("Kanal ist gesperrt");
   const sid = S.sid;
   const key = lane ? "cn" : "sn";
   const kt = C.unb64(c.kt), dir = c.dir + lane;
@@ -1062,7 +1132,10 @@ async function sendObj(c, obj, lane = "") {
     const n = c[key] || 0;
     c[key] = n + 1;
     saveLazy();
-    const block = await C.sealJson(await C.msgKey(kMsg, dir, n), obj, C.BLOCK);
+    const mk = await chainUse(ch[dir], n, false);
+    if (!mk) throw new Error("Senden nicht möglich. Bitte den Kanal schließen und neu öffnen.");
+    r.chDirty = true;
+    const block = await C.sealJson(mk, obj, C.BLOCK);
     const code = await pilePost(await C.msgTag(kt, dir, n), block, await C.msgDelToken(kDel, dir, n));
     if (sid !== S.sid) throw new Error("abgemeldet");
     if (code === 200) return n;
@@ -1078,6 +1151,7 @@ function sendText(c, text) {
   const vs = S.acct.set.view;
   const m = { i: newId(), me: 1, k: "text", x: text, vs, st: "sending" };
   const obj = { t: "m", i: m.i, x: text, vs };
+  if (S.acct.set.unread > 0) obj.xu = 1;      // ungeöffnet nur bis zu einer Frist gültig (wird beim Senden gesetzt)
   if (!C.fitsJson(obj, C.BLOCK)) { toast("Die Nachricht ist zu lang.", "err"); return false; }
   if (!c.keep) m.exp = Date.now() + vs * 1000;
   r.msgs.push(m);                       // sofort anzeigen, das Senden läuft im Hintergrund
@@ -1088,12 +1162,36 @@ function sendText(c, text) {
 
 async function deliver(c, m, obj, canRetry) {
   const r = runOf(c);
+  const kDel = r.kDel, kt = C.unb64(c.kt);       // jetzt festhalten: der Kanal kann gleich gesperrt werden
+  // Frist für "ungeöffnet": beginnt mit dem Senden (auch beim Wiederholen neu).
+  if (obj.xu) {
+    obj.xd = S.acct.set.unread > 0 ? S.acct.set.unread : UNREAD_MIN;
+    obj.xu = nowSec() + obj.xd;
+  }
   try {
     m.n = await sendObj(c, obj);
     m.st = "sent";
     delete m.retry;
+    const tag = kDel ? await C.msgTag(kt, c.dir, m.n) : null;
+    const del = kDel ? await C.msgDelToken(kDel, c.dir, m.n) : null;
+    if (m.cancel) {
+      // Während des Sendens wurde "bei beiden löschen" gewählt: sofort zurückholen.
+      if (tag) queueDelete(tag, del);
+      if (obj.a && obj.a.t) dropAttachment(obj.a.t);
+      sendObj(c, { t: "del", ids: [m.i] }, "c").catch(() => {});
+      return;
+    }
+    // Frist vormerken: Marke und Lösch-Geheimnis dieses einen Blocks, damit er nach
+    // Ablauf vom Server entfernt wird, auch wenn der Kanal dann gesperrt ist.
+    if (obj.xu && tag) {
+      const e = { t: tag, d: del, x: obj.xu, i: m.i };
+      if (obj.a && obj.a.t) e.a = obj.a.t;
+      c.pu = [...(c.pu || []), e].slice(-300);
+      saveLazy();
+    }
     if (c.keep) saveHistorySoon(c);
   } catch (e) {
+    if (m.cancel) return;
     m.st = "failed";
     if (canRetry) m.retry = obj;
     if (S.me) toast("Nicht gesendet: " + (e.message || "Fehler") + (canRetry ? " Antippen zum Wiederholen." : ""), "err");
@@ -1146,7 +1244,9 @@ async function sendMediaInner(c, file, kind, name) {
   r.urls.push(m.url);
   r.msgs.push(m);
   renderChat(true);
-  await deliver(c, m, { t: "m", i: m.i, k: kind, a, vs }, false);
+  const mobj = { t: "m", i: m.i, k: kind, a, vs };
+  if (S.acct.set.unread > 0) mobj.xu = 1;
+  await deliver(c, m, mobj, false);
   if (m.st === "failed") dropAttachment(token);
 }
 
@@ -1182,7 +1282,7 @@ function dropMedia(c, m, alsoServer) {
 // VERLAUF BEHALTEN (nur wenn beide zugestimmt haben)
 // Liegt verschlüsselt im Konto, zusätzlich geschützt durch das Kanal-Passwort.
 // =========================================================================
-async function histKey(kMsg) { return await C.hkdf(kMsg, "chatmesh2|history"); }
+async function histKey(k) { return k; }      // der Verlauf hat einen eigenen, festen Schlüssel
 const _histTimers = {};
 function saveHistorySoon(c) {
   if (_histTimers[c.id]) return;
@@ -1229,7 +1329,13 @@ async function loadHistory(c) {
   if (!c.keep || !r.kMsg) return;
   if (!c.hist) { r.loaded = true; return; }
   try {
-    const old = await readHistory(c, c.hist, r.kMsg, new Set(r.msgs.map(m => m.i)));
+    let old = await readHistory(c, c.hist, r.kMsg, new Set(r.msgs.map(m => m.i)));
+    if (c.xp && c.xp.length) {
+      const gone = new Set(c.xp);
+      old = old.filter(m => !gone.has(m.i));
+      c.xp = [];
+      saveHistorySoon(c);
+    }
     for (const o of old) if (!o.me) r.seen.add(o.i);
     r.msgs = old.concat(r.msgs);
     for (const m of old) if (m.k !== "text") fetchMedia(c, m);
@@ -1260,21 +1366,164 @@ async function applyHistMerges() {
 // =========================================================================
 // KANAL ÖFFNEN / SCHLIESSEN / SPERREN
 // =========================================================================
+// ---------- Schlüssel-Kette ----------
+// Für jede Richtung und jede Spur gibt es eine Kette. Aus dem aktuellen
+// Ketten-Schlüssel entsteht der Schlüssel für genau eine Nachricht und der
+// nächste Ketten-Schlüssel. Der alte wird überschrieben. Rückwärts rechnen geht
+// nicht: Wer den heutigen Stand bekommt, kann frühere Nachrichten nicht öffnen.
+const CHAIN_SKIP_MAX = 320;
+const CHAIN_LANES = ["a", "ac", "b", "bc"];
+async function chainInit(kMsg) {
+  const ch = {};
+  for (const d of CHAIN_LANES) ch[d] = { n: 0, k: C.b64(await C.hkdf(kMsg, "chatmesh2|chain|" + d)) };
+  return ch;
+}
+const chainMk = (ck) => C.hkdf(ck, "chatmesh2|mk");
+const chainNext = (ck) => C.hkdf(ck, "chatmesh2|ck");
+// Schlüssel für Nummer n ansehen, ohne die Kette zu verändern.
+async function chainPeek(st, n) {
+  if (!st) return null;
+  if (n < st.n) return st.skip && st.skip[n] ? C.unb64(st.skip[n]) : null;
+  if (n - st.n > 4096) return null;
+  let ck = C.unb64(st.k);
+  for (let i = st.n; i < n; i++) ck = await chainNext(ck);
+  return await chainMk(ck);
+}
+// Schlüssel für Nummer n benutzen: Die Kette rückt hinter n. Übersprungene
+// Nummern behält der Empfänger einzeln (für verspätet ankommende Blöcke).
+const _chainLocks = new WeakMap();
+function chainUse(st, n, keepSkipped) {
+  const prev = _chainLocks.get(st) || Promise.resolve();
+  const job = prev.then(async () => {
+    if (n < st.n) {
+      const v = st.skip && st.skip[n];
+      if (!v) return null;
+      delete st.skip[n];
+      return C.unb64(v);
+    }
+    if (n - st.n > 4096) return null;
+    let ck = C.unb64(st.k);
+    const skipped = {};
+    for (let i = st.n; i < n; i++) { if (keepSkipped) skipped[i] = C.b64(await chainMk(ck)); ck = await chainNext(ck); }
+    const mk = await chainMk(ck);
+    const next = C.b64(await chainNext(ck));
+    if (keepSkipped) {
+      st.skip = Object.assign(st.skip || {}, skipped);
+      const keys = Object.keys(st.skip).map(Number).sort((a, b) => a - b);
+      for (const k of keys.slice(0, Math.max(0, keys.length - CHAIN_SKIP_MAX))) delete st.skip[k];
+    }
+    st.n = n + 1; st.k = next;
+    return mk;
+  });
+  _chainLocks.set(st, job.catch(() => null));
+  return job;
+}
+// Rückt eine Kette bis vor die Nummer target, ohne Zwischen-Schlüssel zu behalten.
+async function chainAdvance(st, target) {
+  if (!(target > st.n)) return;
+  let ck = C.unb64(st.k);
+  for (let i = st.n; i < target; i++) ck = await chainNext(ck);
+  st.n = target; st.k = C.b64(ck);
+}
+// Einzel-Schlüssel übersprungener Nummern wegwerfen, sobald sie nicht mehr
+// gebraucht werden können (zu alt, gelöscht oder schon verarbeitet).
+function chainPrune(st, below, done) {
+  if (!st || !st.skip) return false;
+  let changed = false;
+  const used = new Set(done || []);
+  for (const k of Object.keys(st.skip)) {
+    const n = Number(k);
+    if (n < below || used.has(n)) { delete st.skip[k]; changed = true; }
+  }
+  return changed;
+}
+const chainProgress = (ch) => CHAIN_LANES.reduce((sum, d) => sum + ((ch && ch[d] && ch[d].n) || 0), 0);
+// Vereint zwei Stände derselben Ketten (zwei Geräte): je Kette gilt der weitere.
+function chainMerge(mine, other) {
+  let changed = false;
+  for (const d of CHAIN_LANES) {
+    const a = mine[d], b = other && other[d];
+    if (!a || !b || typeof b.k !== "string" || !Number.isInteger(b.n)) continue;
+    if (b.n > a.n) {
+      const keep = {};
+      for (const [k, v] of Object.entries(a.skip || {})) keep[k] = v;
+      for (const [k, v] of Object.entries(b.skip || {})) keep[k] = v;
+      mine[d] = { n: b.n, k: b.k };
+      if (Object.keys(keep).length) mine[d].skip = keep;
+      changed = true;
+    }
+  }
+  return changed;
+}
+// Schreibt den aktuellen Stand der Ketten zurück in das mit dem Kanal-Passwort
+// verpackte Päckchen im Konto. Je Kanal läuft immer nur ein Zurückschreiben.
+function rewrap(c, k) {
+  const r = S.run[c.id];
+  const prev = (r && r.rewrapP) || Promise.resolve();
+  const job = prev.then(async () => {
+    const payload = { h: C.b64(k.kMsg), d: C.b64(k.kDel), o: k.own, ch: k.ch };
+    const wrap = await C.wrapWithKey(k.pwKey, C.unb64(c.wrap.s), C.utf8(JSON.stringify(payload)));
+    if (chan(c.id) === c) { c.wrap = wrap; c.wp = chainProgress(k.ch); }
+  });
+  if (r) r.rewrapP = job.catch(() => {});
+  return job;
+}
+async function flushChains() {
+  if (!S.acct) return;
+  const waits = Object.values(S.run).map(r => r.rewrapP).filter(Boolean);
+  if (waits.length) await Promise.all(waits);
+  for (const c of S.acct.ch) {
+    const r = S.run[c.id];
+    if (!r || !r.chDirty || !r.pwKey || !r.ch || !r.kMsg || c.pend) continue;
+    r.chDirty = false;
+    try { await rewrap(c, { kMsg: r.kMsg, kDel: r.kDel, own: r.own, pwKey: r.pwKey, ch: JSON.parse(JSON.stringify(r.ch)) }); } catch (e) { r.chDirty = true; }
+  }
+}
+
 // Öffnet die verpackten Kanal-Schlüssel mit dem Kanal-Passwort.
 async function unwrapKeys(c, password) {
-  let plain;
-  try { plain = JSON.parse(C.fromUtf8(await C.unwrapWithPassword(password, c.wrap))); }
-  catch (e) { throw new Error("Falsches Passwort."); }
-  return { kMsg: C.unb64(plain.m), kDel: C.unb64(plain.d), own: plain.o };
+  let plain, pwKey;
+  try {
+    pwKey = await C.passwordKey(password, C.unb64(c.wrap.s));
+    plain = JSON.parse(C.fromUtf8(await C.open(pwKey, C.unb64(c.wrap.c))));
+  } catch (e) { throw new Error("Falsches Passwort."); }
+  const out = { kDel: C.unb64(plain.d), own: plain.o, pwKey, migrated: false };
+  if (plain.ch && plain.h) {
+    out.kMsg = C.unb64(plain.h);          // Schlüssel nur für einen behaltenen Verlauf
+    out.ch = plain.ch;
+  } else {
+    // Kanal aus der Zeit vor der Schlüssel-Kette: einmalig umstellen.
+    const old = C.unb64(plain.m);
+    out.kMsg = await C.hkdf(old, "chatmesh2|history");
+    out.ch = await chainInit(old);
+    const p = c.dir === "a" ? "b" : "a";
+    await chainAdvance(out.ch[c.dir], c.sn || 0);
+    await chainAdvance(out.ch[c.dir + "c"], c.cn || 0);
+    await chainAdvance(out.ch[p], Math.max(0, (c.rn || 0) - WINDOW_BACK));
+    await chainAdvance(out.ch[p + "c"], Math.max(0, (c.rc || 0) - WINDOW_BACK));
+    out.migrated = true;
+  }
+  return out;
 }
+
 async function unlock(c, password) {
   const r = runOf(c);
+  if (r.rewrapP) { try { await r.rewrapP; } catch (e) {} }
   const k = await unwrapKeys(c, password);
-  r.kMsg = k.kMsg; r.kDel = k.kDel; r.own = k.own;
+  r.kMsg = k.kMsg; r.kDel = k.kDel; r.own = k.own; r.ch = k.ch; r.pwKey = k.pwKey;
+  r.chDirty = !!k.migrated;
+  if (k.migrated) saveSoon();
 }
+
 function lockKeys(c) {
   const r = S.run[c.id];
-  if (r) { r.kMsg = null; r.kDel = null; r.own = null; }
+  if (!r) return;
+  // Vor dem Vergessen den Stand der Ketten sichern.
+  if (r.chDirty && r.pwKey && r.ch && r.kMsg && !c.pend) {
+    const snap = { kMsg: r.kMsg, kDel: r.kDel, own: r.own, pwKey: r.pwKey, ch: JSON.parse(JSON.stringify(r.ch)) };
+    rewrap(c, snap).then(() => { saveSoon(); }).catch(() => {});
+  }
+  r.kMsg = null; r.kDel = null; r.own = null; r.ch = null; r.pwKey = null; r.chDirty = false;
 }
 
 function openChannel(id) {
@@ -1409,7 +1658,11 @@ async function installKeys(c, keys, pwKey, salt) {
   const own = await dissolvePart(keys.kDis, c.dir);
   c.kt = C.b64(keys.kTag);
   c.pd = await dissolvePart(keys.kDis, peerDir(c));
-  c.wrap = await C.wrapWithKey(pwKey, salt, C.utf8(JSON.stringify({ m: C.b64(keys.kMsg), d: C.b64(keys.kDel), o: own })));
+  // Im Päckchen liegen nur: Verlauf-Schlüssel, Lösch-Schlüssel, eigener Auflöse-Teil
+  // und der aktuelle Stand der Schlüssel-Ketten. Der Ausgangs-Schlüssel wird nicht aufbewahrt.
+  const hist = await C.hkdf(keys.kMsg, "chatmesh2|history");
+  const ch = await chainInit(keys.kMsg);
+  c.wrap = await C.wrapWithKey(pwKey, salt, C.utf8(JSON.stringify({ h: C.b64(hist), d: C.b64(keys.kDel), o: own, ch })));
   c.wb = C.b64(await C.boxSeal(C.unb64(S.acct.wp), C.utf8(JSON.stringify({ t: own.t, k: own.k, d: own.d, kt: C.b64(keys.kTag), kd: C.b64(keys.kDel) }))));
   c.sym = keys.symbols;
   c.sn = 0; c.cn = 0; c.sr = 0; c.cr = 0; c.rn = 0; c.rc = 0; c.rp = []; c.rpc = [];
@@ -1418,7 +1671,9 @@ async function installKeys(c, keys, pwKey, salt) {
   c.cf = 0;      // Lösch-Grenze: ältere Nachrichten des Gegenübers werden verworfen
   c.hv = 0;      // zählt, wie oft der Kanal geleert wurde (für zwei Geräte)
   c.ca = [];     // schon umgesetzte Lösch-Aufträge des Gegenübers
-  return own;
+  c.pu = [];     // eigene Nachrichten, die nach einer Frist ungeöffnet gelöscht werden
+  c.wp = 0;      // wie weit die Schlüssel-Ketten im gespeicherten Päckchen sind (für zwei Geräte)
+  return { own, kMsg: hist, kDel: keys.kDel, ch, pwKey };
 }
 
 async function createChannel(name, password, keepReq) {
@@ -1469,11 +1724,11 @@ async function completeInvite(c, block, ps) {
     const ans = await C.openJson(ik.key, block, C.BLOCK);
     const pubB = C.unb64(String(ans.p || ""));
     const keys = await C.channelKeys(await C.channelRoot(ps.priv, pubB, ps.I, ps.pub, pubB));
-    const own = await installKeys(c, keys, ps.pwKey, ps.salt);
+    const inst = await installKeys(c, keys, ps.pwKey, ps.salt);
     c.ro = ps.kr ? ["keep"] : [];          // die Anfrage steckte schon im Einmal-Code
     delete c.pend;
     r.ps = null;
-    if (!S.acct.set.lockOn) { r.kMsg = keys.kMsg; r.kDel = keys.kDel; r.own = own; }
+    if (!S.acct.set.lockOn) { r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.chDirty = false; }
     await refreshExpect(c);
     await saveAccount();
     // Die beiden Blöcke des Einmal-Codes später unauffällig entfernen.
@@ -1512,7 +1767,7 @@ async function joinChannel(codeText, name, password) {
   const salt = C.rand(16);
   const pwKey = await C.passwordKey(password, salt);
   const c = { id: C.hex(C.rand(8)), name, dir: "b" };
-  const own = await installKeys(c, keys, pwKey, salt);
+  const inst = await installKeys(c, keys, pwKey, salt);
   if (offer.kr) c.rq = ["keep"];
   const answer = await C.sealJson(ik.key, { t: "answer", p: C.b64(ex.pub) }, C.BLOCK);
   const delB = C.hex(C.rand(16));
@@ -1523,7 +1778,7 @@ async function joinChannel(codeText, name, password) {
   pileDrop(ik.tagA);
   S.acct.ch.unshift(c);
   const r = runOf(c);
-  r.kMsg = keys.kMsg; r.kDel = keys.kDel; r.own = own;
+  r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.chDirty = false;
   await refreshExpect(c);
   await saveAccount();
   renderList();
@@ -1583,7 +1838,7 @@ function startLoops() {
     if (code === 200) queueDelete(tag, token, randBetween(4000, 90000));
   }, () => Math.round(randExp(10000, 1200, 45000)));
   // Ablauf der Anzeige-Zeit und der Einmal-Schlüssel
-  loop(async () => { tickExpiry(); expireInvites(); }, () => 1000);
+  loop(async () => { tickExpiry(); expireInvites(); expireUnread(); }, () => 1000);
   // Konto in unregelmäßigen Abständen speichern, mit und ohne Anlass: von außen
   // sieht beides gleich aus. Größere Konten (mit behaltenem Verlauf) seltener.
   loop(async () => { await saveAccount(); }, () => {
@@ -1592,6 +1847,40 @@ function startLoops() {
   });
   // Schwere der Rechenaufgabe ab und zu neu holen
   loop(loadConfig, () => randBetween(120000, 360000));
+}
+
+// Eigene Nachrichten, die bis zur eingestellten Frist niemand geöffnet hat,
+// werden vom Server entfernt. Das geht auch bei gesperrtem Kanal.
+let _unreadBusy = false;
+async function expireUnread() {
+  if (!S.acct || _unreadBusy) return;
+  const sid = S.sid, now = nowSec();
+  _unreadBusy = true;
+  try {
+    for (const c of S.acct.ch) {
+      if (!c.pu || !c.pu.length) continue;
+      for (const e of c.pu.filter(x => x.x <= now)) {
+        const state = await pileDeleteState(e.t, e.d);
+        if (sid !== S.sid) return;
+        if (state === "fail") { e.x = nowSec() + 30; continue; }      // später noch einmal
+        c.pu = (c.pu || []).filter(x => x !== e);
+        if (state === "ok") {
+          // Der Block lag noch ungeöffnet da: Er ist jetzt weg, der Anhang auch, und
+          // die Nachricht verschwindet bei mir aus Anzeige und behaltenem Verlauf.
+          if (e.a) dropAttachment(e.a);
+          const r = S.run[c.id];
+          if (r && r.msgs.some(m => m.i === e.i)) {
+            r.msgs = r.msgs.filter(m => m.i !== e.i);
+            if (S.active === c.id) renderChat();
+            if (c.keep) saveHistorySoon(c);
+          } else if (c.keep && e.i) {
+            c.xp = [...(c.xp || []), e.i].slice(-100);
+          }
+        }
+        saveLazy();
+      }
+    }
+  } finally { _unreadBusy = false; }
 }
 
 function tickExpiry() {
@@ -1980,15 +2269,21 @@ function changeCodeSheet() {
 
 function settingsSheet() {
   const set = S.acct.set;
-  const v = set.view;
+  const v = set.view, u = set.unread || 0;
   formSheet("Einstellungen", {
-    info: "So lange bleibt eine Nachricht von dir nach dem Öffnen sichtbar. Danach verschwindet sie bei dir und beim Gegenüber. Verlässt jemand den Chat, ist sie bei ihm sofort weg.",
+    info: "Geöffnete Nachrichten: So lange bleibt eine Nachricht von dir nach dem Öffnen sichtbar. Danach verschwindet sie bei dir und beim Gegenüber. Verlässt jemand den Chat, ist sie bei ihm sofort weg.",
     noFocus: true,
     fields: [
       { name: "d", type: "number", grid: true, label: "Tage", value: Math.floor(v / 86400) },
       { name: "h", type: "number", grid: true, label: "Stunden", value: Math.floor(v % 86400 / 3600) },
       { name: "m", type: "number", grid: true, label: "Minuten", value: Math.floor(v % 3600 / 60) },
       { name: "s", type: "number", grid: true, label: "Sekunden", value: v % 60 },
+      { node: el("div", "sheet-section", "Ungeöffnete Nachrichten löschen nach") },
+      { node: infoNode("Hat dein Gegenüber eine Nachricht von dir bis dahin nicht geöffnet, wird sie gelöscht und nie mehr angezeigt. Alles auf 0 heißt: nicht automatisch (ungeöffnete Nachrichten bleiben höchstens ein bis zwei Wochen liegen).") },
+      { name: "ud", type: "number", grid: true, label: "Tage", value: Math.floor(u / 86400) },
+      { name: "uh", type: "number", grid: true, label: "Stunden", value: Math.floor(u % 86400 / 3600) },
+      { name: "um", type: "number", grid: true, label: "Minuten", value: Math.floor(u % 3600 / 60) },
+      { name: "us", type: "number", grid: true, label: "Sekunden", value: u % 60 },
       { node: el("div", "sheet-section", "Kanal-Sperre") },
       { name: "lockOn", type: "checkbox", label: "Kanal-Passwort jedes Mal verlangen: beim Öffnen und immer, wenn du einen Kanal verlassen hast. Ausgeschaltet fragt jeder Kanal nur einmal je Anmeldung.", value: set.lockOn },
       { node: infoNode("Lädst du die Seite neu, bleibst du angemeldet und gibst nur deinen Code ein. Schließt du das Fenster, bist du abgemeldet. chatmesh beobachtet nicht, ob du die Maus bewegst oder tippst.") },
@@ -2000,7 +2295,11 @@ function settingsSheet() {
       const total = num(val.d) * 86400 + num(val.h) * 3600 + num(val.m) * 60 + num(val.s);
       if (total < VIEW_MIN) throw new Error("Mindestens " + VIEW_MIN + " Sekunden.");
       if (total > VIEW_MAX) throw new Error("Höchstens 30 Tage.");
+      const unread = num(val.ud) * 86400 + num(val.uh) * 3600 + num(val.um) * 60 + num(val.us);
+      if (unread > VIEW_MAX) throw new Error("Höchstens 30 Tage.");
+      if (unread > 0 && unread < UNREAD_MIN) throw new Error("Ungeöffnet: mindestens 1 Minute (oder alles auf 0).");
       set.view = total;
+      set.unread = unread;
       const wasOn = set.lockOn;
       set.lockOn = val.lockOn ? 1 : 0;
       set.rv = (set.rv || 0) + 1;
@@ -2070,7 +2369,7 @@ async function endMode(c, kind) {
 
 function channelMenu(c) {
   const items = [];
-  items.push(menuItem("Alle Nachrichten bei beiden löschen", "Sofort und ohne Zustimmung deines Gegenübers. Gilt auch für einen behaltenen Verlauf. Der Kanal bleibt bestehen.", true, () => confirmClear(c)));
+  items.push(menuItem("Alle Nachrichten bei beiden löschen", "Sofort und ohne Zustimmung deines Gegenübers. Gilt für alles: Geöffnetes, noch nicht Geöffnetes und einen behaltenen Verlauf. Der Kanal bleibt bestehen.", true, () => confirmClear(c)));
   if (c.keep) items.push(menuItem("Verlauf nicht mehr behalten", "Sofort und ohne Zustimmung deines Gegenübers. Der gespeicherte Verlauf wird bei euch beiden gelöscht, ab dann verschwinden Nachrichten wieder.", false, () => endMode(c, "keep")));
   else items.push(menuItem("Verlauf behalten anfragen", "Standard ist: alles verschwindet. Dein Gegenüber muss zustimmen. Abschalten kann es später jeder von euch allein.", false, () => requestMode(c, "keep")));
   if (c.shots) items.push(menuItem("Screenshots wieder verbieten", "Sofort und ohne Zustimmung deines Gegenübers.", false, () => endMode(c, "shots")));
@@ -2116,6 +2415,7 @@ function deleteChannelSheet(c) {
 
 async function deleteForBoth(c, m) {
   const r = runOf(c);
+  if (m.st === "sending") m.cancel = true;          // wird direkt nach dem Senden zurückgeholt
   if (m.st !== "failed" && m.st !== "sending") {
     try { await sendObj(c, { t: "del", ids: [m.me ? m.i : m.i.slice(1)] }, "c"); }
     catch (e) { toast("Nicht gelöscht: " + (e.message || "keine Verbindung"), "err"); return; }
@@ -2126,6 +2426,7 @@ async function deleteForBoth(c, m) {
     }
   }
   r.msgs = r.msgs.filter(x => x !== m);
+  if (c.pu && c.pu.length) c.pu = c.pu.filter(e => e.i !== m.i);
   dropMedia(c, m, true);
   renderChat();
   if (c.keep) saveHistorySoon(c);
@@ -2142,7 +2443,7 @@ function confirmClear(c) {
   no.type = "button";
   no.addEventListener("click", closeSheet);
   openSheetNodes("Alle Nachrichten löschen?", [
-    infoNode("Alle Nachrichten in diesem Kanal verschwinden sofort bei dir und bei deinem Gegenüber, auch ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
+    infoNode("Alle Nachrichten in diesem Kanal verschwinden sofort bei dir und bei deinem Gegenüber: Geöffnetes, noch nicht Geöffnetes und ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
     no, yes,
   ], true);
 }
@@ -2151,6 +2452,7 @@ function clearLocal(c) {
   for (const m of r.msgs) dropMedia(c, m, true);
   r.msgs = [];
   c.hist = "";
+  c.pu = [];
   c.hv = (c.hv || 0) + 1;
   bump(c);
   if (_histTimers[c.id]) { clearTimeout(_histTimers[c.id]); delete _histTimers[c.id]; }
@@ -2171,7 +2473,7 @@ async function applyPendingClear(c, kMsg) {
   for (const [n, block] of r.cwait) {
     if (done.has(n)) continue;
     let b = null;
-    try { b = await C.openJson(await C.msgKey(kMsg, p + "c", n), block, C.BLOCK); } catch (e) { continue; }
+    try { const mk = await chainPeek(r.ch && r.ch[p + "c"], n); if (!mk) continue; b = await C.openJson(mk, block, C.BLOCK); } catch (e) { continue; }
     if (!b || typeof b !== "object") continue;
     if (b.t === "clr" && Number.isInteger(b.upto) && b.upto >= 0) { cutoff = Math.max(cutoff, b.upto); fresh.push(n); }
     else if (b.t === "set" && b.k === "keep" && !b.v) { keepOff = true; fresh.push(n); }
@@ -2181,6 +2483,8 @@ async function applyPendingClear(c, kMsg) {
   if (keepOff && c.keep) c.keep = 0;
   if (cutoff >= 0) {
     c.cf = Math.max(c.cf || 0, cutoff);
+    // Schlüssel für gelöschte, nie geöffnete Nachrichten wegwerfen.
+    if (r.ch && chainPrune(r.ch[p], c.cf, null)) r.chDirty = true;
     clearLocal(c);
   } else if (keepOff) {
     c.hist = "";
@@ -2216,7 +2520,7 @@ function messageMenu(c, m) {
   }
   const items = [];
   if (c.shots && m.k === "text" && m.x) items.push(menuItem("Text kopieren", "", false, () => { navigator.clipboard.writeText(m.x).then(() => toast("Kopiert", "ok")).catch(() => {}); }));
-  items.push(menuItem("Bei beiden löschen", "Verschwindet sofort bei dir und beim Gegenüber. Geht jederzeit, auch bei behaltenem Verlauf.", true, () => deleteForBoth(c, m)));
+  items.push(menuItem("Bei beiden löschen", "Verschwindet sofort bei dir und beim Gegenüber. Geht jederzeit: ob schon geöffnet oder nicht, auch bei behaltenem Verlauf.", true, () => deleteForBoth(c, m)));
   openSheetNodes(null, items);
 }
 
@@ -2326,6 +2630,7 @@ function renderChat(forceBottom) {
   const chip = (text, icon) => { const s = el("span", "chip"); if (icon) s.appendChild(svgEl(icon)); s.appendChild(document.createTextNode(" " + text)); bar.appendChild(s); };
   if (c.keep) chip("Verlauf wird behalten (verschlüsselt, nur für euch beide). Jeder von euch kann ihn jederzeit bei beiden löschen.");
   else chip("Deine Nachrichten bleiben " + fmtDuration(S.acct.set.view) + " nach dem Öffnen sichtbar, danach werden sie gelöscht. Beim Verlassen des Chats sofort.", ICON.timer);
+  if (S.acct.set.unread > 0) chip("Öffnet dein Gegenüber eine Nachricht von dir nicht innerhalb von " + fmtDuration(S.acct.set.unread) + ", wird sie gelöscht.");
   chip(c.shots ? "Screenshots erlaubt" : "Screenshots verboten");
   if (!c.vf) chip("Noch nicht geprüft: Vergleicht einmal eure Prüf-Zahl (Menü oben rechts).");
   if (c.ro.length) chip("Anfrage gesendet: wartet auf Zustimmung");
@@ -2562,7 +2867,7 @@ function bindUI() {
 }
 
 // Nur in der lokalen Testumgebung: Zugriff für automatische Prüfungen.
-if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth };
+if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount };
 
 // Start. Dieses Skript steht am Ende der Seite: alle Bausteine sind schon da.
 // Es wird sofort entschieden, welche Ansicht erscheint. Liegt in diesem Fenster

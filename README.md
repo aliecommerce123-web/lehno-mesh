@@ -89,6 +89,16 @@ bekommt nur Geheimtext.
   (SHA-256 mit führenden Null-Bits). Sie wird schwerer, je voller der Speicher
   ist und je mehr gerade eingeliefert wird. Der Server kennt keine
   IP-Adressen, so schützt er sich trotzdem vor dem Vollmüllen.
+- **Schlüssel-Kette:** Für jede Richtung gibt es eine Kette. Aus dem aktuellen
+  Ketten-Schlüssel entstehen der Schlüssel für genau eine Nachricht und der
+  nächste Ketten-Schlüssel (HKDF), der alte wird überschrieben. Der
+  Ausgangs-Schlüssel wird nicht aufbewahrt. Wer später den Stand eines Geräts
+  bekommt, kann frühere Nachrichten nicht mehr öffnen. Der Stand liegt im
+  Konto nur im Päckchen, das das Kanal-Passwort verschließt.
+- **Zwei Löschzeiten:** Nach dem Öffnen bleibt eine Nachricht eine einstellbare
+  Zeit sichtbar. Zusätzlich lässt sich einstellen, nach welcher Zeit eine
+  ungeöffnete Nachricht gelöscht wird: Die Frist steht verschlüsselt in der
+  Nachricht, und der Absender entfernt den Block nach Ablauf vom Server.
 - **Nachricht:** JSON, aufgefüllt auf 4096 oder 65536 Bytes, AES-256-GCM.
   Lesebestätigungen, Löschaufträge, Anfragen und Antworten sind Blöcke wie
   alle anderen.
@@ -128,6 +138,9 @@ bekommt nur Geheimtext.
   entfällt das.
 - Das Verschwinden von Nachrichten setzt die App des Gegenübers um. Eine
   veränderte App könnte Inhalte behalten.
+- Die Frist für ungeöffnete Nachrichten löscht der Absender selbst vom
+  Server, sobald er angemeldet ist. Ist er es bei Ablauf nicht, zeigt die App
+  des Gegenübers die Nachricht trotzdem nicht mehr an.
 - Screenshots: Am Rechner blendet die App den Inhalt aus, sobald das Fenster
   nicht vorne ist, und löst den Kanal auf, wenn sie einen Versuch erkennt
   (bestimmte Tasten, Drucken). Sicher verhindern kann eine Webseite

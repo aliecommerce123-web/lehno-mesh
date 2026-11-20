@@ -573,10 +573,12 @@ class AccountCreateReq(StrictModel):
     work: str = Field("", max_length=16)
 
 
-# Älteste Fassung der App, die das Konto noch speichern darf. Ein noch offenes
-# Fenster mit einer älteren Fassung kennt neuere Angaben im Konto nicht und
-# könnte sie unbemerkt überschreiben. Es muss die Seite einmal neu laden.
-MIN_CLIENT = 1
+# Älteste Fassung der App, die das Konto noch speichern darf. Gedacht für
+# künftige Änderungen am Speicherformat: Eine App, die diese Angabe kennt, bittet
+# dann selbst darum, die Seite neu zu laden, bevor etwas verloren gehen kann.
+# Fassungen ohne diese Angabe (0) dürfen weiter speichern: Sie würden eine
+# Ablehnung nicht verstehen, und Angelegtes (etwa ein Einmal-Schlüssel) ginge verloren.
+MIN_CLIENT = max(0, int(os.environ.get("LEHNO_MESH_MIN_CLIENT", "0")))
 
 
 class AccountPutReq(StrictModel):

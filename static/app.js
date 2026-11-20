@@ -459,7 +459,7 @@ function showCode(mode) {
   const set = mode === "set";
   $("#code-title").textContent = set ? "Lege deinen Code fest" : "Gib deinen Code ein";
   $("#code-info").textContent = set
-    ? "Diesen Code wählst du selbst: mindestens 8 Zeichen, mit mindestens einem Buchstaben. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter."
+    ? "Diesen Code wählst du selbst: mindestens 8 Zeichen, auch nur Zahlen sind möglich. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter."
     : "Du bist noch angemeldet. Gib deinen Code ein, um weiterzumachen.";
   $("#code-repeat").hidden = !set;
   $("#code-submit").textContent = set ? "Weiter" : "Entsperren";
@@ -476,7 +476,6 @@ async function submitCode() {
   if (_codeMode === "set") {
     if (!_pendingLogin || !S.me) { logout(); return; }
     if (code.length < CODE_MIN) { msg.textContent = "Der Code braucht mindestens " + CODE_MIN + " Zeichen."; return; }
-    if (/^[0-9]+$/.test(code)) { msg.textContent = "Bitte nicht nur Zahlen: mindestens ein Buchstabe."; return; }
     if (code !== f.code2.value) { msg.textContent = "Die beiden Eingaben stimmen nicht überein."; return; }
     btn.disabled = true; msg.textContent = "Einen Moment …";
     const sid = S.sid, bytes = _pendingLogin;

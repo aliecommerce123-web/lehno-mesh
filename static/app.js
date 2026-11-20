@@ -121,6 +121,7 @@ async function api(method, path, opt = {}) {
 async function loadConfig() {
   try {
     const c = await api("GET", "/api/v2/config");
+    if (c && Number.isInteger(c.min_client) && c.min_client > CLIENT_VER) needReload();
     if (c && c.work && Array.isArray(c.work.pile) && Array.isArray(c.work.account) && Array.isArray(c.work.upload) && /^[0-9a-f]{16}$/.test(String(c.work.salt || ""))) S.work = c.work;
   } catch (e) {}
 }
@@ -773,11 +774,25 @@ async function startSession() {
 // damit ein altes, noch offenes Fenster keine neueren Angaben überschreibt.
 const CLIENT_VER = 1;
 let _reloadTold = false;
+// Der Server verlangt eine neuere Fassung: Ab hier würde nichts mehr gespeichert.
+// Deshalb wird die Bedienung angehalten, bis die Seite neu geladen ist. Die
+// Anmeldung bleibt dabei erhalten, es wird nur der eigene Code verlangt.
 function needReload() {
-  setSync("Bitte Seite neu laden");
   if (_reloadTold) return;
   _reloadTold = true;
-  toast("Es gibt eine neue Fassung von chatmesh. Bitte die Seite neu laden: Du bleibst angemeldet und gibst nur deinen Code ein.", "err");
+  try { setSync("Bitte Seite neu laden"); } catch (e) {}
+  const bg = el("div", "reload-note");
+  bg.setAttribute("role", "alertdialog");
+  const box = el("div", "reload-box");
+  box.appendChild(el("div", "reload-title", "Neue Fassung von chatmesh"));
+  box.appendChild(el("p", "", "Bitte lade die Seite neu, damit weiter alles richtig gespeichert wird. Du bleibst angemeldet und gibst nur deinen Code ein."));
+  const b = el("button", "primary", "Seite neu laden");
+  b.type = "button";
+  b.addEventListener("click", () => location.reload());
+  box.appendChild(b);
+  bg.appendChild(box);
+  document.body.appendChild(bg);
+  setTimeout(() => { try { b.focus(); } catch (e) {} }, 50);
 }
 function setSync(text) { const e = $("#sync-state"); if (e) e.textContent = text; }
 

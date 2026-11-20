@@ -286,3 +286,9 @@ input.pw { -webkit-text-security: disc; font-family: ui-monospace, SFMono-Regula
 input::placeholder, textarea::placeholder { color: var(--dimmer); opacity: 1; }
 @media (max-width: 360px) { .sheet-row button { padding: 10px 12px; } }
 @media (prefers-color-scheme: dark) { .sheet { border-color: var(--line-strong); } }
+
+.reload-note { position: fixed; inset: 0; z-index: 200; background: var(--overlay); display: flex; align-items: center; justify-content: center; padding: 20px; }
+.reload-box { background: var(--bg); color: var(--text); border: 1px solid var(--line-strong); border-radius: 12px; padding: 22px 20px; max-width: 380px; width: 100%; display: flex; flex-direction: column; gap: 12px; }
+.reload-title { font-size: 17px; font-weight: 700; }
+.reload-box p { margin: 0; font-size: 14.5px; line-height: 1.5; color: var(--dim); }
+.reload-box button { padding: 12px 18px; font-size: 15px; min-height: 44px; }

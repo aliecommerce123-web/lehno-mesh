@@ -885,6 +885,7 @@ async def config():
     """Öffentliche Einstellungen, dazu die gerade geforderte Schwere der Rechenaufgabe."""
     return {
         "row_hex": BUCKET_HEX, "block_bytes": BLOCK_BYTES, "keep_weeks": PILE_KEEP_WEEKS,
+        "min_client": MIN_CLIENT,
         "work": {
             "salt": _work_salts[0].hex(),
             "pile": [work_bits_pile(n) for n in BLOCK_BYTES],

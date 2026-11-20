@@ -7,7 +7,7 @@ Der komplette Quelltext liegt in diesem Verzeichnis: Server (`app.py`), App
 (`static/`), Verschlüsselung (`static/crypto.js`), Entfernen von Zusatzangaben
 aus Medien (`static/media.js`) und der Dienst für Schein-Verkehr (`bots.py`).
 Der laufende Server zeigt unter `/beweis` die Prüfsummen genau der Dateien, die
-er gerade ausliefert.
+er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
 
 ## Die Idee in einfachen Worten
 
@@ -147,6 +147,22 @@ eigenen Dateien beim Start (`EXPECTED_HASHES.json`).
 Python (FastAPI, SQLite), im Browser reines JavaScript ohne Rahmenwerk.
 Mitgelieferte Bausteine: `static/vendor/qrcode.js` (QR-Code erzeugen,
 MIT-Lizenz) und `static/vendor/jsqr.js` (QR-Code lesen, Apache-Lizenz 2.0).
+
+## Von außen prüfen
+
+Jeder kann kontrollieren, ob ein Server genau diesen Quelltext ausliefert:
+
+```
+python3 verify.py https://mesh.lehno.de
+```
+
+Das Programm lädt alle Dateien, die der Server benutzt und an Browser
+ausliefert, und vergleicht sie mit dem öffentlichen Stand. Es braucht nur
+Python.
+
+Der Server zeigt und zählt bewusst keine Mengen: nicht, wie viele Konten es
+gibt, nicht, wie viele Blöcke oder Anhänge. Die Seite `/beweis` zeigt nur
+Speicherformat, Quelltext und Prüfsummen.
 
 ## Selbst betreiben und prüfen
 

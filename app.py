@@ -1100,13 +1100,13 @@ async def cleanup_loop():
 
 # ---------------------------------------------------------------------------
 # Öffentlicher Beweis (ohne Anmeldung, für jeden einsehbar)
-# Zeigt, WIE der Server speichert, WIE VIEL ungefähr gespeichert ist und WELCHER
-# Quelltext gerade läuft. Alles wird aus der echten Datenbank und den echten
-# Dateien gelesen. Bewusst nur grobe Summen als Momentaufnahme alle 10 Minuten:
-# nichts, woran sich einzelne Nutzer, Kanäle oder Nachrichten erkennen ließen.
+# Zeigt, WIE der Server speichert und WELCHER Quelltext gerade läuft. Bewusst
+# OHNE jede Zahl: nicht wie viele Konten es gibt, nicht wie viele Blöcke oder
+# Anhänge, nichts, woraus sich ablesen ließe, wie viele Menschen den Dienst
+# benutzen oder was sie tun. Der Server zählt das auch nirgends mit.
 # ---------------------------------------------------------------------------
 PROOF_FILES = [
-    "app.py", "bots.py", "README.md", "scripts/update_hashes.py", "EXPECTED_HASHES.json",
+    "app.py", "bots.py", "verify.py", "README.md", "scripts/update_hashes.py", "EXPECTED_HASHES.json",
     "static/index.html", "static/app.js", "static/crypto.js", "static/media.js", "static/bip39.js",
     "static/style.css", "static/landing.html", "static/landing.js",
     "static/proof.html", "static/proof.js", "static/manifest.json",
@@ -1114,31 +1114,7 @@ PROOF_FILES = [
 ]
 REPO_URL = os.environ.get("LEHNO_MESH_REPO_URL", "https://github.com/aliecommerce123-web/lehno-mesh")
 PROOF_REFRESH_SECONDS = max(1, int(os.environ.get("LEHNO_MESH_PROOF_REFRESH", "600")))
-_proof_snapshot = {"live": None, "schema": None, "source": None, "config": None}
-
-
-def _size_classes(sizes, classes):
-    out = {str(c): 0 for c in classes}
-    other = 0
-    for n in sizes:
-        if str(n) in out:
-            out[str(n)] += 1
-        else:
-            other += 1
-    if other:
-        out["andere"] = other
-    return out
-
-
-def _round_coarse(n: int) -> int:
-    """Grobe Zahl (auf Zehner bzw. Hunderter gerundet), damit sich aus kleinen
-    Änderungen nichts über einzelne Vorgänge ablesen lässt."""
-    if n == 0:
-        return 0
-    step = 10 if n < 1000 else 100
-    # Etwas Zufall dazu: so verrät auch ein Sprung der Zahl keinen einzelnen Vorgang.
-    n = max(1, n + secrets.randbelow(2 * step + 1) - step)
-    return max(step, int(round(n / step) * step))
+_proof_snapshot = {"schema": None, "source": None, "config": None}
 
 
 def _label_for_removed(name: str) -> str:
@@ -1158,25 +1134,38 @@ def _label_for_removed(name: str) -> str:
     return "weitere Verbindungsangabe"
 
 
+def repo_commit() -> str:
+    """Kennung des Standes im öffentlichen Quelltext-Verzeichnis, mit dem dieser
+    Server läuft. Wird aus den Dateien der Versionsverwaltung gelesen."""
+    try:
+        git = BASE_DIR / ".git"
+        head = (git / "HEAD").read_text().strip()
+        if not head.startswith("ref:"):
+            return head if re.match(r"^[0-9a-f]{40}$", head) else ""
+        ref = head.split(None, 1)[1].strip()
+        ref_file = git / ref
+        if ref_file.exists():
+            value = ref_file.read_text().strip()
+            return value if re.match(r"^[0-9a-f]{40}$", value) else ""
+        for line in (git / "packed-refs").read_text().splitlines():
+            if line.endswith(" " + ref):
+                return line.split(" ", 1)[0]
+    except Exception:
+        pass
+    return ""
+
+
 async def refresh_proof_snapshot():
     con = await open_db()
     try:
         cur = await con.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         main = [{"table": r["name"], "sql": r["sql"]} for r in await cur.fetchall()]
-        cur = await con.execute("SELECT size_bytes, COUNT(*) AS n FROM pile GROUP BY size_bytes")
-        pile = {str(r["size_bytes"]): _round_coarse(r["n"]) for r in await cur.fetchall()}
-        cur = await con.execute("SELECT COUNT(*) AS n FROM accounts")
-        accounts = _round_coarse((await cur.fetchone())["n"])
-        cur = await con.execute("SELECT COUNT(DISTINCT wk) AS n FROM pile")
-        weeks = (await cur.fetchone())["n"]
     finally:
         await con.close()
     acon = await open_att_db()
     try:
         cur = await acon.execute("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
         att_schema = [{"table": r["name"], "sql": r["sql"]} for r in await cur.fetchall()]
-        cur = await acon.execute("SELECT size_bytes, COUNT(*) AS n FROM blobs GROUP BY size_bytes")
-        att = {str(r["size_bytes"]): _round_coarse(r["n"]) for r in await cur.fetchall()}
     finally:
         await acon.close()
 
@@ -1217,20 +1206,12 @@ async def refresh_proof_snapshot():
         counts[lab] = counts.get(lab, 0) + 1
 
     _proof_snapshot["schema"] = {"main_db": main, "attachments_db": att_schema}
-    _proof_snapshot["source"] = {"repository": REPO_URL, "files": files, "expected_hashes": expected}
+    _proof_snapshot["source"] = {"repository": REPO_URL, "commit": repo_commit(), "files": files, "expected_hashes": expected}
     _proof_snapshot["config"] = {
         "removed_before_app": [{"what": k, "entries": v} for k, v in sorted(counts.items())],
         "proxy_log_disabled": log_off,
         "app_access_log_disabled": "--no-access-log" in sys.argv,
         "no_date_header": "--no-date-header" in sys.argv,
-    }
-    _proof_snapshot["live"] = {
-        "refresh_minutes": max(1, PROOF_REFRESH_SECONDS // 60),
-        "rounded": True,
-        "account_blocks": accounts,
-        "pile_blocks_by_size": pile,
-        "pile_distinct_week_markers": weeks,
-        "attachments_by_size": att,
     }
 
 
@@ -1253,12 +1234,6 @@ def _snap(key: str):
 @app.get("/api/proof/schema")
 async def proof_schema():
     return _snap("schema")
-
-
-@app.get("/api/proof/live")
-async def proof_live():
-    """Bestand als grobe Summen, Stand der letzten Momentaufnahme."""
-    return _snap("live")
 
 
 @app.get("/api/proof/source")
@@ -1306,6 +1281,11 @@ async def tor_info(request: Request):
 
 @app.get("/beweis")
 async def proof_page():
+    return FileResponse(STATIC / "proof.html")
+
+
+@app.get("/proof")
+async def proof_page_en():
     return FileResponse(STATIC / "proof.html")
 
 

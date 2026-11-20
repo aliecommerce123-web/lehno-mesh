@@ -16,6 +16,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 PROTECTED = [
     "app.py",
     "bots.py",
+    "verify.py",
     "README.md",
     "scripts/update_hashes.py",
     "static/index.html",

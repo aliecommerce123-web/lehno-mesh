@@ -1,5 +1,6 @@
-// chatmesh Beweis-Seite: liest alles von den öffentlichen Schnittstellen
-// /api/proof/* und zeigt es unverändert an. Keine fremden Dateien, keine Cookies.
+// chatmesh Beweis-Seite: liest Speicherformat, Quelltext-Liste und Einstellungen
+// von den öffentlichen Schnittstellen /api/proof/* und zeigt sie unverändert an.
+// Bewusst ohne jede Zahl über Nutzer oder Nachrichten. Keine fremden Dateien, keine Cookies.
 (function () {
   const $ = (id) => document.getElementById(id);
 
@@ -14,55 +15,6 @@
     if (cls) td.className = cls;
     td.textContent = text === null || text === undefined ? "" : String(text);
     return td;
-  }
-
-  function stat(label, value) {
-    const d = document.createElement("div");
-    d.className = "stat";
-    const b = document.createElement("b"); b.textContent = String(value);
-    const s = document.createElement("span"); s.textContent = label;
-    d.appendChild(b); d.appendChild(s);
-    return d;
-  }
-
-  const sum = (obj) => Object.values(obj || {}).reduce((a, b) => a + b, 0);
-  const about = (n) => (n === 0 ? "0" : "ca. " + n);
-
-  function sizeLabel(key) {
-    if (key === "andere") return "andere Größe";
-    const n = Number(key);
-    if (n >= 1048576) return (n / 1048576) + " MB";
-    if (n >= 1024) return Math.round(n / 1024) + " KB";
-    return n + " Bytes";
-  }
-
-  async function loadLive() {
-    try {
-      const d = await getJson("/api/proof/live");
-      const stats = $("stats");
-      stats.textContent = "";
-      stats.appendChild(stat("verschlüsselte Konto-Blöcke", about(d.account_blocks)));
-      stats.appendChild(stat("Blöcke auf dem Haufen (echte und Schein-Blöcke, nicht unterscheidbar)", about(sum(d.pile_blocks_by_size))));
-      stats.appendChild(stat("verschlüsselte Anhänge", about(sum(d.attachments_by_size))));
-      stats.appendChild(stat("verschiedene Wochen-Marken auf dem Haufen", d.pile_distinct_week_markers));
-      $("live-pill").textContent = "Momentaufnahme, alle " + d.refresh_minutes + " Minuten neu, gerundet";
-
-      const el = $("t-sizes");
-      el.textContent = "";
-      const head = document.createElement("tr");
-      for (const h of ["Art", "Größe (feste Stufe)", "Anzahl (gerundet)"]) { const th = document.createElement("th"); th.textContent = h; head.appendChild(th); }
-      el.appendChild(head);
-      const groups = [["Block auf dem Haufen", d.pile_blocks_by_size], ["Anhang", d.attachments_by_size]];
-      for (const [kind, obj] of groups) {
-        for (const [key, n] of Object.entries(obj || {})) {
-          const tr = document.createElement("tr");
-          tr.appendChild(cell(kind)); tr.appendChild(cell(sizeLabel(key))); tr.appendChild(cell(about(n)));
-          el.appendChild(tr);
-        }
-      }
-    } catch (e) {
-      $("live-pill").textContent = "gerade nicht erreichbar";
-    }
   }
 
   async function loadSchema() {
@@ -91,6 +43,22 @@
     try {
       const d = await getJson("/api/proof/source");
       $("repo").href = d.repository;
+      if (d.commit) {
+        const line = $("commit-line");
+        line.textContent = "Stand im öffentlichen Quelltext-Verzeichnis: ";
+        const a = document.createElement("a");
+        a.href = d.repository + "/commit/" + d.commit;
+        a.target = "_blank"; a.rel = "noopener";
+        a.textContent = d.commit.slice(0, 12);
+        line.appendChild(a);
+        const hist = document.createElement("a");
+        hist.href = d.repository + "/commits";
+        hist.target = "_blank"; hist.rel = "noopener";
+        hist.textContent = "alle Änderungen ansehen";
+        line.appendChild(document.createTextNode(" · "));
+        line.appendChild(hist);
+      }
+      $("verify-cmd").textContent = "python3 verify.py " + location.origin;
       const el = $("t-files");
       el.textContent = "";
       const head = document.createElement("tr");
@@ -130,6 +98,5 @@
     } catch (e) { $("proxy").textContent = "konnte nicht geladen werden"; }
   }
 
-  loadLive(); loadSchema(); loadSource(); loadProxy();
-  setInterval(loadLive, 60000);
+  loadSchema(); loadSource(); loadProxy();
 })();

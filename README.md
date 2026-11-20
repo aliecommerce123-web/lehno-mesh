@@ -33,7 +33,10 @@ er gerade ausliefert.
    Verlauf verschlüsselt im Konto-Block.
 6. **Schein-Verkehr.** Jede offene App und ein eigener Dienst auf dem Server
    legen ständig Blöcke ab und löschen sie wieder, in unregelmäßigen Abständen.
-   Ein Schein-Block ist von einem echten nicht zu unterscheiden.
+   Ein Schein-Block ist von einem echten nicht zu unterscheiden. Der Dienst
+   legt außerdem laufend neue Schein-Konten an und benutzt sie wie ein Mensch.
+   Er merkt sich nichts dauerhaft: Es gibt keine Liste, aus der sich ablesen
+   ließe, welches Konto ein Schein-Konto ist, auch nicht für den Betreiber.
 
 ## Was auf dem Server liegt
 

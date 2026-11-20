@@ -324,6 +324,10 @@ def init_db():
         except OSError:
             pass
     con = sqlite3.connect(DB_PATH)
+    # Ältere Konten bekamen fortlaufende Zeilennummern: durch Zufallszahlen ersetzen.
+    for (rid,) in con.execute("SELECT rowid FROM accounts WHERE rowid < ?", (2**40,)).fetchall():
+        con.execute("UPDATE accounts SET rowid=? WHERE rowid=?", (2**40 + secrets.randbits(62), rid))
+    con.commit()
     _totals["pile"] = con.execute("SELECT COALESCE(SUM(size_bytes),0) FROM pile").fetchone()[0]
     _totals["accounts"] = con.execute("SELECT COALESCE(SUM(size_bytes),0) FROM accounts").fetchone()[0]
     con.close()
@@ -583,6 +587,13 @@ def new_version() -> int:
     return secrets.randbits(53) + 1
 
 
+ROWID_FLOOR = 2**40
+
+
+def random_rowid() -> int:
+    return ROWID_FLOOR + secrets.randbits(62)
+
+
 @app.post("/api/v2/account")
 async def account_create(req: AccountCreateReq, con: aiosqlite.Connection = Depends(db)):
     _check_blobs(req.blob, req.wipe_blob)
@@ -597,10 +608,15 @@ async def account_create(req: AccountCreateReq, con: aiosqlite.Connection = Depe
     if not disk_ok(size) or _totals["accounts"] + size > MAX_ACCOUNT_BYTES:
         raise HTTPException(507, "storage full, try again later")
     version = new_version()
+    cur = await con.execute("SELECT 1 FROM accounts WHERE id=? OR wipe_hash=?", (req.id, req.wipe_hash))
+    if await cur.fetchone():
+        raise HTTPException(409, "exists")
     try:
+        # Die interne Zeilennummer ist eine Zufallszahl: so steht nirgends, in
+        # welcher Reihenfolge Konten angelegt wurden.
         await con.execute(
-            "INSERT INTO accounts (id, auth_hash, wipe_hash, blob, wipe_blob, version, size_bytes, wk) VALUES (?,?,?,?,?,?,?,?)",
-            (req.id, req.auth_hash, req.wipe_hash, req.blob, req.wipe_blob, version, size, account_bucket(int(time.time()))),
+            "INSERT INTO accounts (rowid, id, auth_hash, wipe_hash, blob, wipe_blob, version, size_bytes, wk) VALUES (?,?,?,?,?,?,?,?,?)",
+            (random_rowid(), req.id, req.auth_hash, req.wipe_hash, req.blob, req.wipe_blob, version, size, account_bucket(int(time.time()))),
         )
         await con.commit()
     except sqlite3.IntegrityError:

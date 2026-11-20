@@ -4,7 +4,7 @@
 // Überblick:
 // - Konto: 12 Anmeldewörter (128 Bit Zufall) -> Kontokennung, Zugang, Schlüssel.
 //   12 Löschwörter (eigene 128 Bit) -> Zugang zum unwiderruflichen Löschen.
-// - Kanal: entsteht aus einem Einmal-Code (9 Wörter) plus einem Schlüsseltausch
+// - Kanal: entsteht aus einem Einmal-Schlüssel (24 Zeichen oder QR-Code) plus einem Schlüsseltausch
 //   zwischen den beiden Geräten. Der Code allein reicht später nicht mehr.
 // - Jede Nachricht liegt unter einer neuen Zufallsmarke, die nur die beiden
 //   Geräte ausrechnen können, und ist mit einem eigenen Schlüssel verschlossen.
@@ -105,7 +105,7 @@
   const WIPE = [4096, 65536];
 
   // ---------- Wörter (BIP39-Verfahren, englische Liste) ----------
-  // 16 Bytes -> 12 Wörter, 12 Bytes -> 9 Wörter. Die letzten Bits sind eine
+  // 16 Bytes -> 12 Wörter. Die letzten Bits sind eine
   // Prüfsumme, damit Tippfehler auffallen.
   async function bytesToWords(entropy) {
     const list = window.LehnoBip39.BIP39_WORDS;
@@ -347,6 +347,39 @@
     }
   }
 
+  // ---------- Einmal-Schlüssel für einen Kanal ----------
+  // 12 Zufallsbytes plus 3 Prüfbytes, dargestellt als 24 Zeichen in 6 Gruppen
+  // (Ziffern und Großbuchstaben ohne I, L, O, U). Bewusst KEINE Wörter: Wörter
+  // gibt es nur für die Anmeldung.
+  const B32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+  async function codeCheck(bytes) { return (await sha256(concat(utf8("chatmesh2|code|"), bytes))).subarray(0, 3); }
+  async function bytesToCode(bytes) {
+    const all = concat(bytes, await codeCheck(bytes));
+    let bits = 0, val = 0, out = "";
+    for (const b of all) {
+      val = (val << 8) | b; bits += 8;
+      while (bits >= 5) { out += B32[(val >>> (bits - 5)) & 31]; bits -= 5; }
+      val &= (1 << bits) - 1;
+    }
+    return out.match(/.{4}/g).join("-");
+  }
+  async function codeToBytes(text) {
+    const clean = String(text || "").toUpperCase().replace(/O/g, "0").replace(/[IL]/g, "1").replace(/[^0-9A-Z]/g, "");
+    if (clean.length !== 24) throw new Error("count");
+    const all = new Uint8Array(15);
+    let bits = 0, val = 0, o = 0;
+    for (const ch of clean) {
+      const v = B32.indexOf(ch);
+      if (v < 0) throw new Error("char");
+      val = (val << 5) | v; bits += 5;
+      if (bits >= 8) { all[o++] = (val >>> (bits - 8)) & 255; bits -= 8; }
+      val &= (1 << bits) - 1;
+    }
+    const bytes = all.slice(0, 12), check = await codeCheck(bytes);
+    if (check[0] !== all[12] || check[1] !== all[13] || check[2] !== all[14]) throw new Error("checksum");
+    return bytes;
+  }
+
   window.CM = {
     utf8, fromUtf8, rand, b64, unb64, hex, unhex, concat, sha256, hkdf, hmac, seal, open,
     sealJson, openJson, fitsJson, BLOCK, ACCOUNT, WIPE,
@@ -355,6 +388,6 @@
     msgTag, msgTags, msgDelToken, msgKey, delHash, dissolveKeys,
     passwordKey, wrapWithKey, wrapWithPassword, unwrapWithPassword,
     encryptFile, decryptFile, FILE_SIZES,
-    boxSeal, boxOpen, work,
+    boxSeal, boxOpen, work, bytesToCode, codeToBytes,
   };
 })();

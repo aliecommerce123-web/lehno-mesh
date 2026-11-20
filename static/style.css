@@ -1082,3 +1082,5 @@ input.pw { -webkit-text-security: disc; font-family: ui-monospace, Menlo, monosp
   .sheet-row button { min-height: 44px; }
   .icon-btn { width: 44px; height: 44px; }
 }
+.code-key { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin: 0 8px 10px; padding: 12px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 12px; font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; font-size: 18px; letter-spacing: 2px; text-align: center; -webkit-user-select: all; user-select: all; }
+.code-key span { color: var(--accent); font-weight: 700; }

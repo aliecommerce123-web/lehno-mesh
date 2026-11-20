@@ -17,7 +17,7 @@ er gerade ausliefert.
    unwiderruflich. Einen eigenen Knopf gibt es dafür nicht, und es sieht
    danach aus, als hätte es das Konto nie gegeben.
 2. **Kanal = Einmal-Code.** Wer mit jemandem schreiben will, legt einen Kanal
-   an und bekommt einen Einmal-Code (9 Wörter oder QR-Code). Das Gegenüber gibt
+   an und bekommt einen Einmal-Schlüssel (24 Zeichen oder QR-Code). Das Gegenüber gibt
    ihn ein. Danach ist der Code für alle ungültig. Jeder Kanal hat bei jedem
    der beiden ein eigenes Passwort.
 3. **Der Haufen.** Jede Nachricht ist ein namenloser Block fester Größe unter
@@ -67,7 +67,7 @@ bekommt nur Geheimtext.
   Prüfwert. Ein kleiner zweiter Block enthält, verschlüsselt mit einem
   Schlüssel aus den Löschwörtern, was zum Benachrichtigen der Gegenüber nötig
   ist.
-- **Einmal-Code:** 12 Zufallsbytes (9 Wörter). Daraus entstehen zwei Marken
+- **Einmal-Schlüssel:** 12 Zufallsbytes, gezeigt als 24 Zeichen mit Prüfteil. Daraus entstehen zwei Marken
   und ein Schlüssel. Unter der ersten Marke liegt das verschlüsselte Angebot
   mit einem frischen ECDH-Schlüssel (P-256), unter der zweiten die Antwort.
   Aus ECDH-Geheimnis, Code und beiden öffentlichen Schlüsseln entsteht per

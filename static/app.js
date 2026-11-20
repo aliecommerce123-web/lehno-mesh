@@ -2,7 +2,7 @@
 //
 // Grundsätze dieser Datei:
 // - Ein Konto besteht nur aus 12 Anmeldewörtern. Dazu gibt es 12 Löschwörter.
-// - Kanäle entstehen über einen Einmal-Code (9 Wörter oder QR-Code). Jeder
+// - Kanäle entstehen über einen Einmal-Schlüssel (24 Zeichen oder QR-Code). Jeder
 //   Kanal hat ein eigenes Passwort. Ohne dieses Passwort lassen sich auch mit
 //   den 12 Anmeldewörtern keine Nachrichten lesen, senden oder löschen.
 // - Jede Nachricht liegt als namenloser Block unter einer neuen Zufallsmarke
@@ -1100,7 +1100,7 @@ function openChannel(id) {
   // Ist die Kanal-Sperre abgeschaltet, bleibt der Kanal nach der ersten
   // Passwort-Eingabe für die Dauer der Anmeldung offen (nur im Arbeitsspeicher).
   if (r.kMsg) { go(); return; }
-  askPassword("Kanal „" + c.name + "“ öffnen", "Passwort dieses Kanals", async (pw) => { await unlock(c, pw); go(); });
+  askPassword("Kanal „" + c.name + "“ öffnen", "Dein Passwort für diesen Kanal", async (pw) => { await unlock(c, pw); go(); });
 }
 
 // Verlässt den offenen Kanal. Ohne „Verlauf behalten“ ist danach alles weg,
@@ -1282,10 +1282,13 @@ async function completeInvite(c, block, ps) {
 
 async function joinChannel(codeText, name, password) {
   let I;
-  try { I = await C.wordsToBytes(codeText, 12); }
-  catch (e) { throw new Error(wordError(e, 9)); }
+  try { I = await C.codeToBytes(codeText); }
+  catch (e) {
+    const m = String(e && e.message || "");
+    throw new Error(m === "count" ? "Der Einmal-Schlüssel hat 24 Zeichen (6 Gruppen mit je 4 Zeichen)." : "Der Einmal-Schlüssel stimmt nicht. Bitte auf Tippfehler prüfen.");
+  }
   const ik = await C.inviteKeys(I);
-  const invalid = "Dieser Code ist nicht gültig.";
+  const invalid = "Dieser Einmal-Schlüssel ist nicht gültig (schon benutzt, abgelaufen oder zurückgezogen).";
   const found = await scanFor([ik.tagA, ik.tagB]);
   const block = found[ik.tagA];
   if (!block || found[ik.tagB]) throw new Error(invalid);
@@ -1324,7 +1327,7 @@ function expireInvites() {
       dropRuntime(c.id);
       S.acct.ch = S.acct.ch.filter(x => x.id !== c.id);
       S.acct.gone = [...S.acct.gone, c.id].slice(-300);
-      S.acct.notes.push(`Der Einmal-Code für „${c.name}“ ist abgelaufen.`);
+      S.acct.notes.push(`Der Einmal-Schlüssel für „${c.name}“ ist abgelaufen.`);
       saveSoon();
       renderList();
     }
@@ -1570,10 +1573,10 @@ function checkPw(v) {
 
 function newChannelSheet() {
   formSheet("Neuer Kanal", {
-    info: "Du bekommst einen Einmal-Code. Den gibst du deinem Gegenüber, als QR-Code zum Scannen oder zum Abtippen. Er gilt 24 Stunden und nur ein einziges Mal.",
+    info: "Du bekommst einen Einmal-Schlüssel. Den gibst du deinem Gegenüber: als QR-Code zum Scannen oder zum Abtippen. Er gilt 24 Stunden und nur ein einziges Mal.",
     fields: [
-      { name: "name", label: "Name für diesen Kanal (siehst nur du)", placeholder: "z. B. Kollege", max: 40 },
-      { name: "pw", type: "password", label: "Passwort für diesen Kanal", hint: "Dieses Passwort brauchst du jedes Mal, wenn du den Kanal öffnest oder löschst." },
+      { name: "name", label: "Name für diesen Kanal (frei wählbar, siehst nur du)", max: 40 },
+      { name: "pw", type: "password", label: "Dein eigenes Passwort, um auf diesen Kanal zuzugreifen", hint: "Nur du kennst es. Du brauchst es jedes Mal, wenn du diesen Kanal öffnest oder löschst. Mit deinen 12 Anmeldewörtern hat es nichts zu tun." },
       { name: "pw2", type: "password", label: "Passwort wiederholen" },
       { name: "keep", type: "checkbox", label: "Verlauf behalten anfragen (dein Gegenüber muss zustimmen, sonst wird wie üblich gelöscht)" },
     ],
@@ -1606,21 +1609,21 @@ async function showInvite(c) {
   const ps = runOf(c).ps;
   if (!ps) {
     // In einer neuen Sitzung ist der Einmal-Code nur mit dem Kanal-Passwort lesbar.
-    askPassword("Einmal-Code für „" + c.name + "“", "Passwort dieses Kanals", async (pw) => { await unsealPending(c, pw); setTimeout(() => showInvite(c), 0); }, "Anzeigen");
+    askPassword("Einmal-Schlüssel für „" + c.name + "“", "Dein Passwort für diesen Kanal", async (pw) => { await unsealPending(c, pw); setTimeout(() => showInvite(c), 0); }, "Anzeigen");
     return;
   }
-  const words = await C.bytesToWords(ps.I);
+  const key = await C.bytesToCode(ps.I);
   const canvas = el("canvas", "qr-canvas");
-  drawQr(canvas, words);
-  const code = el("div", "code-words");
-  words.split(" ").forEach((w, i) => { const s = el("span", "", w); s.dataset.n = String(i + 1); code.appendChild(s); });
-  const copy = el("button", "ghost small", "Code kopieren");
+  drawQr(canvas, key);
+  const code = el("div", "code-key");
+  key.split("-").forEach((g) => code.appendChild(el("span", "", g)));
+  const copy = el("button", "ghost small", "Schlüssel kopieren");
   copy.type = "button";
-  copy.addEventListener("click", () => { navigator.clipboard.writeText(words).then(() => toast("Code kopiert", "ok")).catch(() => toast("Kopieren nicht möglich", "err")); });
-  const wait = el("p", "sheet-info center", "Warte auf den Beitritt … Der Kanal erscheint von selbst, sobald dein Gegenüber den Code eingegeben hat.");
-  const drop = menuItem("Einmal-Code zurückziehen", "Der Code wird sofort ungültig.", true, () => dissolveChannel(c, "deleted"));
-  openSheetNodes("Einmal-Code für „" + c.name + "“", [
-    infoNode("Lass dein Gegenüber diesen QR-Code scannen oder die 9 Wörter abtippen. Gültig 24 Stunden, nur ein einziges Mal. Die Wörter sind englisch (eine weltweit übliche Liste)."),
+  copy.addEventListener("click", () => { navigator.clipboard.writeText(key).then(() => toast("Schlüssel kopiert", "ok")).catch(() => toast("Kopieren nicht möglich", "err")); });
+  const wait = el("p", "sheet-info center", "Warte auf den Beitritt … Der Kanal erscheint von selbst, sobald dein Gegenüber den Schlüssel eingegeben hat.");
+  const drop = menuItem("Einmal-Schlüssel zurückziehen", "Er wird sofort ungültig.", true, () => dissolveChannel(c, "deleted"));
+  openSheetNodes("Einmal-Schlüssel für „" + c.name + "“", [
+    infoNode("Lass dein Gegenüber diesen QR-Code scannen oder die 24 Zeichen abtippen. Gültig 24 Stunden, nur ein einziges Mal."),
     canvas, code, copy, wait, drop,
   ]);
 }
@@ -1632,11 +1635,11 @@ function openPending(c) {
   if (!c.pend.ans) { showInvite(c); return; }
   const finish = async (ps) => {
     const ok = await completeInvite(c, C.unb64(c.pend.ans), ps);
-    if (!ok) { saveSoon(); renderList(); throw new Error("Der Beitritt war ungültig. Der Einmal-Code gilt weiter."); }
+    if (!ok) { saveSoon(); renderList(); throw new Error("Der Beitritt war ungültig. Der Einmal-Schlüssel gilt weiter."); }
   };
   const ps = runOf(c).ps;
   if (ps) { finish(ps).catch(e => toast(e.message, "err")); return; }
-  askPassword("Kanal „" + c.name + "“ verbinden", "Passwort dieses Kanals", async (pw) => { await finish(await unsealPending(c, pw)); }, "Verbinden");
+  askPassword("Kanal „" + c.name + "“ verbinden", "Dein Passwort für diesen Kanal", async (pw) => { await finish(await unsealPending(c, pw)); }, "Verbinden");
 }
 
 let _scan = null;
@@ -1679,13 +1682,13 @@ function joinChannelSheet() {
   scanWrap.appendChild(scanBtn);
   scanWrap.appendChild(video);
   const inputs = formSheet("Kanal beitreten", {
-    info: "Gib den Einmal-Code ein, den dein Gegenüber dir zeigt: scannen oder die 9 Wörter abtippen.",
+    info: "Gib den Einmal-Schlüssel ein, den dein Gegenüber dir zeigt: QR-Code scannen oder abtippen.",
     noFocus: true,
     fields: [
       { node: scanWrap },
-      { name: "code", type: "textarea", label: "Einmal-Code (9 Wörter)", placeholder: "wort1 wort2 … wort9" },
-      { name: "name", label: "Name für diesen Kanal (siehst nur du)", placeholder: "z. B. Kollege", max: 40 },
-      { name: "pw", type: "password", label: "Passwort für diesen Kanal", hint: "Dein eigenes Passwort für diesen Kanal. Es muss nicht dasselbe sein wie bei deinem Gegenüber." },
+      { name: "code", type: "textarea", label: "Einmal-Schlüssel (24 Zeichen)", placeholder: "XXXX-XXXX-XXXX-XXXX-XXXX-XXXX" },
+      { name: "name", label: "Name für diesen Kanal (frei wählbar, siehst nur du)", max: 40 },
+      { name: "pw", type: "password", label: "Dein eigenes Passwort, um auf diesen Kanal zuzugreifen", hint: "Nur du kennst es. Dein Gegenüber hat sein eigenes. Du brauchst es jedes Mal, wenn du diesen Kanal öffnest oder löschst." },
       { name: "pw2", type: "password", label: "Passwort wiederholen" },
     ],
     submit: "Beitreten",
@@ -1704,7 +1707,7 @@ function joinChannelSheet() {
   scanBtn.addEventListener("click", async () => {
     try {
       video.hidden = false;
-      await startScan(video, (text) => { inputs.code.value = text; video.hidden = true; toast("Code erkannt", "ok"); });
+      await startScan(video, (text) => { inputs.code.value = text; video.hidden = true; toast("Schlüssel erkannt", "ok"); });
     } catch (e) { video.hidden = true; toast(e.message, "err"); }
   });
 }
@@ -1844,7 +1847,7 @@ function channelMenu(c) {
 function deleteChannelSheet(c) {
   formSheet("Kanal „" + c.name + "“ löschen", {
     info: "Der Kanal wird bei dir und bei deinem Gegenüber aufgelöst. Das lässt sich nicht rückgängig machen.",
-    fields: [{ name: "pw", type: "password", label: "Passwort dieses Kanals" }],
+    fields: [{ name: "pw", type: "password", label: "Dein Passwort für diesen Kanal" }],
     submit: "Endgültig löschen",
     danger: true,
     busy: "Wird geprüft …",
@@ -1922,7 +1925,7 @@ function renderList() {
     const e = el("div", "contact-empty");
     e.appendChild(document.createTextNode("Noch keine Kanäle."));
     e.appendChild(document.createElement("br"));
-    e.appendChild(document.createTextNode("Lege einen neuen Kanal an oder tritt mit einem Einmal-Code bei."));
+    e.appendChild(document.createTextNode("Lege einen neuen Kanal an oder tritt mit einem Einmal-Schlüssel bei."));
     list.appendChild(e);
   }
   for (const c of S.acct.ch) {
@@ -1934,7 +1937,7 @@ function renderList() {
     meta.appendChild(el("div", "name is-nick", c.name));
     const line = el("div", "last-row");
     let sub = "Ende-zu-Ende verschlüsselt";
-    if (c.pend) sub = c.pend.ans ? "Beitritt da: antippen und Passwort eingeben" : "Wartet auf Beitritt (Einmal-Code anzeigen)";
+    if (c.pend) sub = c.pend.ans ? "Beitritt da: antippen und Passwort eingeben" : "Wartet auf Beitritt (Einmal-Schlüssel anzeigen)";
     else if (c.id === S.active) sub = "geöffnet";
     else if (!unlocked(c)) sub = "gesperrt";
     line.appendChild(el("div", "last" + (c.pend ? " warn" : ""), sub));

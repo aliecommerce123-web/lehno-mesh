@@ -573,11 +573,18 @@ class AccountCreateReq(StrictModel):
     work: str = Field("", max_length=16)
 
 
+# Älteste Fassung der App, die das Konto noch speichern darf. Ein noch offenes
+# Fenster mit einer älteren Fassung kennt neuere Angaben im Konto nicht und
+# könnte sie unbemerkt überschreiben. Es muss die Seite einmal neu laden.
+MIN_CLIENT = 1
+
+
 class AccountPutReq(StrictModel):
     blob: str = Field(..., min_length=1, max_length=5_700_000)
     wipe_blob: str = Field(..., min_length=1, max_length=90_000)
     expected_version: int = Field(..., ge=1, le=2**62)
     work: str = Field("", max_length=16)
+    cv: int = Field(0, ge=0, le=100000)
 
 
 class WipeReq(StrictModel):
@@ -678,6 +685,8 @@ async def account_put(req: AccountPutReq, con: aiosqlite.Connection = Depends(db
     """Schreibt den Konto-Block nur, wenn der Client den aktuellen Stand kennt.
     Die Versionsmarke ist eine Zufallszahl, kein Zähler."""
     _check_blobs(req.blob, req.wipe_blob)
+    if req.cv < MIN_CLIENT:
+        raise HTTPException(426, "reload required")
     if not limit_ok(f"account:put:{me}", 240, 60):
         raise HTTPException(429, "too many requests")
     size = len(req.blob) + len(req.wipe_blob)

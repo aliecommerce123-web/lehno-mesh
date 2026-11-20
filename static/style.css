@@ -24,6 +24,7 @@
 }
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --bg: #101214;
     --panel: #181b1e;
     --panel-2: #22262a;
@@ -202,6 +203,7 @@ body.shielded .shield { display: flex !important; position: absolute; inset: 0; 
 .sheet-title { font-weight: 700; font-size: 16.5px; padding: 8px 12px 10px; }
 .sheet-section { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--dimmer); padding: 10px 8px 0; }
 .sheet-info { font-size: 13.5px; color: var(--dim); padding: 2px 12px 10px; margin: 0; line-height: 1.45; }
+.sheet-form .sheet-info { padding: 2px 8px 10px; }
 .sheet-info.center { text-align: center; }
 .sheet-item { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left; padding: 12px; border-radius: 8px; font-size: 15px; color: var(--text); }
 .sheet-item:hover { background: var(--panel); }
@@ -226,7 +228,7 @@ input.pw { -webkit-text-security: disc; font-family: ui-monospace, SFMono-Regula
 .sheet-error { min-height: 18px; padding: 0 8px; font-size: 13.5px; color: var(--danger); }
 .sheet-error.busy { color: var(--dim); }
 .sheet-row { display: flex; gap: 8px; justify-content: flex-end; padding: 0 8px 4px; }
-.sheet-row button { padding: 10px 18px; font-size: 14.5px; }
+.sheet-row button { padding: 10px 18px; font-size: 14.5px; white-space: nowrap; }
 .sheet-choice { display: block; width: calc(100% - 16px); margin: 8px; padding: 14px 12px; border-radius: var(--radius); font-size: 15.5px; font-weight: 600; text-align: center; background: var(--bg); color: var(--text); border: 1px solid var(--line); }
 .sheet-choice.danger-fill { border-color: transparent; }
 .qr-canvas { display: block; margin: 6px auto 12px; width: min(240px, 66vw); height: auto; border: 1px solid var(--line); border-radius: 8px; image-rendering: pixelated; }
@@ -281,3 +283,6 @@ input.pw { -webkit-text-security: disc; font-family: ui-monospace, SFMono-Regula
 .sheet-item button.small { margin-top: 8px; }
 .sheet-btn-row { padding: 0 8px; }
 .sheet-btn-row button { min-height: 44px; }
+input::placeholder, textarea::placeholder { color: var(--dimmer); opacity: 1; }
+@media (max-width: 360px) { .sheet-row button { padding: 10px 12px; } }
+@media (prefers-color-scheme: dark) { .sheet { border-color: var(--line-strong); } }

@@ -16,12 +16,13 @@ er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
    Dazu gibt es 12 Löschwörter: Wer sie bei „Anmelden“ eingibt, löscht alles
    unwiderruflich. Einen eigenen Knopf gibt es dafür nicht. Es öffnet sich ein
    leeres Konto wie bei einer normalen Anmeldung, das alte Konto ist danach
-   ebenfalls leer, und die Kanäle verschwinden bei den Gegenübern wie bei
+   ebenfalls leer, und die Chat-Kanäle verschwinden bei den Gegenübern wie bei
    einem gewöhnlichen Löschen.
-2. **Kanal = Einmal-Code.** Wer mit jemandem schreiben will, legt einen Kanal
+2. **Chat-Kanal = Einmal-Code.** Wer mit jemandem schreiben will, legt einen Chat-Kanal
    an und bekommt einen Einmal-Schlüssel (24 Zeichen oder QR-Code). Das Gegenüber gibt
-   ihn ein. Danach ist der Code für alle ungültig. Jeder Kanal hat bei jedem
-   der beiden ein eigenes Passwort.
+   ihn ein. Danach ist der Code für alle ungültig. Jeder der beiden kann dem
+   Chat-Kanal für sich ein eigenes Passwort geben. Das ist freiwillig und lässt
+   sich später festlegen, ändern oder entfernen.
 3. **Der Haufen.** Jede Nachricht ist ein namenloser Block fester Größe unter
    einer neuen Zufallsmarke. Alle Blöcke aller Nutzer liegen auf einem
    gemeinsamen Haufen. Jede App lädt den ganzen Haufen und findet ihre Blöcke
@@ -73,18 +74,23 @@ bekommt nur Geheimtext.
   und ein Schlüssel. Unter der ersten Marke liegt das verschlüsselte Angebot
   mit einem frischen ECDH-Schlüssel (P-256), unter der zweiten die Antwort.
   Aus ECDH-Geheimnis, Code und beiden öffentlichen Schlüsseln entsteht per
-  HKDF die Wurzel des Kanals. Eine Prüf-Zahl (12 Ziffern) zeigt beiden Seiten, dass
+  HKDF die Wurzel des Chat-Kanals. Eine Prüf-Zahl (18 Ziffern) zeigt beiden Seiten, dass
   sich niemand dazwischengedrängt hat.
-- **Kanal:** Aus der Wurzel entstehen vier Schlüssel: für Marken, Inhalt,
+- **Chat-Kanal:** Aus der Wurzel entstehen vier Schlüssel: für Marken, Inhalt,
   Löschen und Auflösen. Für jede Nachricht werden daraus per HMAC/HKDF eine
   neue Marke, ein neuer Inhaltsschlüssel und ein neues Lösch-Geheimnis
-  gebildet. Zwei Nachrichten desselben Kanals haben für Außenstehende nichts
+  gebildet. Zwei Nachrichten desselben Chat-Kanals haben für Außenstehende nichts
   gemeinsam.
-- **Kanal-Passwort:** Die Schlüssel zum Lesen, Senden, Löschen und Auflösen
-  eines Kanals liegen im Konto nur verpackt mit dem Kanal-Passwort
-  (PBKDF2-SHA256, 600.000 Runden, AES-GCM). Mit den 12 Anmeldewörtern allein
-  lässt sich kein Kanal lesen. Offen liegt nur, was zum Zählen ungelesener
-  Blöcke nötig ist.
+- **Chat-Kanal-Passwort (freiwillig):** Die Schlüssel zum Lesen, Senden, Löschen
+  und Auflösen eines Chat-Kanals liegen im Konto nur in einem verschlossenen
+  Päckchen. Offen liegt nur, was zum Zählen ungelesener Blöcke nötig ist.
+  Mit Passwort: Das Päckchen ist mit dem Chat-Kanal-Passwort verschlossen
+  (PBKDF2-SHA256, 600.000 Runden, AES-GCM). Die 12 Anmeldewörter allein
+  genügen dann nicht, um den Chat-Kanal zu lesen.
+  Ohne Passwort: Ein Zufalls-Schlüssel verschließt das Päckchen. Er liegt im
+  verschlüsselten Konto, die 12 Anmeldewörter genügen dann zum Öffnen.
+  Ein später festgelegtes Passwort schützt ab diesem Zeitpunkt, nicht
+  rückwirkend.
 - **Rechenaufgabe:** Jede Einlieferung bringt eine kleine Rechenaufgabe mit
   (SHA-256 mit führenden Null-Bits). Sie wird schwerer, je voller der Speicher
   ist und je mehr gerade eingeliefert wird. Der Server kennt keine
@@ -94,7 +100,8 @@ bekommt nur Geheimtext.
   nächste Ketten-Schlüssel (HKDF), der alte wird überschrieben. Der
   Ausgangs-Schlüssel wird nicht aufbewahrt. Wer später den Stand eines Geräts
   bekommt, kann frühere Nachrichten nicht mehr öffnen. Der Stand liegt im
-  Konto nur im Päckchen, das das Kanal-Passwort verschließt.
+  Konto nur im Päckchen, das das Chat-Kanal-Passwort oder, ohne Passwort, der
+  Zufalls-Schlüssel verschließt.
 - **Zwei Löschzeiten:** Nach dem Öffnen bleibt eine Nachricht eine einstellbare
   Zeit sichtbar. Zusätzlich lässt sich einstellen, nach welcher Zeit eine
   ungeöffnete Nachricht gelöscht wird: Die Frist steht verschlüsselt in der
@@ -124,7 +131,7 @@ bekommt nur Geheimtext.
 
 ## Was der Server nicht kann
 
-- Nachrichten, Anhänge, Kanal-Namen oder Verläufe lesen.
+- Nachrichten, Anhänge, Chat-Kanal-Namen oder Verläufe lesen.
 - Aus dem, was er speichert, ablesen, wer mit wem schreibt.
 - Echte Blöcke von Schein-Blöcken unterscheiden.
 - Ein Konto wiederherstellen. Wer die Wörter verliert, verliert das Konto.
@@ -142,7 +149,7 @@ bekommt nur Geheimtext.
   Server, sobald er angemeldet ist. Ist er es bei Ablauf nicht, zeigt die App
   des Gegenübers die Nachricht trotzdem nicht mehr an.
 - Screenshots: Am Rechner blendet die App den Inhalt aus, sobald das Fenster
-  nicht vorne ist, und löst den Kanal auf, wenn sie einen Versuch erkennt
+  nicht vorne ist, und löst den Chat-Kanal auf, wenn sie einen Versuch erkennt
   (bestimmte Tasten, Drucken). Sicher verhindern kann eine Webseite
   Bildschirmfotos nicht, am Handy lässt sich ein Screenshot nicht erkennen, und
   niemand kann das Abfotografieren eines Bildschirms verhindern.

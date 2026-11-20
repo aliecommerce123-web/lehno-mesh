@@ -2,9 +2,10 @@
 //
 // Grundsätze dieser Datei:
 // - Ein Konto besteht nur aus 12 Anmeldewörtern. Dazu gibt es 12 Löschwörter.
-// - Kanäle entstehen über einen Einmal-Schlüssel (24 Zeichen oder QR-Code). Jeder
-//   Kanal hat ein eigenes Passwort. Ohne dieses Passwort lassen sich auch mit
-//   den 12 Anmeldewörtern keine Nachrichten lesen, senden oder löschen.
+// - Kanäle entstehen über einen Einmal-Schlüssel (24 Zeichen oder QR-Code). Ein
+//   eigenes Passwort je Kanal ist freiwillig. Mit Passwort genügen die 12
+//   Anmeldewörter allein nicht, um Nachrichten zu lesen, zu senden oder zu
+//   löschen. Ohne Passwort genügen sie.
 // - Jede Nachricht liegt als namenloser Block unter einer neuen Zufallsmarke
 //   auf dem gemeinsamen Haufen. Dieses Gerät lädt den ganzen Haufen und findet
 //   seine Blöcke selbst. Der Server bekommt keine Angabe, für wen ein Block ist.
@@ -22,7 +23,7 @@ const WINDOW_BACK = 32, WINDOW_AHEAD = 256, RESERVE = 8;
 const LIM = { keep: 6000, bytes: 24 * 1024 * 1024 };         // nicht zugeordnete Blöcke im Arbeitsspeicher
 const VIEW_MIN = 5, VIEW_MAX = 30 * 86400, VIEW_DEFAULT = 600;
 const INVITE_SECONDS = 24 * 3600;
-const HIST_BYTES = 200000;              // Verlauf je Kanal (verschlüsselt im Konto)
+const HIST_BYTES = 200000;              // Verlauf je Chat-Kanal (verschlüsselt im Konto)
 const PW_MIN = 6;
 const UNREAD_MIN = 60;                 // kürzeste Frist für ungeöffnete Nachrichten (Sekunden)
 const CLOCK_SLACK = 90;                // so viel dürfen die Uhren zweier Geräte auseinander liegen
@@ -53,8 +54,8 @@ const S = {
   cursor: 0,
   synced: false,
   expect: new Map(),   // Marke -> { id, kind, lane, n }
-  run: {},             // Kanal-ID -> Laufzeitdaten (nur Arbeitsspeicher)
-  active: null,        // gerade offener Kanal
+  run: {},             // Chat-Kanal-ID -> Laufzeitdaten (nur Arbeitsspeicher)
+  active: null,        // gerade offener Chat-Kanal
   timers: new Set(),
 };
 
@@ -198,17 +199,20 @@ const numList = (v) => (Array.isArray(v) ? v : []).filter(x => Number.isInteger(
 const modeList = (v) => (Array.isArray(v) ? v : []).filter(x => x === "keep" || x === "shots").filter((x, i, a) => a.indexOf(x) === i);
 function sanitizeChannel(c) {
   if (!c || typeof c.id !== "string" || !/^[0-9a-f]{16}$/.test(c.id)) return null;
-  c.name = String(c.name || "Kanal").slice(0, 40);
+  c.name = String(c.name || "Chat").slice(0, 40);
   c.dir = c.dir === "b" ? "b" : "a";
   c.rv = Number.isInteger(c.rv) ? c.rv : 0;
   if (c.pend) {
     const p = c.pend;
     if (![p.ta, p.da, p.tb].every(x => typeof x === "string" && /^[0-9a-f]{32}$/.test(x)) || typeof p.s !== "string" || typeof p.c !== "string") return null;
     p.exp = Number.isFinite(p.exp) ? p.exp : 0;
+    if (p.n !== undefined && (typeof p.n !== "string" || p.n.length < 40 || p.n.length > 48)) return null;
     return c;
   }
   if (typeof c.kt !== "string" || !c.wrap || typeof c.wrap.s !== "string" || typeof c.wrap.c !== "string") return null;
   if (!c.pd || typeof c.pd.t !== "string" || typeof c.pd.k !== "string" || typeof c.pd.d !== "string") return null;
+  if (c.wrap.n !== undefined && (typeof c.wrap.n !== "string" || c.wrap.n.length < 40 || c.wrap.n.length > 48)) return null;
+  c.wrap.v = Number.isInteger(c.wrap.v) && c.wrap.v > 0 ? c.wrap.v : 0;
   for (const k of ["sn", "cn", "sr", "cr", "rn", "rc"]) c[k] = Number.isInteger(c[k]) && c[k] >= 0 ? c[k] : 0;
   c.rp = numList(c.rp); c.rpc = numList(c.rpc);
   c.keep = c.keep ? 1 : 0; c.shots = c.shots ? 1 : 0;
@@ -279,8 +283,23 @@ function mergeChannel(l, r) {
   if (!r.ib) delete l.ib;
   if (r.wrap && l.wrap && r.wrap.c !== l.wrap.c) {
     const lr = S.run[l.id];
-    if (lr && lr.ch && lr.pwKey) _wrapMerges.push([l.id, r.wrap]);          // hier geöffnet: je Kette den weiteren Stand nehmen
-    else if ((r.wp || 0) > (l.wp || 0)) { l.wrap = r.wrap; l.wp = r.wp || 0; }   // hier gesperrt: das weitere Päckchen gilt
+    const lv = wrapVer(l), rv = wrapVer(r);
+    const sameKey = r.wrap.s === l.wrap.s;
+    // Bei gleichem Stand, aber verschiedenem Salz haben zwei Geräte gleichzeitig geändert:
+    // Dann gilt überall das Päckchen mit dem größeren Salz.
+    if (rv > lv || (rv === lv && !sameKey && r.wrap.s > l.wrap.s)) {
+      // Auf einem anderen Gerät wurde das Passwort geändert, festgelegt oder entfernt:
+      // Dessen Päckchen gilt. Der hier noch bekannte alte Schlüssel wird sofort vergessen,
+      // damit nichts mehr mit ihm verpackt wird.
+      l.wrap = r.wrap; l.wp = r.wp || 0;
+      if (lr && (lr.pwKey || lr.kMsg)) {
+        lr.kMsg = null; lr.kDel = null; lr.own = null; lr.ch = null; lr.pwKey = null; lr.ws = null; lr.chDirty = false;
+        if (S.active === l.id) { try { closeChannel(false); } catch (e) {} toast("Das Passwort dieses Chat-Kanals wurde auf einem anderen Gerät geändert. Bitte neu öffnen."); }
+      }
+    } else if (rv === lv && sameKey) {
+      if (lr && lr.ch && lr.pwKey) _wrapMerges.push([l.id, r.wrap]);          // hier geöffnet: je Kette den weiteren Stand nehmen
+      else if ((r.wp || 0) > (l.wp || 0)) { l.wrap = r.wrap; l.wp = r.wp || 0; }   // hier gesperrt: das weitere Päckchen gilt
+    }
   }
   { const seen = new Set(); l.pu = [...(l.pu || []), ...(r.pu || [])].filter(e => e && !seen.has(e.t) && seen.add(e.t)).slice(-300); }
   const run = S.run[l.id];
@@ -356,7 +375,7 @@ async function doSave() {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const blobs = await accountBlobs();
-      const body = { ...blobs, expected_version: S.version };
+      const body = { ...blobs, expected_version: S.version, cv: CLIENT_VER };
       if (work) body.work = work;
       const r = await api("PUT", "/api/v2/account", { auth: true, keepalive: true, json: body });
       if (sid !== S.sid) return false;
@@ -367,6 +386,7 @@ async function doSave() {
       return true;
     } catch (e) {
       if (sid !== S.sid) return false;
+      if (e.status === 426) { needReload(); break; }
       if (e.status === 428) {
         // Das Konto wächst in eine größere Stufe: einmalige Rechenaufgabe.
         await loadConfig();
@@ -376,7 +396,7 @@ async function doSave() {
         continue;
       }
       if (e.status !== 409) {
-        if (String(e.message) === "too large") { setSync("Konto ist voll"); if (!_saveWarned) toast("Der Speicher für behaltene Verläufe ist voll. Bitte in einem Kanal „Verlauf nicht mehr behalten“ wählen.", "err"); _saveWarned = true; }
+        if (String(e.message) === "too large") { setSync("Konto ist voll"); if (!_saveWarned) toast("Der Speicher für behaltene Verläufe ist voll. Bitte in einem Chat-Kanal „Verlauf nicht mehr behalten“ wählen.", "err"); _saveWarned = true; }
         break;
       }
       // Ein anderes Gerät hat gespeichert: Stand holen und zusammenführen.
@@ -749,6 +769,16 @@ async function startSession() {
   renderList();
   startLoops();
 }
+// Fassung dieser App. Der Server nimmt Speicherungen älterer Fassungen nicht mehr an,
+// damit ein altes, noch offenes Fenster keine neueren Angaben überschreibt.
+const CLIENT_VER = 1;
+let _reloadTold = false;
+function needReload() {
+  setSync("Bitte Seite neu laden");
+  if (_reloadTold) return;
+  _reloadTold = true;
+  toast("Es gibt eine neue Fassung von chatmesh. Bitte die Seite neu laden: Du bleibst angemeldet und gibst nur deinen Code ein.", "err");
+}
 function setSync(text) { const e = $("#sync-state"); if (e) e.textContent = text; }
 
 // =========================================================================
@@ -889,8 +919,11 @@ async function onMatch(tag, info, block) {
   if (info.kind === "ans") {
     if (!c.pend) return;
     if (c.pend.exp <= nowSec()) { expireInvites(); return; }
-    if (r.ps) await completeInvite(c, block, r.ps);
-    else { c.pend.ans = C.b64(block); saveSoon(); renderList(); toast("Jemand ist „" + c.name + "“ beigetreten. Kanal antippen und Passwort eingeben.", "ok"); }
+    let ps = r.ps;
+    if (!ps && noPw(c)) { try { ps = await unsealPending(c, ""); } catch (e) { ps = null; } }
+    if (!c.pend) return;
+    if (ps) await completeInvite(c, block, ps);
+    else { c.pend.ans = C.b64(block); saveSoon(); renderList(); toast("Jemand ist „" + c.name + "“ beigetreten. " + (noPw(c) ? "Chat-Kanal antippen zum Verbinden." : "Chat-Kanal antippen und Passwort eingeben."), "ok"); }
     return;
   }
   if (info.kind === "dis") {
@@ -1015,7 +1048,9 @@ async function handleIncoming(c, body) {
     const waited = Number.isFinite(body.__arr) ? (Date.now() - body.__arr) / 1000 : 0;
     const lateByClock = Number.isFinite(body.xu) && body.xu > 0 && nowSec() > body.xu + CLOCK_SLACK;
     const lateByWait = Number.isFinite(body.xd) && body.xd > 0 && waited > body.xd;
-    if (lateByClock || lateByWait) {
+    // Lag der Block schon fast die ganze Frist hier und ist sie nach der Uhr vorbei, gilt er ebenfalls als abgelaufen.
+    const lateNear = Number.isFinite(body.xd) && body.xd > 0 && waited > body.xd - 5 && Number.isFinite(body.xu) && body.xu > 0 && nowSec() > body.xu;
+    if (lateByClock || lateByWait || lateNear) {
       if (kind !== "text") { const gone = cleanAtt(body.a); if (gone) dropAttachment(gone.t); }
       return null;
     }
@@ -1048,7 +1083,7 @@ async function handleIncoming(c, body) {
   }
   if (t === "clr") {
     // Geleert wurde schon vor dem Öffnen der Nachrichten (applyPendingClear).
-    toast("Dein Gegenüber hat alle Nachrichten in diesem Kanal gelöscht.");
+    toast("Dein Gegenüber hat alle Nachrichten in diesem Chat-Kanal gelöscht.");
     return null;
   }
   if (t === "req" && (body.k === "keep" || body.k === "shots")) {
@@ -1123,7 +1158,7 @@ function reserveNumbers(c, key) {
 async function sendObj(c, obj, lane = "") {
   const r = runOf(c);
   const kMsg = r.kMsg, kDel = r.kDel, ch = r.ch;
-  if (!kMsg || !ch) throw new Error("Kanal ist gesperrt");
+  if (!kMsg || !ch) throw new Error("Chat-Kanal ist gesperrt");
   const sid = S.sid;
   const key = lane ? "cn" : "sn";
   const kt = C.unb64(c.kt), dir = c.dir + lane;
@@ -1133,7 +1168,7 @@ async function sendObj(c, obj, lane = "") {
     c[key] = n + 1;
     saveLazy();
     const mk = await chainUse(ch[dir], n, false);
-    if (!mk) throw new Error("Senden nicht möglich. Bitte den Kanal schließen und neu öffnen.");
+    if (!mk) throw new Error("Senden nicht möglich. Bitte den Chat-Kanal schließen und neu öffnen.");
     r.chDirty = true;
     const block = await C.sealJson(mk, obj, C.BLOCK);
     const code = await pilePost(await C.msgTag(kt, dir, n), block, await C.msgDelToken(kDel, dir, n));
@@ -1162,7 +1197,7 @@ function sendText(c, text) {
 
 async function deliver(c, m, obj, canRetry) {
   const r = runOf(c);
-  const kDel = r.kDel, kt = C.unb64(c.kt);       // jetzt festhalten: der Kanal kann gleich gesperrt werden
+  const kDel = r.kDel, kt = C.unb64(c.kt);       // jetzt festhalten: der Chat-Kanal kann gleich gesperrt werden
   // Frist für "ungeöffnet": beginnt mit dem Senden (auch beim Wiederholen neu).
   if (obj.xu) {
     obj.xd = S.acct.set.unread > 0 ? S.acct.set.unread : UNREAD_MIN;
@@ -1457,13 +1492,26 @@ function chainMerge(mine, other) {
 }
 // Schreibt den aktuellen Stand der Ketten zurück in das mit dem Kanal-Passwort
 // verpackte Päckchen im Konto. Je Kanal läuft immer nur ein Zurückschreiben.
+// Chat-Kanal ohne eigenes Passwort: Statt eines Passworts verschließt ein Zufalls-Schlüssel
+// das Päckchen. Er liegt im Konto, das nur mit den 12 Wörtern lesbar ist.
+function noPw(c) { return !!(c && (c.pend ? c.pend.n : (c.wrap && c.wrap.n))); }
+function wrapVer(c) { return (c && c.wrap && c.wrap.v) || 0; }
+async function wrapKeyFor(password, salt, nk) { return nk ? C.unb64(nk) : await C.passwordKey(password, salt); }
+
 function rewrap(c, k) {
   const r = S.run[c.id];
   const prev = (r && r.rewrapP) || Promise.resolve();
   const job = prev.then(async () => {
+    // Passt der Schlüssel nicht (mehr) zum Päckchen im Konto, etwa weil das Passwort
+    // inzwischen geändert wurde, wird nichts geschrieben. Erkannt wird das am Salz.
+    if (chan(c.id) !== c || !c.wrap || !k.ws || k.ws !== c.wrap.s) return;
     const payload = { h: C.b64(k.kMsg), d: C.b64(k.kDel), o: k.own, ch: k.ch };
-    const wrap = await C.wrapWithKey(k.pwKey, C.unb64(c.wrap.s), C.utf8(JSON.stringify(payload)));
-    if (chan(c.id) === c) { c.wrap = wrap; c.wp = chainProgress(k.ch); }
+    const wrap = await C.wrapWithKey(k.pwKey, C.unb64(k.ws), C.utf8(JSON.stringify(payload)));
+    if (chan(c.id) === c && c.wrap && k.ws === c.wrap.s) {
+      wrap.v = wrapVer(c);
+      if (c.wrap.n) wrap.n = c.wrap.n;
+      c.wrap = wrap; c.wp = chainProgress(k.ch);
+    }
   });
   if (r) r.rewrapP = job.catch(() => {});
   return job;
@@ -1476,18 +1524,19 @@ async function flushChains() {
     const r = S.run[c.id];
     if (!r || !r.chDirty || !r.pwKey || !r.ch || !r.kMsg || c.pend) continue;
     r.chDirty = false;
-    try { await rewrap(c, { kMsg: r.kMsg, kDel: r.kDel, own: r.own, pwKey: r.pwKey, ch: JSON.parse(JSON.stringify(r.ch)) }); } catch (e) { r.chDirty = true; }
+    try { await rewrap(c, { kMsg: r.kMsg, kDel: r.kDel, own: r.own, pwKey: r.pwKey, ws: r.ws, ch: JSON.parse(JSON.stringify(r.ch)) }); } catch (e) { r.chDirty = true; }
   }
 }
 
 // Öffnet die verpackten Kanal-Schlüssel mit dem Kanal-Passwort.
 async function unwrapKeys(c, password) {
   let plain, pwKey;
+  const w = c.wrap;                 // genau dieses Päckchen; das Konto kann sich währenddessen ändern
   try {
-    pwKey = await C.passwordKey(password, C.unb64(c.wrap.s));
-    plain = JSON.parse(C.fromUtf8(await C.open(pwKey, C.unb64(c.wrap.c))));
-  } catch (e) { throw new Error("Falsches Passwort."); }
-  const out = { kDel: C.unb64(plain.d), own: plain.o, pwKey, migrated: false };
+    pwKey = await wrapKeyFor(password, C.unb64(w.s), w.n);
+    plain = JSON.parse(C.fromUtf8(await C.open(pwKey, C.unb64(w.c))));
+  } catch (e) { throw new Error(w.n ? "Dieser Chat-Kanal lässt sich gerade nicht öffnen." : "Falsches Passwort."); }
+  const out = { kDel: C.unb64(plain.d), own: plain.o, pwKey, ws: w.s, migrated: false };
   if (plain.ch && plain.h) {
     out.kMsg = C.unb64(plain.h);          // Schlüssel nur für einen behaltenen Verlauf
     out.ch = plain.ch;
@@ -1509,10 +1558,48 @@ async function unwrapKeys(c, password) {
 async function unlock(c, password) {
   const r = runOf(c);
   if (r.rewrapP) { try { await r.rewrapP; } catch (e) {} }
-  const k = await unwrapKeys(c, password);
-  r.kMsg = k.kMsg; r.kDel = k.kDel; r.own = k.own; r.ch = k.ch; r.pwKey = k.pwKey;
+  // Hat ein anderes Gerät das Päckchen währenddessen ersetzt, wird mit dem neuen noch einmal geöffnet.
+  let k = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const w = c.wrap;
+    const got = await unwrapKeys(c, password);
+    if (chan(c.id) !== c || c.pend) throw new Error("Diesen Chat-Kanal gibt es nicht mehr.");
+    if (c.wrap === w || (c.wrap && c.wrap.s === got.ws && c.wrap.c === w.c)) { k = got; break; }
+  }
+  if (!k) throw new Error("Dieser Chat-Kanal wurde gerade auf einem anderen Gerät geändert. Bitte noch einmal öffnen.");
+  r.kMsg = k.kMsg; r.kDel = k.kDel; r.own = k.own; r.ch = k.ch; r.pwKey = k.pwKey; r.ws = k.ws;
   r.chDirty = !!k.migrated;
   if (k.migrated) saveSoon();
+}
+
+async function setChannelPassword(c, newPw) {
+  const r = S.run[c.id];
+  if (!r || !r.ch || !r.kMsg || !r.pwKey || c.pend) throw new Error("Bitte den Chat-Kanal erst öffnen.");
+  const salt = C.rand(16);
+  const nk = newPw ? null : C.b64(C.rand(32));
+  const key = await wrapKeyFor(newPw, salt, nk);
+  const prev = r.rewrapP || Promise.resolve();
+  const job = prev.then(async () => {
+    if (chan(c.id) !== c || S.run[c.id] !== r || !r.ch || !r.kMsg) throw new Error("Bitte den Chat-Kanal erst öffnen.");
+    const ver = wrapVer(c);
+    const progress = chainProgress(r.ch);
+    const payload = { h: C.b64(r.kMsg), d: C.b64(r.kDel), o: r.own, ch: r.ch };
+    const wrap = await C.wrapWithKey(key, salt, C.utf8(JSON.stringify(payload)));
+    if (chan(c.id) !== c || wrapVer(c) !== ver) throw new Error("Das Passwort wurde gerade auf einem anderen Gerät geändert. Bitte noch einmal versuchen.");
+    wrap.v = ver + 1;
+    if (nk) wrap.n = nk;
+    c.wrap = wrap; c.wp = progress;
+    // Ist der Chat-Kanal noch offen, gilt ab jetzt der neue Schlüssel; der Stand der Ketten wird gleich noch einmal gesichert.
+    if (r.ch && r.kMsg) { r.pwKey = key; r.ws = wrap.s; r.chDirty = true; }
+  });
+  r.rewrapP = job.catch(() => {});
+  await job;
+  // Die Änderung gilt hier bereits. Klappt das Sichern gerade nicht, wird es nachgeholt.
+  const saved = await saveAccount();
+  // Hat gleichzeitig ein anderes Gerät geändert und dessen Stand gilt, ist diese Änderung verworfen.
+  if (chan(c.id) !== c || !c.wrap || c.wrap.s !== C.b64(salt)) return "lost";
+  if (!saved) { saveSoon(); return "later"; }
+  return "ok";
 }
 
 function lockKeys(c) {
@@ -1520,10 +1607,10 @@ function lockKeys(c) {
   if (!r) return;
   // Vor dem Vergessen den Stand der Ketten sichern.
   if (r.chDirty && r.pwKey && r.ch && r.kMsg && !c.pend) {
-    const snap = { kMsg: r.kMsg, kDel: r.kDel, own: r.own, pwKey: r.pwKey, ch: JSON.parse(JSON.stringify(r.ch)) };
+    const snap = { kMsg: r.kMsg, kDel: r.kDel, own: r.own, pwKey: r.pwKey, ws: r.ws, ch: JSON.parse(JSON.stringify(r.ch)) };
     rewrap(c, snap).then(() => { saveSoon(); }).catch(() => {});
   }
-  r.kMsg = null; r.kDel = null; r.own = null; r.ch = null; r.pwKey = null; r.chDirty = false;
+  r.kMsg = null; r.kDel = null; r.own = null; r.ch = null; r.pwKey = null; r.ws = null; r.chDirty = false;
 }
 
 function openChannel(id) {
@@ -1553,7 +1640,14 @@ function openChannel(id) {
   // Ist die Kanal-Sperre abgeschaltet, bleibt der Kanal nach der ersten
   // Passwort-Eingabe für die Dauer der Anmeldung offen (nur im Arbeitsspeicher).
   if (r.kMsg) { go(); return; }
-  askPassword("Kanal „" + c.name + "“ öffnen", "Dein Passwort für diesen Kanal", async (pw) => { await unlock(c, pw); go(); });
+  if (noPw(c)) {
+    // Ohne eigenes Passwort öffnet sich der Chat-Kanal direkt.
+    if (r.opening) return;
+    r.opening = true;
+    unlock(c, "").then(() => { r.opening = false; if (chan(id) === c) go(); }, (e) => { r.opening = false; toast(e.message || "Öffnen nicht möglich", "err"); });
+    return;
+  }
+  askPassword("Chat-Kanal „" + c.name + "“ öffnen", "Dein Passwort für diesen Chat-Kanal", async (pw) => { await unlock(c, pw); go(); });
 }
 
 // Verlässt den offenen Kanal. Ohne „Verlauf behalten“ ist danach alles weg,
@@ -1594,10 +1688,10 @@ async function postDissolve(own, reason) {
 }
 function reasonText(name, reason, mine) {
   if (reason === "shot") return mine
-    ? `Screenshot-Versuch erkannt. Der Kanal „${name}“ wurde bei euch beiden aufgelöst.`
-    : `Im Kanal „${name}“ wurde versucht, einen Screenshot zu machen. Der Kanal wurde aufgelöst.`;
-  if (reason === "wipe") return `Dein Gegenüber im Kanal „${name}“ hat sein Konto gelöscht. Der Kanal wurde aufgelöst.`;
-  return mine ? `Kanal „${name}“ gelöscht.` : `Der Kanal „${name}“ wurde vom Gegenüber gelöscht.`;
+    ? `Screenshot-Versuch erkannt. Der Chat-Kanal „${name}“ wurde bei euch beiden aufgelöst.`
+    : `Im Chat-Kanal „${name}“ wurde versucht, einen Screenshot zu machen. Der Chat-Kanal wurde aufgelöst.`;
+  if (reason === "wipe") return `Dein Gegenüber im Chat-Kanal „${name}“ hat sein Konto gelöscht. Der Chat-Kanal wurde aufgelöst.`;
+  return mine ? `Chat-Kanal „${name}“ gelöscht.` : `Der Chat-Kanal „${name}“ wurde vom Gegenüber gelöscht.`;
 }
 function dissolveLocal(c, reason, mine) {
   dropRuntime(c.id);
@@ -1654,7 +1748,7 @@ async function dissolvePart(kDis, dir) {
 // Legt die Schlüssel eines neuen Kanals ab: Marken-Schlüssel offen (damit
 // Ungelesenes auch bei gesperrtem Kanal gezählt werden kann), alles andere
 // verpackt mit dem Kanal-Passwort.
-async function installKeys(c, keys, pwKey, salt) {
+async function installKeys(c, keys, pwKey, salt, nk) {
   const own = await dissolvePart(keys.kDis, c.dir);
   c.kt = C.b64(keys.kTag);
   c.pd = await dissolvePart(keys.kDis, peerDir(c));
@@ -1663,17 +1757,19 @@ async function installKeys(c, keys, pwKey, salt) {
   const hist = await C.hkdf(keys.kMsg, "chatmesh2|history");
   const ch = await chainInit(keys.kMsg);
   c.wrap = await C.wrapWithKey(pwKey, salt, C.utf8(JSON.stringify({ h: C.b64(hist), d: C.b64(keys.kDel), o: own, ch })));
+  c.wrap.v = 0;                // Stand des Päckchens: steigt, wenn das Passwort wechselt (für zwei Geräte)
+  if (nk) c.wrap.n = nk;       // ohne eigenes Passwort
   c.wb = C.b64(await C.boxSeal(C.unb64(S.acct.wp), C.utf8(JSON.stringify({ t: own.t, k: own.k, d: own.d, kt: C.b64(keys.kTag), kd: C.b64(keys.kDel) }))));
   c.sym = keys.symbols;
   c.sn = 0; c.cn = 0; c.sr = 0; c.cr = 0; c.rn = 0; c.rc = 0; c.rp = []; c.rpc = [];
   c.keep = 0; c.shots = 0; c.rq = []; c.ro = []; c.hist = ""; c.rv = 0;
   c.vf = 0;      // Prüf-Zahl noch nicht verglichen
   c.cf = 0;      // Lösch-Grenze: ältere Nachrichten des Gegenübers werden verworfen
-  c.hv = 0;      // zählt, wie oft der Kanal geleert wurde (für zwei Geräte)
+  c.hv = 0;      // zählt, wie oft der Chat-Kanal geleert wurde (für zwei Geräte)
   c.ca = [];     // schon umgesetzte Lösch-Aufträge des Gegenübers
   c.pu = [];     // eigene Nachrichten, die nach einer Frist ungeöffnet gelöscht werden
   c.wp = 0;      // wie weit die Schlüssel-Ketten im gespeicherten Päckchen sind (für zwei Geräte)
-  return { own, kMsg: hist, kDel: keys.kDel, ch, pwKey };
+  return { own, kMsg: hist, kDel: keys.kDel, ch, pwKey, ws: c.wrap.s };
 }
 
 async function createChannel(name, password, keepReq) {
@@ -1681,22 +1777,24 @@ async function createChannel(name, password, keepReq) {
   const ik = await C.inviteKeys(I);
   const ex = await C.newExchangeKey();
   const salt = C.rand(16);
-  const pwKey = await C.passwordKey(password, salt);
+  const nk = password ? null : C.b64(C.rand(32));
+  const pwKey = await wrapKeyFor(password, salt, nk);
   const kr = keepReq ? 1 : 0;
   const offer = await C.sealJson(ik.key, { t: "offer", p: C.b64(ex.pub), kr }, C.BLOCK);
   // Das Lösch-Geheimnis für das Angebot kennt nur dieses Gerät. Wer den
   // Einmal-Schlüssel abfängt, kann das Angebot deshalb nicht austauschen.
   const delA = C.hex(C.rand(16));
   const code = await pilePost(ik.tagA, offer, delA);
-  if (code !== 200) throw new Error("Der Kanal konnte gerade nicht angelegt werden. Bitte noch einmal versuchen.");
+  if (code !== 200) throw new Error("Der Chat-Kanal konnte gerade nicht angelegt werden. Bitte noch einmal versuchen.");
   // Die Geheimnisse der Einladung liegen im Konto nur verpackt mit dem Kanal-Passwort.
   const sealed = await C.seal(pwKey, C.utf8(JSON.stringify({ inv: C.b64(I), priv: ex.privJwk, pub: C.b64(ex.pub), kr })));
   const c = {
     id: C.hex(C.rand(8)), name, dir: "a", rv: 0,
     pend: { ta: ik.tagA, da: delA, tb: ik.tagB, exp: nowSec() + INVITE_SECONDS, s: C.b64(salt), c: C.b64(sealed) },
   };
+  if (nk) c.pend.n = nk;
   S.acct.ch.unshift(c);
-  runOf(c).ps = { I, priv: ex.privJwk, pub: ex.pub, kr, pwKey, salt };
+  runOf(c).ps = { I, priv: ex.privJwk, pub: ex.pub, kr, pwKey, salt, nk };
   await refreshExpect(c);
   await saveAccount();
   renderList();
@@ -1706,11 +1804,12 @@ async function createChannel(name, password, keepReq) {
 // Öffnet die verpackten Geheimnisse einer offenen Einladung mit dem Kanal-Passwort.
 async function unsealPending(c, password) {
   const salt = C.unb64(c.pend.s);
-  const pwKey = await C.passwordKey(password, salt);
+  const nk = c.pend.n || null;
+  const pwKey = await wrapKeyFor(password, salt, nk);
   let plain;
   try { plain = JSON.parse(C.fromUtf8(await C.open(pwKey, C.unb64(c.pend.c)))); }
-  catch (e) { throw new Error("Falsches Passwort."); }
-  const ps = { I: C.unb64(plain.inv), priv: plain.priv, pub: C.unb64(plain.pub), kr: plain.kr ? 1 : 0, pwKey, salt };
+  catch (e) { throw new Error(nk ? "Der Einmal-Schlüssel lässt sich gerade nicht öffnen." : "Falsches Passwort."); }
+  const ps = { I: C.unb64(plain.inv), priv: plain.priv, pub: C.unb64(plain.pub), kr: plain.kr ? 1 : 0, pwKey, salt, nk };
   runOf(c).ps = ps;
   return ps;
 }
@@ -1724,17 +1823,17 @@ async function completeInvite(c, block, ps) {
     const ans = await C.openJson(ik.key, block, C.BLOCK);
     const pubB = C.unb64(String(ans.p || ""));
     const keys = await C.channelKeys(await C.channelRoot(ps.priv, pubB, ps.I, ps.pub, pubB));
-    const inst = await installKeys(c, keys, ps.pwKey, ps.salt);
+    const inst = await installKeys(c, keys, ps.pwKey, ps.salt, ps.nk);
     c.ro = ps.kr ? ["keep"] : [];          // die Anfrage steckte schon im Einmal-Code
     delete c.pend;
     r.ps = null;
-    if (!S.acct.set.lockOn) { r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.chDirty = false; }
+    if (!S.acct.set.lockOn) { r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.ws = inst.ws; r.chDirty = false; }
     await refreshExpect(c);
     await saveAccount();
     // Die beiden Blöcke des Einmal-Codes später unauffällig entfernen.
     const wait = randBetween(15000, 90000);
     queueDelete(offerTag, offerDel, wait);      // die Antwort entfernt das Gegenüber selbst
-    toast("Kanal „" + c.name + "“ ist verbunden.", "ok");
+    toast("Chat-Kanal „" + c.name + "“ ist verbunden.", "ok");
     if ($("#sheet .qr-canvas")) closeSheet();
     renderList();
     await matchPile();
@@ -1765,9 +1864,10 @@ async function joinChannel(codeText, name, password) {
   let keys;
   try { keys = await C.channelKeys(await C.channelRoot(ex.privJwk, pubA, I, pubA, ex.pub)); } catch (e) { throw new Error(invalid); }
   const salt = C.rand(16);
-  const pwKey = await C.passwordKey(password, salt);
+  const nk = password ? null : C.b64(C.rand(32));
+  const pwKey = await wrapKeyFor(password, salt, nk);
   const c = { id: C.hex(C.rand(8)), name, dir: "b" };
-  const inst = await installKeys(c, keys, pwKey, salt);
+  const inst = await installKeys(c, keys, pwKey, salt, nk);
   if (offer.kr) c.rq = ["keep"];
   const answer = await C.sealJson(ik.key, { t: "answer", p: C.b64(ex.pub) }, C.BLOCK);
   const delB = C.hex(C.rand(16));
@@ -1778,7 +1878,7 @@ async function joinChannel(codeText, name, password) {
   pileDrop(ik.tagA);
   S.acct.ch.unshift(c);
   const r = runOf(c);
-  r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.chDirty = false;
+  r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.ws = inst.ws; r.chDirty = false;
   await refreshExpect(c);
   await saveAccount();
   renderList();
@@ -2041,6 +2141,7 @@ function formSheet(title, opts) {
     try {
       await opts.onSubmit(values, inputs);
     } catch (ex) {
+      if (opts.keepPw) for (const [k, inp] of Object.entries(inputs)) if (inp.classList.contains("pw") && inp.isConnected) inp.value = values[k];
       err.textContent = String(ex && ex.message || ex);
       err.className = "sheet-error";
       ok.disabled = false;
@@ -2067,23 +2168,25 @@ function askPassword(title, label, onPassword, submit) {
 // FENSTER: Neuer Kanal, Beitreten, Code anzeigen, QR
 // =========================================================================
 function checkPw(v) {
-  if (!v.pw || v.pw.length < PW_MIN) throw new Error("Das Kanal-Passwort braucht mindestens " + PW_MIN + " Zeichen.");
+  if (!v.pw && !v.pw2) return;          // freiwillig: ohne eigenes Passwort
+  if (!v.pw || v.pw.length < PW_MIN) throw new Error("Das Passwort für den Chat-Kanal braucht mindestens " + PW_MIN + " Zeichen.");
   if (v.pw !== v.pw2) throw new Error("Die beiden Passwörter stimmen nicht überein.");
 }
 
 function newChannelSheet() {
-  formSheet("Neuer Kanal", {
+  formSheet("Neuer Chat-Kanal", {
     info: "Du bekommst einen Einmal-Schlüssel. Den gibst du deinem Gegenüber: als QR-Code zum Scannen oder als Schlüssel zum Kopieren. Er gilt 24 Stunden und nur ein einziges Mal.",
     fields: [
-      { name: "name", label: "Name für diesen Kanal (frei wählbar, siehst nur du)", max: 40 },
-      { name: "pw", type: "password", label: "Dein eigenes Passwort, um auf diesen Kanal zuzugreifen", hint: "Nur du kennst es. Du brauchst es jedes Mal, wenn du diesen Kanal öffnest oder löschst. Mit deinen 12 Anmeldewörtern hat es nichts zu tun." },
-      { name: "pw2", type: "password", label: "Passwort wiederholen" },
+      { name: "name", label: "Name für diesen Chat-Kanal (frei wählbar, siehst nur du)", max: 40 },
+      { name: "pw", type: "password", label: "Dein eigenes Passwort, um auf diesen Chat-Kanal zuzugreifen (freiwillig)", hint: "Mit Passwort: Nur du kennst es, und du brauchst es, wenn du diesen Chat-Kanal öffnest oder löschst. Mit deinen 12 Anmeldewörtern hat es nichts zu tun. Leer lassen: Der Chat-Kanal öffnet sich ohne Passwort, dann genügen deine 12 Anmeldewörter, um ihn zu öffnen." },
+      { name: "pw2", type: "password", label: "Passwort wiederholen (nur wenn du eins vergibst)" },
       { name: "keep", type: "checkbox", label: "Verlauf behalten anfragen (dein Gegenüber muss zustimmen, sonst wird wie üblich gelöscht)" },
     ],
-    submit: "Kanal anlegen",
-    busy: "Kanal wird angelegt …",
+    submit: "Chat-Kanal anlegen",
+    busy: "Chat-Kanal wird angelegt …",
+    keepPw: true,
     onSubmit: async (v) => {
-      const name = (v.name || "").trim() || "Kanal";
+      const name = (v.name || "").trim() || "Chat";
       checkPw(v);
       const c = await createChannel(name.slice(0, 40), v.pw, v.keep);
       showInvite(c);
@@ -2106,10 +2209,14 @@ function drawQr(canvas, text) {
 
 async function showInvite(c) {
   if (!c.pend) return;
-  const ps = runOf(c).ps;
+  let ps = runOf(c).ps;
+  if (!ps && noPw(c)) {
+    try { ps = await unsealPending(c, ""); } catch (e) { toast(e.message, "err"); return; }
+    if (!c.pend) return;
+  }
   if (!ps) {
     // In einer neuen Sitzung ist der Einmal-Code nur mit dem Kanal-Passwort lesbar.
-    askPassword("Einmal-Schlüssel für „" + c.name + "“", "Dein Passwort für diesen Kanal", async (pw) => { await unsealPending(c, pw); setTimeout(() => showInvite(c), 0); }, "Anzeigen");
+    askPassword("Einmal-Schlüssel für „" + c.name + "“", "Dein Passwort für diesen Chat-Kanal", async (pw) => { await unsealPending(c, pw); setTimeout(() => showInvite(c), 0); }, "Anzeigen");
     return;
   }
   // Ein einziger Schlüssel am Stück: lässt sich als Ganzes kopieren und einfügen.
@@ -2120,7 +2227,7 @@ async function showInvite(c) {
   const copy = el("button", "primary small", "Schlüssel kopieren");
   copy.type = "button";
   copy.addEventListener("click", () => { navigator.clipboard.writeText(key).then(() => toast("Schlüssel kopiert", "ok")).catch(() => toast("Kopieren nicht möglich", "err")); });
-  const wait = el("p", "sheet-info center", "Warte auf den Beitritt … Der Kanal erscheint von selbst, sobald dein Gegenüber den Schlüssel eingegeben hat.");
+  const wait = el("p", "sheet-info center", "Warte auf den Beitritt … Der Chat-Kanal erscheint von selbst, sobald dein Gegenüber den Schlüssel eingegeben hat.");
   const drop = menuItem("Einmal-Schlüssel zurückziehen", "Er wird sofort ungültig.", true, () => dissolveChannel(c, "deleted"));
   openSheetNodes("Einmal-Schlüssel für „" + c.name + "“", [
     infoNode("Lass dein Gegenüber diesen QR-Code scannen, oder kopiere den Schlüssel und gib ihn weiter. Gültig 24 Stunden, nur ein einziges Mal."),
@@ -2139,7 +2246,8 @@ function openPending(c) {
   };
   const ps = runOf(c).ps;
   if (ps) { finish(ps).catch(e => toast(e.message, "err")); return; }
-  askPassword("Kanal „" + c.name + "“ verbinden", "Dein Passwort für diesen Kanal", async (pw) => { await finish(await unsealPending(c, pw)); }, "Verbinden");
+  if (noPw(c)) { unsealPending(c, "").then(finish).catch(e => toast(e.message, "err")); return; }
+  askPassword("Chat-Kanal „" + c.name + "“ verbinden", "Dein Passwort für diesen Chat-Kanal", async (pw) => { await finish(await unsealPending(c, pw)); }, "Verbinden");
 }
 
 let _scan = null;
@@ -2181,26 +2289,27 @@ function joinChannelSheet() {
   const scanWrap = el("div", "scan-wrap");
   scanWrap.appendChild(scanBtn);
   scanWrap.appendChild(video);
-  const inputs = formSheet("Kanal beitreten", {
+  const inputs = formSheet("Chat-Kanal beitreten", {
     info: "Gib den Einmal-Schlüssel ein, den du von deinem Gegenüber bekommen hast: QR-Code scannen oder Schlüssel einfügen.",
     noFocus: true,
     fields: [
       { node: scanWrap },
       { name: "code", label: "Einmal-Schlüssel", placeholder: "Schlüssel hier einfügen", max: 60 },
-      { name: "name", label: "Name für diesen Kanal (frei wählbar, siehst nur du)", max: 40 },
-      { name: "pw", type: "password", label: "Dein eigenes Passwort, um auf diesen Kanal zuzugreifen", hint: "Nur du kennst es. Dein Gegenüber hat sein eigenes. Du brauchst es jedes Mal, wenn du diesen Kanal öffnest oder löschst." },
-      { name: "pw2", type: "password", label: "Passwort wiederholen" },
+      { name: "name", label: "Name für diesen Chat-Kanal (frei wählbar, siehst nur du)", max: 40 },
+      { name: "pw", type: "password", label: "Dein eigenes Passwort, um auf diesen Chat-Kanal zuzugreifen (freiwillig)", hint: "Mit Passwort: Nur du kennst es, und du brauchst es, wenn du diesen Chat-Kanal öffnest oder löschst. Dein Gegenüber entscheidet das für sich selbst. Leer lassen: Der Chat-Kanal öffnet sich ohne Passwort, dann genügen deine 12 Anmeldewörter, um ihn zu öffnen." },
+      { name: "pw2", type: "password", label: "Passwort wiederholen (nur wenn du eins vergibst)" },
     ],
     submit: "Beitreten",
-    busy: "Kanal wird verbunden …",
+    busy: "Chat-Kanal wird verbunden …",
+    keepPw: true,
     onCancel: stopScan,
     onSubmit: async (v) => {
-      const name = (v.name || "").trim() || "Kanal";
+      const name = (v.name || "").trim() || "Chat";
       checkPw(v);
       stopScan();
       const c = await joinChannel(v.code, name.slice(0, 40), v.pw);
       closeSheet();
-      toast("Kanal „" + c.name + "“ ist verbunden.", "ok");
+      toast("Chat-Kanal „" + c.name + "“ ist verbunden.", "ok");
       openChannel(c.id);
     },
   });
@@ -2284,8 +2393,8 @@ function settingsSheet() {
       { name: "uh", type: "number", grid: true, label: "Stunden", value: Math.floor(u % 86400 / 3600) },
       { name: "um", type: "number", grid: true, label: "Minuten", value: Math.floor(u % 3600 / 60) },
       { name: "us", type: "number", grid: true, label: "Sekunden", value: u % 60 },
-      { node: el("div", "sheet-section", "Kanal-Sperre") },
-      { name: "lockOn", type: "checkbox", label: "Kanal-Passwort jedes Mal verlangen: beim Öffnen und immer, wenn du einen Kanal verlassen hast. Ausgeschaltet fragt jeder Kanal nur einmal je Anmeldung.", value: set.lockOn },
+      { node: el("div", "sheet-section", "Chat-Kanal-Sperre") },
+      { name: "lockOn", type: "checkbox", label: "Passwort des Chat-Kanals jedes Mal verlangen: beim Öffnen und immer, wenn du einen Chat-Kanal verlassen hast. Ausgeschaltet fragt jeder Chat-Kanal nur einmal je Anmeldung. Betrifft nur Chat-Kanäle, für die du ein Passwort vergeben hast.", value: set.lockOn },
       { node: infoNode("Lädst du die Seite neu, bleibst du angemeldet und gibst nur deinen Code ein. Schließt du das Fenster, bist du abgemeldet. chatmesh beobachtet nicht, ob du die Maus bewegst oder tippst.") },
       { node: codeChangeButton() },
     ],
@@ -2343,8 +2452,8 @@ function askRequest(c) {
   no.addEventListener("click", () => answer(false));
   openSheetNodes(kind === "keep" ? "Verlauf behalten?" : "Screenshots erlauben?", [
     infoNode(kind === "keep"
-      ? "Dein Gegenüber möchte, dass der Verlauf dieses Kanals behalten wird. Dann bleiben Nachrichten bei euch beiden gespeichert (verschlüsselt, nur für euch lesbar), statt zu verschwinden. Bilder, Videos und Dateien bleiben dabei etwa 5 Wochen abrufbar. Jeder von euch kann den Verlauf jederzeit bei beiden wieder löschen, ohne den anderen zu fragen."
-      : "Dein Gegenüber möchte in diesem Kanal Screenshots erlauben. Dann wird der Kanal bei einem Screenshot nicht mehr aufgelöst."),
+      ? "Dein Gegenüber möchte, dass der Verlauf dieses Chat-Kanals behalten wird. Dann bleiben Nachrichten bei euch beiden gespeichert (verschlüsselt, nur für euch lesbar), statt zu verschwinden. Bilder, Videos und Dateien bleiben dabei etwa 5 Wochen abrufbar. Jeder von euch kann den Verlauf jederzeit bei beiden wieder löschen, ohne den anderen zu fragen."
+      : "Dein Gegenüber möchte in diesem Chat-Kanal Screenshots erlauben. Dann wird der Chat-Kanal bei einem Screenshot nicht mehr aufgelöst."),
     no, yes,
   ], true);
 }
@@ -2369,11 +2478,11 @@ async function endMode(c, kind) {
 
 function channelMenu(c) {
   const items = [];
-  items.push(menuItem("Alle Nachrichten bei beiden löschen", "Sofort und ohne Zustimmung deines Gegenübers. Gilt für alles: Geöffnetes, noch nicht Geöffnetes und einen behaltenen Verlauf. Der Kanal bleibt bestehen.", true, () => confirmClear(c)));
+  items.push(menuItem("Alle Nachrichten bei beiden löschen", "Sofort und ohne Zustimmung deines Gegenübers. Gilt für alles: Geöffnetes, noch nicht Geöffnetes und einen behaltenen Verlauf. Der Chat-Kanal bleibt bestehen.", true, () => confirmClear(c)));
   if (c.keep) items.push(menuItem("Verlauf nicht mehr behalten", "Sofort und ohne Zustimmung deines Gegenübers. Der gespeicherte Verlauf wird bei euch beiden gelöscht, ab dann verschwinden Nachrichten wieder.", false, () => endMode(c, "keep")));
   else items.push(menuItem("Verlauf behalten anfragen", "Standard ist: alles verschwindet. Dein Gegenüber muss zustimmen. Abschalten kann es später jeder von euch allein.", false, () => requestMode(c, "keep")));
   if (c.shots) items.push(menuItem("Screenshots wieder verbieten", "Sofort und ohne Zustimmung deines Gegenübers.", false, () => endMode(c, "shots")));
-  else items.push(menuItem("Screenshots erlauben anfragen", "Standard ist: Ein erkannter Screenshot-Versuch löst den Kanal bei euch beiden auf. Am Handy kann eine Webseite Screenshots nicht erkennen.", false, () => requestMode(c, "shots")));
+  else items.push(menuItem("Screenshots erlauben anfragen", "Standard ist: Ein erkannter Screenshot-Versuch löst den Chat-Kanal bei euch beiden auf. Am Handy kann eine Webseite Screenshots nicht erkennen.", false, () => requestMode(c, "shots")));
   const sym = el("div", "sheet-item static");
   sym.appendChild(el("span", "sheet-label", c.vf ? "Prüf-Zahl (geprüft)" : "Prüf-Zahl (noch nicht geprüft)"));
   sym.appendChild(el("span", "sym-row", c.sym || ""));
@@ -2381,34 +2490,69 @@ function channelMenu(c) {
   if (!c.vf) {
     const okBtn = el("button", "ghost small", "Die Zahl stimmt überein");
     okBtn.type = "button";
-    okBtn.addEventListener("click", () => { c.vf = 1; bump(c); saveSoon(); closeSheet(); renderChat(); toast("Kanal als geprüft markiert.", "ok"); });
+    okBtn.addEventListener("click", () => { c.vf = 1; bump(c); saveSoon(); closeSheet(); renderChat(); toast("Chat-Kanal als geprüft markiert.", "ok"); });
     sym.appendChild(okBtn);
   }
   items.push(sym);
-  items.push(menuItem("Kanal umbenennen", "", false, () => {
-    formSheet("Kanal umbenennen", {
+  items.push(menuItem("Chat-Kanal umbenennen", "", false, () => {
+    formSheet("Chat-Kanal umbenennen", {
       fields: [{ name: "name", label: "Neuer Name (siehst nur du)", value: c.name, max: 40 }],
       submit: "Speichern",
       onSubmit: async (v) => { c.name = ((v.name || "").trim() || c.name).slice(0, 40); bump(c); await saveAccount(); closeSheet(); renderList(); renderChat(); },
     });
   }));
-  items.push(menuItem("Kanal löschen", "Geht jederzeit, auch wenn der Kanal leer ist. Löscht den Kanal mit allem darin bei dir und bei deinem Gegenüber. Braucht dein Kanal-Passwort.", true, () => deleteChannelSheet(c)));
+  if (noPw(c)) items.push(menuItem("Passwort festlegen", "Dieser Chat-Kanal hat bei dir kein eigenes Passwort. Mit Passwort wird es beim Öffnen und beim Löschen verlangt.", false, () => passwordSheet(c)));
+  else items.push(menuItem("Passwort ändern oder entfernen", "Braucht dein bisheriges Passwort für diesen Chat-Kanal.", false, () => passwordSheet(c)));
+  items.push(menuItem("Chat-Kanal löschen", "Geht jederzeit, auch wenn der Chat-Kanal leer ist. Löscht den Chat-Kanal mit allem darin bei dir und bei deinem Gegenüber." + (noPw(c) ? "" : " Braucht dein Passwort für diesen Chat-Kanal."), true, () => deleteChannelSheet(c)));
   openSheetNodes(c.name, items);
 }
 
+// Passwort eines Chat-Kanals festlegen, ändern oder entfernen. Nur dieses Gerät und
+// dieses Konto sind betroffen; das Gegenüber hat sein eigenes (oder keins).
+function passwordSheet(c) {
+  const has = !noPw(c);
+  const fields = [];
+  if (has) fields.push({ name: "pw0", type: "password", label: "Bisheriges Passwort" });
+  fields.push({ name: "pw", type: "password", label: has ? "Neues Passwort (leer lassen: Passwort entfernen)" : "Neues Passwort", hint: (has ? "Wenn du eins vergibst: mindestens " : "Mindestens ") + PW_MIN + " Zeichen. Nur du kennst es." });
+  fields.push({ name: "pw2", type: "password", label: has ? "Neues Passwort wiederholen (nur wenn du eins vergibst)" : "Neues Passwort wiederholen" });
+  formSheet(has ? "Passwort ändern oder entfernen" : "Passwort festlegen", {
+    info: has
+      ? "Gilt für den Chat-Kanal „" + c.name + "“. Ohne Passwort öffnet er sich direkt, sobald du angemeldet bist: Dann genügen deine 12 Anmeldewörter."
+      : "Gilt für den Chat-Kanal „" + c.name + "“. Ab jetzt brauchst du das Passwort, wenn du ihn öffnest oder löschst. Es schützt ab jetzt, nicht rückwirkend.",
+    fields,
+    submit: "Speichern",
+    busy: "Wird gespeichert …",
+    keepPw: true,
+    onSubmit: async (v) => {
+      if (chan(c.id) !== c || c.pend) throw new Error("Diesen Chat-Kanal gibt es nicht mehr.");
+      if (has !== !noPw(c)) throw new Error("Das Passwort wurde inzwischen geändert. Bitte dieses Fenster schließen und neu öffnen.");
+      if (!has && !v.pw && !v.pw2) throw new Error("Bitte ein Passwort eingeben.");
+      checkPw(v);
+      if (has) await unwrapKeys(c, v.pw0 || "");
+      const res = await setChannelPassword(c, v.pw || "");
+      closeSheet();
+      if (res === "ok") toast(v.pw ? "Passwort gespeichert." : "Passwort entfernt.", "ok");
+      else if (res === "later") toast((v.pw ? "Passwort geändert." : "Passwort entfernt.") + " Gerade keine Verbindung: Die Sicherung wird nachgeholt.");
+      else toast("Auf einem anderen Gerät wurde gleichzeitig das Passwort geändert. Dessen Änderung gilt.", "err");
+      renderList();
+    },
+  });
+}
+
 function deleteChannelSheet(c) {
-  formSheet("Kanal „" + c.name + "“ löschen", {
-    info: "Der Kanal wird mit allem darin bei dir und bei deinem Gegenüber gelöscht: Nachrichten, Anhänge und ein behaltener Verlauf. Das geht jederzeit, auch wenn der Kanal leer ist, und lässt sich nicht rückgängig machen.",
-    fields: [{ name: "pw", type: "password", label: "Dein Passwort für diesen Kanal" }],
+  const has = !noPw(c);
+  formSheet("Chat-Kanal „" + c.name + "“ löschen", {
+    info: "Der Chat-Kanal wird mit allem darin bei dir und bei deinem Gegenüber gelöscht: Nachrichten, Anhänge und ein behaltener Verlauf. Das geht jederzeit, auch wenn der Chat-Kanal leer ist, und lässt sich nicht rückgängig machen.",
+    fields: has ? [{ name: "pw", type: "password", label: "Dein Passwort für diesen Chat-Kanal" }] : [],
     submit: "Endgültig löschen",
     danger: true,
     busy: "Wird geprüft …",
     onSubmit: async (v) => {
       // Nur mit dem Passwort lässt sich die Mitteilung ans Gegenüber überhaupt erzeugen.
-      const k = await unwrapKeys(c, v.pw);
-      if (!(await dissolveChannel(c, "deleted", k.own))) throw new Error("Keine Verbindung. Der Kanal wurde nicht gelöscht, bitte noch einmal versuchen.");
+      const k = await unwrapKeys(c, v.pw || "");
+      if (!(await dissolveChannel(c, "deleted", k.own))) throw new Error("Keine Verbindung. Der Chat-Kanal wurde nicht gelöscht, bitte noch einmal versuchen.");
       closeSheet();
-      toast("Kanal gelöscht", "ok");
+      toast("Chat-Kanal gelöscht", "ok");
     },
   });
 }
@@ -2443,7 +2587,7 @@ function confirmClear(c) {
   no.type = "button";
   no.addEventListener("click", closeSheet);
   openSheetNodes("Alle Nachrichten löschen?", [
-    infoNode("Alle Nachrichten in diesem Kanal verschwinden sofort bei dir und bei deinem Gegenüber: Geöffnetes, noch nicht Geöffnetes und ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
+    infoNode("Alle Nachrichten in diesem Chat-Kanal verschwinden sofort bei dir und bei deinem Gegenüber: Geöffnetes, noch nicht Geöffnetes und ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
     no, yes,
   ], true);
 }
@@ -2551,9 +2695,9 @@ function renderList() {
   let unread = 0;
   if (!S.acct.ch.length) {
     const e = el("div", "contact-empty");
-    e.appendChild(document.createTextNode("Noch keine Kanäle."));
+    e.appendChild(document.createTextNode("Noch keine Chat-Kanäle."));
     e.appendChild(document.createElement("br"));
-    e.appendChild(document.createTextNode("Lege einen neuen Kanal an oder tritt mit einem Einmal-Schlüssel bei."));
+    e.appendChild(document.createTextNode("Lege einen neuen Chat-Kanal an oder tritt mit einem Einmal-Schlüssel bei."));
     list.appendChild(e);
   }
   for (const c of S.acct.ch) {
@@ -2564,9 +2708,9 @@ function renderList() {
     meta.appendChild(el("div", "name is-nick", c.name));
     const line = el("div", "last-row");
     let sub = "Ende-zu-Ende verschlüsselt";
-    if (c.pend) sub = c.pend.ans ? "Beitritt da: antippen und Passwort eingeben" : "Wartet auf Beitritt (Einmal-Schlüssel anzeigen)";
+    if (c.pend) sub = c.pend.ans ? (noPw(c) ? "Beitritt da: antippen zum Verbinden" : "Beitritt da: antippen und Passwort eingeben") : "Wartet auf Beitritt (Einmal-Schlüssel anzeigen)";
     else if (c.id === S.active) sub = "geöffnet";
-    else if (!unlocked(c)) sub = "gesperrt";
+    else if (!unlocked(c) && !noPw(c)) sub = "mit Passwort gesperrt";
     line.appendChild(el("div", "last" + (c.pend ? " warn" : ""), sub));
     const waiting = r.wait.size;
     if (waiting > 0 && c.id !== S.active) { unread += waiting; line.appendChild(el("span", "unread", waiting > 99 ? "99+" : String(waiting))); }
@@ -2599,7 +2743,7 @@ function renderChat(forceBottom) {
   if (!c || !S.me) {
     stream.textContent = ""; header.textContent = ""; bar.hidden = true; composer.style.display = "none";
     document.body.classList.remove("no-select");
-    if (S.me) stream.appendChild(el("div", "empty", "Wähle links einen Kanal oder lege einen neuen an."));
+    if (S.me) stream.appendChild(el("div", "empty", "Wähle links einen Chat-Kanal oder lege einen neuen an."));
     return;
   }
   const r = runOf(c);
@@ -2699,7 +2843,7 @@ function mediaNode(c, m) {
     txt.appendChild(el("span", "file-size", (fmtSize(m.a.s) + " · verschlüsselt übertragen").replace(/^ · /, "")));
     btn.appendChild(txt);
     btn.addEventListener("click", () => {
-      if (!c.shots && !m.me) { toast("Speichern ist in diesem Kanal nicht erlaubt (wie Screenshots).", "err"); return; }
+      if (!c.shots && !m.me) { toast("Speichern ist in diesem Chat-Kanal nicht erlaubt (wie Screenshots).", "err"); return; }
       const a = document.createElement("a");
       a.href = m.url; a.download = m.k === "file" ? safeName(m.a.n) : "datei";
       document.body.appendChild(a); a.click();
@@ -2775,7 +2919,7 @@ function updateRecordUI() {
 function toggleSidebar() {
   const view = $("#view-chat");
   if (window.matchMedia("(max-width: 720px)").matches) {
-    if (S.active) view.classList.add("peek-chat"); else toast("Wähle erst einen Kanal aus.");
+    if (S.active) view.classList.add("peek-chat"); else toast("Wähle erst einen Chat-Kanal aus.");
     return;
   }
   view.classList.toggle("sidebar-collapsed");
@@ -2835,7 +2979,7 @@ function bindUI() {
   });
   $("#btn-attach").addEventListener("click", () => $("#file-input").click());
   $("#file-input").addEventListener("change", async (e) => {
-    const c = S.active ? chan(S.active) : null;       // alle gewählten Dateien gehen an DIESEN Kanal
+    const c = S.active ? chan(S.active) : null;       // alle gewählten Dateien gehen an DIESEN Chat-Kanal
     const sid = S.sid;
     const files = Array.from(e.target.files);
     e.target.value = "";
@@ -2867,7 +3011,7 @@ function bindUI() {
 }
 
 // Nur in der lokalen Testumgebung: Zugriff für automatische Prüfungen.
-if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount };
+if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount, noPw };
 
 // Start. Dieses Skript steht am Ende der Seite: alle Bausteine sind schon da.
 // Es wird sofort entschieden, welche Ansicht erscheint. Liegt in diesem Fenster

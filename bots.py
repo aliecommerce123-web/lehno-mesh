@@ -49,6 +49,8 @@ MAX_LINGER = 400                         # so viele Blöcke dürfen ohne Löschu
 MAX_ATTACHMENTS = 2                      # so viele Schein-Anhänge gleichzeitig unterwegs
 MAX_LINGER_ATTACHMENTS = 30              # so viele kleine Schein-Anhänge dürfen liegen bleiben
 MAX_WORK_BITS = 24                       # wird die Rechenaufgabe schwerer, pausieren die Bots (wie die Schein-Blöcke der App)
+CLIENT_VER = 1            # dieselbe Fassungs-Angabe wie die App
+
 PEOPLE_MIN, PEOPLE_MAX = 5, 24           # so viele Schein-Menschen gibt es gleichzeitig
 NEW_PER_DAY_MAX = 6                      # mehr neue Schein-Konten entstehen nie an einem Tag
 POST_LEN = len(json.dumps({"tag": "0" * 32, "data": "x" * 5500, "del_hash": "0" * 64, "work": "0" * 16}, separators=(",", ":")))
@@ -294,7 +296,7 @@ class Account:
             cls += 1
         if wcls < self.wipe_wanted and rng.random() < 0.004:
             wcls = 1
-        body = {**self.blobs(cls, wcls), "expected_version": self.version}
+        body = {**self.blobs(cls, wcls), "expected_version": self.version, "cv": CLIENT_VER}
         r = await self.api.client.put("/api/v2/account", headers=self.auth, json=body)
         if r.status_code == 428 and (cls > self.cls or wcls > self.wcls):
             await self.api.load_config()

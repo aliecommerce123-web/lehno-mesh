@@ -41,13 +41,14 @@ HOST = os.environ.get("LEHNO_MESH_BOT_HOST", "localhost").strip().lower()
 INTENSITY = float(os.environ.get("LEHNO_MESH_BOT_INTENSITY", "1.0"))   # 1.0 = Standard
 
 SMALL, BIG = 4124, 65564                 # Blockgrößen wie in der App
-ACCOUNT_PLAIN = [8192, 65536, 262144]
-WIPE_BYTES = 4096 + 28
+ACCOUNT_PLAIN = [8192, 65536, 262144, 1048576]
+WIPE_PLAIN = [4096, 65536]
 ATTACHMENT_SIZES = [262144, 1048576, 4194304, 16777216]
 MAX_PENDING = 1500                       # so viele eigene Löschungen stehen höchstens aus
 MAX_LINGER = 400                         # so viele Blöcke dürfen ohne Löschung liegen bleiben
-MAX_ATTACHMENTS = 2                      # so viele Schein-Anhänge gleichzeitig
-MAX_WORK_BITS = 23                       # wird die Rechenaufgabe schwerer, pausieren die Bots
+MAX_ATTACHMENTS = 2                      # so viele Schein-Anhänge gleichzeitig unterwegs
+MAX_LINGER_ATTACHMENTS = 30              # so viele kleine Schein-Anhänge dürfen liegen bleiben
+MAX_WORK_BITS = 24                       # wird die Rechenaufgabe schwerer, pausieren die Bots (wie die Schein-Blöcke der App)
 PEOPLE_MIN, PEOPLE_MAX = 5, 24           # so viele Schein-Menschen gibt es gleichzeitig
 NEW_PER_DAY_MAX = 6                      # mehr neue Schein-Konten entstehen nie an einem Tag
 POST_LEN = len(json.dumps({"tag": "0" * 32, "data": "x" * 5500, "del_hash": "0" * 64, "work": "0" * 16}, separators=(",", ":")))
@@ -56,6 +57,7 @@ rng = secrets.SystemRandom()
 _pending = 0                             # Blöcke, deren Löschung noch aussteht
 _linger = 0                              # Blöcke, die bewusst liegen bleiben (laufen beim Server ab)
 _attachments = 0
+_linger_attachments = 0
 _people = 0                              # Schein-Menschen, die es gerade gibt
 _created = deque()                       # Zeitpunkte der letzten Konto-Anlagen (nur im Arbeitsspeicher)
 
@@ -110,7 +112,11 @@ mood = Mood()
 class Api:
     def __init__(self):
         self.client = httpx.AsyncClient(base_url=TARGET, headers={"host": HOST}, timeout=60.0)
-        self.work = {"pile": [12, 16], "delete": 8, "account": [17, 19, 21, 23, 25], "upload": [16, 18, 20, 22]}
+        self.work = {"salt": "", "pile": [12, 16], "delete": 8, "account": [17, 19, 21, 23, 25], "upload": [16, 18, 20, 22]}
+
+    def subject(self, raw: bytes) -> bytes:
+        """Gegenstand der Rechenaufgabe: aktuelles Salz des Servers + Kennung + Art."""
+        return bytes.fromhex(self.work.get("salt") or "") + raw
 
     async def load_config(self):
         try:
@@ -134,7 +140,7 @@ class Api:
             bits = self.work["pile"][1 if size == BIG else 0]
             if bits > MAX_WORK_BITS:
                 return None                # Server ist unter Last: Bots halten sich zurück
-            work = await asyncio.to_thread(solve, bytes.fromhex(tag) + b"p", bits)
+            work = await asyncio.to_thread(solve, self.subject(bytes.fromhex(tag) + b"p"), bits)
             body = {"tag": tag, "data": b64(secrets.token_bytes(size)), "del_hash": hashlib.sha256(bytes.fromhex(token)).hexdigest(), "work": work}
             r = await self.client.post("/api/v2/pile", json=body)
             if r.status_code != 200:
@@ -156,7 +162,7 @@ class Api:
                 bits = int(self.work.get("delete", 8))
                 if bits > MAX_WORK_BITS:
                     continue
-                work = await asyncio.to_thread(solve, bytes.fromhex(tag) + b"d", bits)
+                work = await asyncio.to_thread(solve, self.subject(bytes.fromhex(tag) + b"d"), bits)
                 base = len(json.dumps({"tag": tag, "token": token, "work": work, "pad": ""}, separators=(",", ":")))
                 body = {"tag": tag, "token": token, "work": work, "pad": "x" * max(0, POST_LEN - base)}
                 r = await self.client.post("/api/v2/pile/delete", json=body)
@@ -189,7 +195,7 @@ class Api:
         if bits > MAX_WORK_BITS + 3:
             return None
         token = secrets.token_hex(16)
-        work = await asyncio.to_thread(solve, bytes.fromhex(token) + b"u" + bytes([index]), bits)
+        work = await asyncio.to_thread(solve, self.subject(bytes.fromhex(token) + b"u" + bytes([index])), bits)
         r = await self.client.post(
             "/api/attachments",
             headers={"x-work": f"{token}.{index}.{work}"},
@@ -225,16 +231,24 @@ class Account:
         self.token = secrets.token_hex(32)
         self.wipe = secrets.token_hex(32)
         pick = rng.random()
-        self.wanted = 0 if pick < 0.90 else (1 if pick < 0.98 else 2)
+        self.wanted = 0 if pick < 0.90 else (1 if pick < 0.975 else (2 if pick < 0.995 else 3))
+        self.wipe_wanted = 1 if rng.random() < 0.02 else 0
         self.cls = 0
+        self.wcls = 0
         self.version = None
+        self.gone = False
 
     @property
     def auth(self):
         return {"authorization": f"Bearer {self.id}.{self.token}"}
 
-    def blobs(self, cls: int):
-        return {"blob": b64(secrets.token_bytes(ACCOUNT_PLAIN[cls] + 28)), "wipe_blob": b64(secrets.token_bytes(WIPE_BYTES))}
+    def blobs(self, cls: int, wcls: int = 0):
+        return {"blob": b64(secrets.token_bytes(ACCOUNT_PLAIN[cls] + 28)), "wipe_blob": b64(secrets.token_bytes(WIPE_PLAIN[wcls] + 28))}
+
+    def save_pause(self) -> float:
+        """Abstand bis zum nächsten Speichern, wie in der App: große Konten seltener."""
+        mean = 14 if self.cls == 0 else (45 if self.cls == 1 else 120)
+        return expo(mean, mean / 4, mean * 4)
 
     async def create(self) -> bool:
         """Legt das Konto an, genau wie die App beim Anlegen."""
@@ -243,7 +257,7 @@ class Account:
             bits = self.api.work["account"][0]
             if bits > MAX_WORK_BITS + 3:
                 return False
-            work = await asyncio.to_thread(solve, bytes.fromhex(self.id) + b"a", bits)
+            work = await asyncio.to_thread(solve, self.api.subject(bytes.fromhex(self.id) + b"a"), bits)
             body = {
                 "id": self.id,
                 "auth_hash": hashlib.sha256(bytes.fromhex(self.token)).hexdigest(),
@@ -261,31 +275,38 @@ class Account:
         return False
 
     async def login(self) -> bool:
-        """Meldet sich an wie die App: Konto-Block holen."""
+        """Meldet sich an wie die App: Konto-Block holen. Nur eine klare Absage
+        (401) heißt, dass es das Konto nicht mehr gibt."""
         r = await self.api.client.get("/api/v2/account", headers=self.auth)
         if r.status_code == 200:
             self.version = r.json()["version"]
             return True
+        if r.status_code == 401:
+            self.gone = True
         return False
 
     async def save(self):
         if self.version is None and not await self.login():
             return
         # Manche Konten wachsen mit der Zeit in eine größere Stufe.
-        cls = self.cls
+        cls, wcls = self.cls, self.wcls
         if cls < self.wanted and rng.random() < 0.004:
             cls += 1
-        body = {**self.blobs(cls), "expected_version": self.version}
+        if wcls < self.wipe_wanted and rng.random() < 0.004:
+            wcls = 1
+        body = {**self.blobs(cls, wcls), "expected_version": self.version}
         r = await self.api.client.put("/api/v2/account", headers=self.auth, json=body)
-        if r.status_code == 428 and cls > self.cls:
-            bits = self.api.work["account"][cls]
+        if r.status_code == 428 and (cls > self.cls or wcls > self.wcls):
+            await self.api.load_config()
+            bits = self.api.work["account"][cls] + (2 if wcls else 0)
             if bits > MAX_WORK_BITS + 3:
                 return
-            body["work"] = await asyncio.to_thread(solve, bytes.fromhex(self.id) + b"g" + bytes([cls * 2]), bits)
+            mark = cls * 2 + (1 if wcls else 0)
+            body["work"] = await asyncio.to_thread(solve, self.api.subject(bytes.fromhex(self.id) + b"g" + bytes([mark])), bits)
             r = await self.api.client.put("/api/v2/account", headers=self.auth, json=body)
         if r.status_code == 200:
             self.version = r.json()["version"]
-            self.cls = cls
+            self.cls, self.wcls = cls, wcls
         elif r.status_code in (401, 409):
             self.version = None
 
@@ -346,7 +367,7 @@ async def session(api: Api, account: Account, spawn):
     loop = asyncio.get_running_loop()
     end = loop.time() + lognorm(420 * mood.level, 1.0, 25, 4 * 3600)
     next_post = expo(mood.scale(25), 1, 600)
-    next_save = expo(14, 3.5, 56)
+    next_save = account.save_pause()
     next_decoy = expo(10, 1.2, 45)
     chatting = 0
     while loop.time() < end:
@@ -377,7 +398,7 @@ async def session(api: Api, account: Account, spawn):
                     spawn(send_attachment(api))
             next_save -= step
             if next_save <= 0:
-                next_save = expo(14, 3.5, 56)
+                next_save = account.save_pause()
                 await account.save()
         except Exception:
             await asyncio.sleep(expo(10, 2, 60))
@@ -413,8 +434,11 @@ async def person(api: Api, tasks: set):
                 if first or await account.login():
                     first = False
                     await session(api, account, spawn)
-                else:
+                elif account.gone:
                     return                         # Konto gibt es nicht mehr
+                else:
+                    visits += 1                    # Server gerade nicht erreichbar: später noch einmal
+                    await asyncio.sleep(expo(60, 10, 600))
             except Exception:
                 await asyncio.sleep(expo(20, 5, 120))
             if visits > 0:
@@ -441,14 +465,18 @@ async def read_block(api: Api, got, spawn):
 
 
 async def send_attachment(api: Api):
-    global _attachments
+    global _attachments, _linger_attachments
     if _attachments >= MAX_ATTACHMENTS:
         return
     _attachments += 1
     token = None
+    keep = False
     try:
         x = rng.random()
         index = 0 if x < 0.70 else (1 if x < 0.90 else (2 if x < 0.975 else 3))
+        # Manche kleinen Anhänge bleiben liegen, wie bei Menschen, die nicht lesen
+        # oder ihren Verlauf behalten. Der Server räumt sie nach einigen Wochen weg.
+        keep = index <= 1 and rng.random() < 0.12 and _linger_attachments < MAX_LINGER_ATTACHMENTS
         token = await api.upload(index)
         if not token:
             return
@@ -456,18 +484,24 @@ async def send_attachment(api: Api):
         await asyncio.sleep(lognorm(40, 1.1, 2, 1800))
         if note:
             await api.delete_block(*note)
-        await api.download(token)
+        if not keep or rng.random() < 0.5:
+            await api.download(token)
         await asyncio.sleep(0.1 + rng.random())
     except Exception:
         pass
     finally:
-        # Der Schein-Anhang wird in jedem Fall wieder entfernt.
-        try:
-            if token:
-                await api.delete_upload(token)
-        except Exception:
-            pass
         _attachments -= 1
+        if token and keep:
+            _linger_attachments += 1
+            try:
+                await asyncio.sleep(42 * 86400)
+            finally:
+                _linger_attachments -= 1
+        elif token:
+            try:
+                await api.delete_upload(token)
+            except Exception:
+                pass
 
 
 async def newcomers(api: Api, tasks: set):
@@ -476,11 +510,10 @@ async def newcomers(api: Api, tasks: set):
     gerade wenige, kommen sie schneller, sind es viele, kommt niemand dazu.
     Eine feste Tages-Obergrenze verhindert, dass der Speicher sich füllt."""
     loop = asyncio.get_running_loop()
-    start = loop.time()
     first = True
     while True:
         if first:
-            wait = expo(40, 5, 180)
+            wait = expo(150, 20, 600) / max(1.0, INTENSITY)
         elif _people < PEOPLE_MIN:
             wait = expo(420, 45, 2400) / max(1.0, INTENSITY)
         else:
@@ -490,9 +523,7 @@ async def newcomers(api: Api, tasks: set):
         now = loop.time()
         while _created and _created[0] < now - 86400:
             _created.popleft()
-        # In der ersten Stunde nach dem Start dürfen ein paar mehr entstehen.
-        allowed = NEW_PER_DAY_MAX + (PEOPLE_MIN if now - start < 3 * 3600 else 0)
-        if _people >= PEOPLE_MAX or len(_created) >= allowed:
+        if _people >= PEOPLE_MAX or len(_created) >= NEW_PER_DAY_MAX:
             continue
         _created.append(now)
         t = asyncio.ensure_future(person(api, tasks))

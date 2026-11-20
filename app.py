@@ -118,6 +118,9 @@ class RateLimiter:
         q.append(now)
         return True
 
+    def note(self, key: str):
+        self.hits[key].append(time.monotonic())
+
     def count(self, key: str, window: int) -> int:
         now = time.monotonic()
         q = self.hits.get(key)
@@ -222,13 +225,45 @@ def sha256_hex(raw: bytes) -> str:
 WORK_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
-def work_ok(subject: bytes, work: str, bits: int) -> bool:
+# Die Aufgabe ist an ein Salz gebunden, das der Server alle paar Minuten neu
+# würfelt (nur im Arbeitsspeicher). Eine Lösung gilt deshalb nur kurz, und jede
+# Lösung wird nur ein einziges Mal angenommen.
+WORK_ROTATE_SECONDS = 600
+WORK_USED_MAX = 1_500_000
+_work_salts = [secrets.token_bytes(8), secrets.token_bytes(8)]      # [aktuell, vorher]
+_work_used = [set(), set()]
+
+
+def work_rotate():
+    _work_salts[1], _work_used[1] = _work_salts[0], _work_used[0]
+    _work_salts[0], _work_used[0] = secrets.token_bytes(8), set()
+
+
+def work_ok(subject: bytes, work: str, bits: int, consume: bool = True) -> bool:
     if bits <= 0:
         return True
     if not isinstance(work, str) or not WORK_RE.match(work):
         return False
-    digest = hashlib.sha256(subject + bytes.fromhex(work)).digest()
-    return int.from_bytes(digest[:8], "big") >> (64 - bits) == 0
+    nonce = bytes.fromhex(work)
+    for i in (0, 1):
+        digest = hashlib.sha256(_work_salts[i] + subject + nonce).digest()
+        if int.from_bytes(digest[:8], "big") >> (64 - bits) == 0:
+            key = digest[:12]
+            if key in _work_used[i]:
+                return False
+            if consume:
+                if len(_work_used[0]) > WORK_USED_MAX:
+                    work_rotate()
+                    return False
+                _work_used[i].add(key)
+            return True
+    return False
+
+
+async def work_loop():
+    while True:
+        await asyncio.sleep(WORK_ROTATE_SECONDS)
+        work_rotate()
 
 
 def _step(value: float, steps) -> int:
@@ -342,7 +377,7 @@ async def lifespan(app: FastAPI):
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(name).setLevel(logging.WARNING)
     init_db()
-    tasks = [asyncio.create_task(cleanup_loop()), asyncio.create_task(proof_loop())]
+    tasks = [asyncio.create_task(cleanup_loop()), asyncio.create_task(proof_loop()), asyncio.create_task(work_loop())]
     try:
         yield
     finally:
@@ -434,8 +469,8 @@ MAX_BODY_ATTACHMENT = 17 * 1024 * 1024
 _INFLIGHT: dict[str, int] = defaultdict(int)
 BIG_ROUTES = {
     # (Methode, Pfad) -> (Zähler, gleichzeitig, Zeitlimit s, Body-Grenze, vorher anmelden?)
-    ("PUT", "/api/v2/account"):   ("account", 8, 240, MAX_BODY_ACCOUNT, True),
-    ("POST", "/api/attachments"): ("upload", 8, 600, MAX_BODY_ATTACHMENT, False),
+    ("PUT", "/api/v2/account"):   ("account", 48, 300, MAX_BODY_ACCOUNT, True),
+    ("POST", "/api/attachments"): ("upload", 16, 330, MAX_BODY_ATTACHMENT, False),
 }
 # Kopfzeilen, mit denen sich das Änderungsdatum von Dateien erfragen ließe.
 STRIP_REQUEST_HEADERS = (b"if-modified-since", b"if-none-match", b"if-range", b"range", b"if-unmodified-since")
@@ -470,6 +505,9 @@ async def guard(request: Request, call_next):
                 resp = _json(413, "request too large")
             elif big:
                 name, max_parallel, timeout, _, pre_auth = big
+                # Kleine Anfragen bekommen wenig Zeit: so kann niemand mit hängenden
+                # Verbindungen lange Plätze belegen.
+                timeout = min(timeout, (20 + int(cl) / 20000) if name == "account" else (30 + int(cl) / 60000))
                 if pre_auth:
                     # Anmeldung prüfen, BEVOR der große Body gelesen wird.
                     try:
@@ -479,7 +517,7 @@ async def guard(request: Request, call_next):
                 elif name == "upload":
                     # Rechenaufgabe prüfen, BEVOR der große Body gelesen wird.
                     try:
-                        upload_ticket(request.headers.get("x-work", ""), int(cl))
+                        upload_ticket(request.headers.get("x-work", ""), int(cl), consume=False)
                     except HTTPException as e:
                         resp = _json(e.status_code, str(e.detail))
                 if resp is None:
@@ -563,7 +601,7 @@ async def account_from_header(header: str) -> str:
     acc_id, _, token = parts[1].strip().partition(".")
     if not re.match(HEX64, acc_id) or not re.match(HEX64, token):
         raise HTTPException(401, "not signed in")
-    if not limit_ok("account:auth", 60000, 60):
+    if not limit_ok("account:auth", 600000, 60):
         raise HTTPException(429, "too many requests")
     con = await open_db()
     try:
@@ -602,7 +640,7 @@ async def account_create(req: AccountCreateReq, con: aiosqlite.Connection = Depe
         raise HTTPException(400, "invalid account block size")
     if not work_ok(bytes.fromhex(req.id) + b"a", req.work, work_bits_account()):
         raise HTTPException(428, "more work required")
-    if not limit_ok("account:create", 5000, 3600):
+    if limiter.count("account:create", 3600) >= 5000:
         raise HTTPException(429, "too many requests")
     size = len(req.blob) + len(req.wipe_blob)
     if not disk_ok(size) or _totals["accounts"] + size > MAX_ACCOUNT_BYTES:
@@ -621,6 +659,7 @@ async def account_create(req: AccountCreateReq, con: aiosqlite.Connection = Depe
         await con.commit()
     except sqlite3.IntegrityError:
         raise HTTPException(409, "exists")
+    limiter.note("account:create")
     _totals["accounts"] += size
     return {"version": version}
 
@@ -685,7 +724,7 @@ async def account_wipe(req: WipeReq, con: aiosqlite.Connection = Depends(db)):
     started = time.monotonic()
     # Kein enges Limit: das Lösch-Geheimnis hat 256 Bit, Raten ist aussichtslos,
     # und das Löschen im Notfall darf niemand von außen blockieren können.
-    if not limit_ok("account:wipe", 20000, 60):
+    if not limit_ok("account:wipe", 600000, 60):
         raise HTTPException(429, "too many requests")
     wipe_hash = sha256_hex(bytes.fromhex(req.token))
     cur = await con.execute("DELETE FROM accounts WHERE wipe_hash=? RETURNING wipe_blob, size_bytes", (wipe_hash,))
@@ -753,7 +792,7 @@ async def pile_post(req: PilePostReq, con: aiosqlite.Connection = Depends(db)):
         raise HTTPException(400, "invalid block size")
     if not work_ok(bytes.fromhex(req.tag) + b"p", req.work, work_bits_pile(len(raw))):
         return await _even(started, _reply(False, 428))
-    if not limit_ok("pile:post", 20000, 60):
+    if limiter.count("pile:post", 60) >= 20000:
         return await _even(started, _reply(False, 429))
     if not disk_ok(len(raw)) or _totals["pile"] + len(raw) > MAX_PILE_BYTES:
         return await _even(started, _reply(False, 507))
@@ -765,6 +804,7 @@ async def pile_post(req: PilePostReq, con: aiosqlite.Connection = Depends(db)):
         await con.commit()
     except sqlite3.IntegrityError:
         return await _even(started, _reply(False, 409))      # Marke schon vergeben
+    limiter.note("pile:post")
     _totals["pile"] += len(raw)
     return await _even(started, _reply(True))
 
@@ -775,7 +815,7 @@ async def pile_delete(req: PileDeleteReq, con: aiosqlite.Connection = Depends(db
     started = time.monotonic()
     if not work_ok(bytes.fromhex(req.tag) + b"d", req.work, work_bits_delete()):
         return await _even(started, _reply(False, 428))
-    if not limit_ok("pile:delete", 20000, 60):
+    if limiter.count("pile:delete", 60) >= 20000:
         return await _even(started, _reply(False, 429))
     del_hash = sha256_hex(bytes.fromhex(req.token))
     # Ein einziger Schritt: so kann derselbe Block nie zweimal abgezogen werden.
@@ -784,6 +824,7 @@ async def pile_delete(req: PileDeleteReq, con: aiosqlite.Connection = Depends(db
     await con.commit()
     if not row:
         return await _even(started, _reply(False, 404))
+    limiter.note("pile:delete")
     _totals["pile"] -= row["size_bytes"]
     return await _even(started, _reply(True))
 
@@ -797,7 +838,7 @@ async def pile_get(since: int = 0, b: str = "", con: aiosqlite.Connection = Depe
     je Block: Nummer (8 Bytes) | Marke (16 Bytes) | Länge (4 Bytes) | Block.
     Die laufende Nummer ist nur eine Reihenfolge, keine Uhrzeit.
     Kopfzeile X-Pile: 'weiter' (es gibt noch mehr) oder 'ende', dazu die höchste Nummer."""
-    if not limit_ok("pile:get", 40000, 60):
+    if not limit_ok("pile:get", 600000, 60):
         raise HTTPException(429, "too many requests")
     if since < 0 or since > 2**62:
         raise HTTPException(400, "invalid cursor")
@@ -834,6 +875,7 @@ async def config():
     return {
         "row_hex": BUCKET_HEX, "block_bytes": BLOCK_BYTES, "keep_weeks": PILE_KEEP_WEEKS,
         "work": {
+            "salt": _work_salts[0].hex(),
             "pile": [work_bits_pile(n) for n in BLOCK_BYTES],
             "delete": work_bits_delete(),
             "account": [work_bits_account(i) for i in range(len(ACCOUNT_B64))],
@@ -858,7 +900,7 @@ def _check_token(token: str):
         raise HTTPException(400, "invalid token format")
 
 
-def upload_ticket(header: str, content_length: int = 0):
+def upload_ticket(header: str, content_length: int = 0, consume: bool = True):
     """Kopfzeile X-Work: <Kennung>.<Stufe>.<Zahl>. Die Kennung (128 Bit Zufall)
     wählt das Gerät selbst, sie wird die Kennung des Anhangs. Gibt (Kennung, Stufe) zurück."""
     parts = (header or "").split(".")
@@ -867,7 +909,7 @@ def upload_ticket(header: str, content_length: int = 0):
     index = int(parts[1])
     if content_length and content_length > ATTACHMENT_BUCKETS[index] + 8192:
         raise HTTPException(413, "request too large")
-    if not work_ok(bytes.fromhex(parts[0]) + b"u" + bytes([index]), parts[2], work_bits_upload(index)):
+    if not work_ok(bytes.fromhex(parts[0]) + b"u" + bytes([index]), parts[2], work_bits_upload(index), consume):
         raise HTTPException(428, "more work required")
     return parts[0], index
 
@@ -884,7 +926,8 @@ async def upload_attachment(request: Request, file: UploadFile = File(...)):
         chunks.append(chunk)
     if size != ATTACHMENT_BUCKETS[index]:
         raise HTTPException(400, "attachment size not in bucket")
-    limit_or_429("upload:global", 12000, 3600)
+    if limiter.count("upload:global", 3600) >= 12000:
+        raise HTTPException(429, "too many requests, try again later")
     data = b"".join(chunks)
     del chunks
     today = week_bucket(int(time.time()))
@@ -896,6 +939,8 @@ async def upload_attachment(request: Request, file: UploadFile = File(...)):
             free = MIN_FREE_BYTES + size
         if free - size < MIN_FREE_BYTES:
             raise HTTPException(507, "attachment storage full, try again later")
+        # Prüfen und Ablegen in einem Schritt, damit gleichzeitige Uploads die Grenze nicht überschreiten.
+        await con.execute("BEGIN IMMEDIATE")
         cur = await con.execute("SELECT COALESCE(SUM(size_bytes),0) AS total FROM blobs")
         total = (await cur.fetchone())["total"]
         _totals["uploads"] = total
@@ -904,12 +949,13 @@ async def upload_attachment(request: Request, file: UploadFile = File(...)):
             raise HTTPException(507, "attachment storage full, try again later")
         try:
             await con.execute(
-                "INSERT INTO blobs (token, data, size_bytes, created_day, expires_day) VALUES (?,?,?,?,?)",
-                (token, data, size, 0, today + KEEP_WEEKS * WEEK),
+                "INSERT INTO blobs (rowid, token, data, size_bytes, created_day, expires_day) VALUES (?,?,?,?,?,?)",
+                (random_rowid(), token, data, size, 0, today + KEEP_WEEKS * WEEK),
             )
             await con.commit()
         except sqlite3.IntegrityError:
             raise HTTPException(409, "exists")
+        limiter.note("upload:global")
         _totals["uploads"] = total + size
     finally:
         await con.close()
@@ -1020,6 +1066,14 @@ async def cleanup_loop():
             await con.commit()
             await (await con.execute("PRAGMA incremental_vacuum")).fetchall()
             await con.commit()
+            # Neu packen: Danach liegen die Zeilen in der Reihenfolge ihrer zufälligen
+            # Nummern in der Datei. Aus der Datei lässt sich so nicht ablesen, in
+            # welcher Reihenfolge Konten angelegt wurden.
+            try:
+                if DB_PATH.stat().st_size < 150 * 1024 * 1024:
+                    await con.execute("VACUUM")
+            except Exception:
+                pass
             cur = await con.execute("SELECT COALESCE(SUM(size_bytes),0) AS n FROM pile")
             _totals["pile"] = (await cur.fetchone())["n"]
             cur = await con.execute("SELECT COALESCE(SUM(size_bytes),0) AS n FROM accounts")

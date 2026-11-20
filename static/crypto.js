@@ -198,18 +198,19 @@
   }
   // Aus dem gemeinsamen Geheimnis: Schlüssel für Marken, Inhalt, Löschen, Auflösen.
   async function channelKeys(root) {
-    // Prüf-Zahl: 12 Ziffern aus dem gemeinsamen Geheimnis. Steht bei beiden
-    // dieselbe Zahl, hat sich niemand dazwischengedrängt.
-    const sym = await hkdf(root, "chatmesh2|verify", 8);
-    let v = 0;
-    for (let i = 0; i < 5; i++) v = v * 256 + sym[i];
-    const digits = String(v % 1e12).padStart(12, "0");
+    // Prüf-Zahl: 18 Ziffern (rund 60 Bit) aus dem gemeinsamen Geheimnis. Steht bei
+    // beiden dieselbe Zahl, hat sich niemand dazwischengedrängt. So lang, dass sie
+    // sich nicht passend zurechtprobieren lässt.
+    const sym = await hkdf(root, "chatmesh2|verify", 9);
+    let v = 0n;
+    for (let i = 0; i < 8; i++) v = v * 256n + BigInt(sym[i]);
+    const digits = String(v % 1000000000000000000n).padStart(18, "0");
     return {
       kTag: await hkdf(root, "chatmesh2|ch|tag"),
       kMsg: await hkdf(root, "chatmesh2|ch|msg"),
       kDel: await hkdf(root, "chatmesh2|ch|del"),
       kDis: await hkdf(root, "chatmesh2|ch|dissolve"),
-      symbols: digits.slice(0, 4) + " " + digits.slice(4, 8) + " " + digits.slice(8),
+      symbols: digits.match(/.{3}/g).join(" "),
     };
   }
   function dn(dir, n) { return dir + "|" + String(n); }

@@ -9,7 +9,7 @@
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2314171a'/%3E%3Ctext x='32' y='43' font-size='34' text-anchor='middle' fill='%23ffffff' font-family='Arial,sans-serif' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
   <style>
     :root { --bg:#ffffff; --bg2:#f6f7f8; --bg3:#eceef0; --line:#e0e3e7; --text:#14171a; --dim:#5c6570; --dimmer:#8b939d; --accent:#2563eb; --warn:#9a5b00; --code:#f6f7f8; }
-    @media (prefers-color-scheme: dark) { :root { --bg:#101214; --bg2:#181b1e; --bg3:#22262a; --line:#2b3035; --text:#eceef0; --dim:#9da5ae; --dimmer:#6f7780; --accent:#3b82f6; --warn:#e0a84a; --code:#181b1e; } }
+    @media (prefers-color-scheme: dark) { :root { --bg:#101214; --bg2:#181b1e; --bg3:#22262a; --line:#2b3035; --text:#eceef0; --dim:#9da5ae; --dimmer:#6f7780; --accent:#7fb0ff; --warn:#e0a84a; --code:#181b1e; } }
     * { box-sizing: border-box; }
     html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
     a { color: var(--accent); }
@@ -39,7 +39,7 @@
     li b { color: var(--text); }
     .small { font-size: 12.5px; color: var(--dimmer); }
     .files a { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    .to-app { margin-left: auto; }
+    .to-app { margin-left: auto; padding: 10px 0; }
   </style>
 </head>
 <body>
@@ -102,9 +102,9 @@
       <li><b>Mit dem Tor-Browser:</b> sieht nicht einmal dein Internetanbieter, dass du chatmesh nutzt, und kein Netzdienst sieht deine IP-Adresse. <a href="/tor">Anleitung</a></li>
       <li><b>Dein Gegenüber:</b> sieht deine Nachrichten und ob du sie geöffnet hast (Lesebestätigung). Es gibt keine Adresse, keinen Namen und kein Profil. Den Namen eines Kanals vergibt jeder für sich selbst.</li>
     </ul>
-    <p class="small">Ehrliche Grenzen: Die App kommt als Webseite von diesem Server. Deshalb ist der Quelltext oben offen und mit Prüfsummen versehen, damit jeder kontrollieren kann, was ausgeliefert wird. Alles oben beschreibt, was dieser Quelltext tut: Er speichert und wertet nichts aus. Ein heimlich veränderter Server könnte mehr mitschreiben, zum Beispiel wann welche Verbindung einen Block löscht. Genau dagegen helfen die Prüfsummen und der Tor-Browser. Das Verschwinden von Nachrichten setzt die App deines Gegenübers um. Ein Screenshot-Versuch am Rechner löst den Kanal auf, sicher verhindern kann eine Webseite Bildschirmfotos aber nicht, vor allem nicht am Handy, und niemand kann verhindern, dass jemand den Bildschirm abfotografiert. Bei gewöhnlichen Dateien (zum Beispiel PDF) können eingebettete Angaben nicht entfernt werden, bei Bildern, Videos und Sprachnachrichten schon.</p>
+    <p class="small">Ehrliche Grenzen: Die App kommt als Webseite von diesem Server. Deshalb ist der Quelltext oben offen und mit Prüfsummen versehen, damit jeder kontrollieren kann, was ausgeliefert wird. Alles oben beschreibt, was dieser Quelltext tut: Er speichert nur, was unter 1 steht, und wertet nichts aus. Ein heimlich veränderter Server könnte mehr mitschreiben, zum Beispiel wann welche Verbindung einen Block löscht. Genau dagegen helfen die Prüfsummen und der Tor-Browser. Die Schein-Blöcke schützen vor allem das, was auf dem Server liegt: Wer den Datenverkehr selbst über lange Zeit mitschneidet, kann mehr erkennen. Und: Der Schlüssel eines Kanals bleibt gleich, solange es den Kanal gibt. Wer später die 12 Wörter und das Kanal-Passwort bekommt und die verschlüsselten Blöcke vorher mitgeschnitten hat, könnte alte Nachrichten lesen. Wer das ausschließen will, löscht den Kanal und legt einen neuen an. Die laufende Nummer der Blöcke verrät außerdem einem Dauer-Beobachter, wann ungefähr ein Block abgelegt wurde. Das Verschwinden von Nachrichten setzt die App deines Gegenübers um. Ein Screenshot-Versuch am Rechner löst den Kanal auf, sicher verhindern kann eine Webseite Bildschirmfotos aber nicht, vor allem nicht am Handy, und niemand kann verhindern, dass jemand den Bildschirm abfotografiert. Bei gewöhnlichen Dateien (zum Beispiel PDF) können eingebettete Angaben nicht entfernt werden, bei Bildern, Videos und Sprachnachrichten schon.</p>
   </div>
 </div>
-<script src="/s/proof.js?v=6"></script>
+<script src="/s/proof.js?v=11"></script>
 </body>
 </html>

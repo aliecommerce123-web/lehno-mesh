@@ -11,8 +11,10 @@
       --bg: #f6f7f8; --bg-2: #ffffff; --bg-3: #eceef0; --line: #e0e3e7; --text: #14171a; --text-dim: #5c6570; --text-dimmer: #8b939d;
       --accent: #2563eb; --accent-dark: #1d4fc0; --warn: #9a5b00;
     }
-    @media (prefers-color-scheme: dark) { :root { --bg: #101214; --bg-2: #181b1e; --bg-3: #22262a; --line: #2b3035; --text: #eceef0; --text-dim: #9da5ae; --text-dimmer: #6f7780; --accent: #3b82f6; --accent-dark: #2f6fe0; --warn: #e0a84a; } }
+    @media (prefers-color-scheme: dark) { :root { --bg: #101214; --bg-2: #181b1e; --bg-3: #22262a; --line: #2b3035; --text: #eceef0; --text-dim: #9da5ae; --text-dimmer: #6f7780; --accent: #7fb0ff; --accent-dark: #5a95f5; --warn: #e0a84a; } }
     * { box-sizing: border-box; }
+    a { color: var(--accent); }
+    .btn, button { min-height: 44px; }
     html, body {
       margin: 0; padding: 0; min-height: 100vh;
       background: var(--bg);
@@ -168,7 +170,7 @@
   </div>
   <p style="text-align:center;margin:14px 0 6px"><a class="btn" href="/">Zur App im normalen Browser</a></p>
 
-  <h2>1. Tor Browser installieren</h2>
+  <h2>1. Tor-Browser installieren</h2>
 
   <div class="step">
     <div class="step-num">A</div>
@@ -182,7 +184,7 @@
     <div class="step-num">B</div>
     <div class="step-body">
       <strong>Android</strong>
-      <p><a href="https://play.google.com/store/apps/details?id=org.torproject.torbrowser" target="_blank" rel="noopener">„Tor Browser“ im Play Store</a></p>
+      <p><a href="https://play.google.com/store/apps/details?id=org.torproject.torbrowser" target="_blank" rel="noopener">„Tor-Browser“ im Play Store</a></p>
     </div>
   </div>
 
@@ -206,7 +208,7 @@
   </div>
 
   <p style="color:var(--text-dim);font-size:13px;text-align:center;margin:18px 0 8px">
-    Oder QR-Code mit dem Tor Browser scannen:
+    Oder QR-Code mit dem Tor-Browser scannen:
   </p>
   <div class="qr-wrap">
     <div class="qr">
@@ -226,6 +228,6 @@
   </div>
 </div>
 
-<script src="/s/landing.js?v=6"></script>
+<script src="/s/landing.js?v=11"></script>
 </body>
 </html>

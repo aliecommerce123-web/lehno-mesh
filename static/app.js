@@ -44,7 +44,7 @@ const S = {
   urgent: false,
   blobLen: 0,
   blobClass: 0,
-  work: { pile: [12, 16], delete: 8, account: [17, 19, 21, 23, 25], account_wipe_extra: 2, upload: [16, 18, 20, 22] },
+  work: { salt: "", pile: [12, 16], delete: 8, account: [17, 19, 21, 23, 25], account_wipe_extra: 2, upload: [16, 18, 20, 22] },
   wipeBig: false,
   pile: new Map(),     // Marke -> Block (noch nicht zugeordnet)
   pileBytes: 0,
@@ -118,15 +118,17 @@ async function api(method, path, opt = {}) {
 async function loadConfig() {
   try {
     const c = await api("GET", "/api/v2/config");
-    if (c && c.work && Array.isArray(c.work.pile) && Array.isArray(c.work.account) && Array.isArray(c.work.upload)) S.work = c.work;
+    if (c && c.work && Array.isArray(c.work.pile) && Array.isArray(c.work.account) && Array.isArray(c.work.upload) && /^[0-9a-f]{16}$/.test(String(c.work.salt || ""))) S.work = c.work;
   } catch (e) {}
 }
-const subject = (hexId, letter, extra) => C.concat(C.unhex(hexId), C.utf8(letter), extra === undefined ? new Uint8Array(0) : new Uint8Array([extra]));
+// Gegenstand der Rechenaufgabe: aktuelles Salz des Servers + Kennung + Art.
+const subject = (hexId, letter, extra) => C.concat(C.unhex(S.work.salt || ""), C.unhex(hexId), C.utf8(letter), extra === undefined ? new Uint8Array(0) : new Uint8Array([extra]));
 
 // Einliefern und Löschen sehen von außen gleich aus: gleiche Länge der Anfrage,
 // gleiche Länge und Dauer der Antwort.
 const POST_LEN = JSON.stringify({ tag: "0".repeat(32), data: "x".repeat(5500), del_hash: "0".repeat(64), work: "0".repeat(16) }).length;
 async function pilePost(tag, bytes, delToken, maxBits = 26) {
+  if (!S.work.salt) await loadConfig();
   const delHash = await C.delHash(delToken);
   const idx = bytes.byteLength > 5000 ? 1 : 0;
   for (let i = 0; i < 3; i++) {
@@ -144,6 +146,7 @@ async function pilePost(tag, bytes, delToken, maxBits = 26) {
 
 async function pileDelete(tag, token) {
   try {
+    if (!S.work.salt) await loadConfig();
     const bits = S.work.delete || 0;
     if (bits > 24) return false;
     const work = await C.work(subject(tag, "d"), bits);
@@ -246,14 +249,28 @@ function mergeChannel(l, r) {
   l.cr = Math.max(l.cr || 0, r.cr || 0);
   l.rn = Math.max(l.rn || 0, r.rn || 0);
   l.rc = Math.max(l.rc || 0, r.rc || 0);
-  for (const [k, base] of [["rp", "rn"], ["rpc", "rc"]]) {
+  l.cf = Math.max(l.cf || 0, r.cf || 0);
+  for (const [k, base] of [["rp", "rn"], ["rpc", "rc"], ["ca", "rc"]]) {
     l[k] = Array.from(new Set([...(l[k] || []), ...(r[k] || [])])).filter(n => n >= l[base] - WINDOW_BACK).sort((a, b) => a - b);
   }
+  if (!r.ib) delete l.ib;
   const run = S.run[l.id];
   const open = S.active === l.id && run && run.loaded;
   const newer = (r.rv || 0) > (l.rv || 0);
-  if (newer) for (const k of ["name", "keep", "shots", "rq", "ro", "rv"]) l[k] = r[k];
+  if (newer) for (const k of ["name", "keep", "shots", "rq", "ro", "rv", "vf"]) l[k] = r[k];
+  const lhv = l.hv || 0, rhv = r.hv || 0;
+  if (rhv > lhv) {
+    // Das andere Gerät hat den Kanal inzwischen geleert: Das gilt auch hier.
+    l.hv = rhv;
+    l.hist = l.keep ? (r.hist || "") : "";
+    if (run) {
+      if (S.active === l.id) { for (const m of run.msgs) dropMedia(l, m, false); run.msgs = []; _mergeRender = true; if (l.hist) _histMerges.push([l.id, l.hist]); }
+      else run.loaded = false;
+    }
+    return;
+  }
   if (!l.keep) { l.hist = ""; return; }
+  if (rhv < lhv) return;                       // das andere Gerät kennt die Löschung noch nicht
   if (r.hist && r.hist !== l.hist) {
     // Verlauf: Ist der Chat hier gerade offen, werden beide Stände vereint.
     // Sonst gilt der Stand des anderen Geräts (dieses hat ihn nicht verändert).
@@ -261,6 +278,7 @@ function mergeChannel(l, r) {
     else { l.hist = r.hist; if (run) run.loaded = false; }
   }
 }
+let _mergeRender = false;
 
 function mergeAccount(local, remote) {
   const gone = new Set([...remote.gone, ...local.gone]);
@@ -328,6 +346,7 @@ async function doSave() {
         S.version = r.version;
         for (const c of S.acct.ch) runOf(c);
         await applyHistMerges();
+        if (_mergeRender) { _mergeRender = false; renderChat(); }
         await rebuildExpect();
         renderList();
       } catch (e2) { break; }
@@ -395,7 +414,12 @@ async function loginWithBytes(L, fromWords) {
     // Kein Konto zu diesen Wörtern. Sind es die Löschwörter eines Kontos, wird
     // jetzt alles unwiderruflich gelöscht. Von außen und auf dem Bildschirm sieht
     // beides gleich aus: Es gibt kein Konto zu diesen Wörtern.
-    if (fromWords) { try { await wipeWith(L); } catch (e2) {} }
+    if (fromWords) {
+      // Kommt die Lösch-Anfrage nicht durch, darf das nicht wie "kein Konto"
+      // aussehen: sonst glaubt man, es sei gelöscht, obwohl nichts passiert ist.
+      try { await wipeWith(L); }
+      catch (e2) { throw new Error("Keine Verbindung zum Server. Bitte noch einmal versuchen."); }
+    }
     const err = new Error("Zu diesen Wörtern gibt es kein Konto.");
     err.gone = true;
     throw err;
@@ -416,7 +440,7 @@ async function loginWithBytes(L, fromWords) {
 // fünfmal falsch war. Sonst speichert chatmesh nichts auf dem Gerät.
 // =========================================================================
 const SESSION_KEY = "cm";
-const CODE_MIN = 4, CODE_TRIES = 5;
+const CODE_MIN = 8, CODE_TRIES = 5;
 let _pendingLogin = null, _codeMode = null;
 function readSession() {
   try {
@@ -435,7 +459,7 @@ function showCode(mode) {
   const set = mode === "set";
   $("#code-title").textContent = set ? "Lege deinen Code fest" : "Gib deinen Code ein";
   $("#code-info").textContent = set
-    ? "Diesen Code wählst du selbst. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter."
+    ? "Diesen Code wählst du selbst: mindestens 8 Zeichen, mit mindestens einem Buchstaben. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter."
     : "Du bist noch angemeldet. Gib deinen Code ein, um weiterzumachen.";
   $("#code-repeat").hidden = !set;
   $("#code-submit").textContent = set ? "Weiter" : "Entsperren";
@@ -452,9 +476,13 @@ async function submitCode() {
   if (_codeMode === "set") {
     if (!_pendingLogin || !S.me) { logout(); return; }
     if (code.length < CODE_MIN) { msg.textContent = "Der Code braucht mindestens " + CODE_MIN + " Zeichen."; return; }
+    if (/^[0-9]+$/.test(code)) { msg.textContent = "Bitte nicht nur Zahlen: mindestens ein Buchstabe."; return; }
     if (code !== f.code2.value) { msg.textContent = "Die beiden Eingaben stimmen nicht überein."; return; }
     btn.disabled = true; msg.textContent = "Einen Moment …";
-    try { await storeSession(_pendingLogin, code); } catch (e) {}
+    const sid = S.sid, bytes = _pendingLogin;
+    try { await storeSession(bytes, code); } catch (e) {}
+    // Wurde inzwischen abgemeldet, darf nichts zurückbleiben.
+    if (sid !== S.sid || !S.me) { clearSession(); btn.disabled = false; msg.textContent = ""; return; }
     _pendingLogin = null;
     f.code.value = ""; f.code2.value = "";
     btn.disabled = false; msg.textContent = "";
@@ -503,8 +531,19 @@ function wordError(e, count) {
 async function wipeWith(W) {
   const wk = await C.wipeKeys(W);
   const r = await api("POST", "/api/v2/wipe", { json: { token: wk.token } });
-  if (!r.ok) return -1;
   await loadConfig();
+  if (!r.ok) {
+    // Kein Treffer. Damit es von außen gleich aussieht wie ein echtes Löschen,
+    // gehen auch hier ein, zwei Blöcke raus (Schein-Blöcke, die wieder verschwinden).
+    try {
+      const k = 1 + randInt(2);
+      for (let i = 0; i < k; i++) {
+        const tag = C.hex(C.rand(16)), token = C.hex(C.rand(16));
+        if ((await pilePost(tag, C.rand(4124), token, 20)) === 200) queueDelete(tag, token, randBetween(20000, 120000));
+      }
+    } catch (e) {}
+    return -1;
+  }
   // Die Gegenüber benachrichtigen: jeder gemeinsame Kanal wird bei ihnen aufgelöst.
   let n = 0;
   try {
@@ -584,6 +623,7 @@ function logout(message) {
   for (const id of ["#chat-stream", "#chat-header", "#channel-list", "#notes", "#words-login", "#words-wipe"]) $(id).textContent = "";
   $("#msg-input").value = "";
   $$("textarea[name=words]").forEach(t => { t.value = ""; });
+  { const f = $("#form-code"); if (f) { f.code.value = ""; f.code2.value = ""; } }
   $("#view-chat").classList.remove("peek-chat", "sidebar-collapsed");
   closeSheet();
   $$("#view-auth .tab").forEach(x => x.classList.toggle("active", x.dataset.tab === "login"));
@@ -784,14 +824,9 @@ async function processWaiting(c) {
     const seenIds = [];
     const jobs = [];
     let advanced = false;
-    // Wartet ein Auftrag „alles löschen“, werden ältere Nachrichten gar nicht erst geöffnet.
-    let cutoff = -1;
-    for (const [n, block] of r.cwait) {
-      try {
-        const b = await C.openJson(await C.msgKey(kMsg, p + "c", n), block, C.BLOCK);
-        if (b && b.t === "clr" && Number.isInteger(b.upto)) cutoff = Math.max(cutoff, b.upto);
-      } catch (e) {}
-    }
+    // Wartende Lösch-Aufträge zuerst: Der Kanal wird geleert, bevor neue Nachrichten
+    // geöffnet werden. So bleibt, was NACH dem Löschen gesendet wurde.
+    await applyPendingClear(c, kMsg);
     if (!alive()) return;
     // Erst die Nachrichten, dann die stillen Steuerzeichen.
     for (const [lane, map, key, doneKey] of [["", r.wait, "rn", "rp"], ["c", r.cwait, "rc", "rpc"]]) {
@@ -809,7 +844,7 @@ async function processWaiting(c) {
         advanced = true;
         jobs.push([p + lane, n]);
         if (!body || typeof body !== "object") continue;
-        if (!lane && n < cutoff) {                 // vom Gegenüber gelöscht, bevor wir sie gesehen haben
+        if (!lane && n < (c.cf || 0)) {            // vom Gegenüber gelöscht (auch wenn sie verspätet ankommt)
           if (body.t === "m" && body.a) { const a = cleanAtt(body.a); if (a) dropAttachment(a.t); }
           continue;
         }
@@ -824,6 +859,7 @@ async function processWaiting(c) {
         for (const [d, n] of jobs) { try { queueDelete(await C.msgTag(kt, d, n), await C.msgDelToken(kDel, d, n)); } catch (e) {} }
       });
     }
+    if (advanced && c.ib) dropAnswerBlock(c);
     if (advanced) { await refreshExpect(c); await matchPile(); }
     if (seenIds.length && alive()) sendObj(c, { t: "seen", ids: seenIds.slice(0, 200) }, "c").catch(() => {});
     renderList();
@@ -885,7 +921,7 @@ async function handleIncoming(c, body) {
     return null;
   }
   if (t === "clr") {
-    clearLocal(c);
+    // Geleert wurde schon vor dem Öffnen der Nachrichten (applyPendingClear).
     toast("Dein Gegenüber hat alle Nachrichten in diesem Kanal gelöscht.");
     return null;
   }
@@ -1199,6 +1235,9 @@ function openChannel(id) {
     renderChat(true);
     if (r.flush) { try { await r.flush; } catch (e) {} }
     if (S.active !== id) return;
+    // Hat das Gegenüber inzwischen alles gelöscht, wird der alte Verlauf gar nicht erst gezeigt.
+    await applyPendingClear(c, r.kMsg);
+    if (S.active !== id) return;
     await loadHistory(c);
     if (S.active !== id) return;
     renderList();
@@ -1319,6 +1358,10 @@ async function installKeys(c, keys, pwKey, salt) {
   c.sym = keys.symbols;
   c.sn = 0; c.cn = 0; c.sr = 0; c.cr = 0; c.rn = 0; c.rc = 0; c.rp = []; c.rpc = [];
   c.keep = 0; c.shots = 0; c.rq = []; c.ro = []; c.hist = ""; c.rv = 0;
+  c.vf = 0;      // Prüf-Zahl noch nicht verglichen
+  c.cf = 0;      // Lösch-Grenze: ältere Nachrichten des Gegenübers werden verworfen
+  c.hv = 0;      // zählt, wie oft der Kanal geleert wurde (für zwei Geräte)
+  c.ca = [];     // schon umgesetzte Lösch-Aufträge des Gegenübers
   return own;
 }
 
@@ -1330,13 +1373,16 @@ async function createChannel(name, password, keepReq) {
   const pwKey = await C.passwordKey(password, salt);
   const kr = keepReq ? 1 : 0;
   const offer = await C.sealJson(ik.key, { t: "offer", p: C.b64(ex.pub), kr }, C.BLOCK);
-  const code = await pilePost(ik.tagA, offer, ik.delA);
+  // Das Lösch-Geheimnis für das Angebot kennt nur dieses Gerät. Wer den
+  // Einmal-Schlüssel abfängt, kann das Angebot deshalb nicht austauschen.
+  const delA = C.hex(C.rand(16));
+  const code = await pilePost(ik.tagA, offer, delA);
   if (code !== 200) throw new Error("Der Kanal konnte gerade nicht angelegt werden. Bitte noch einmal versuchen.");
   // Die Geheimnisse der Einladung liegen im Konto nur verpackt mit dem Kanal-Passwort.
   const sealed = await C.seal(pwKey, C.utf8(JSON.stringify({ inv: C.b64(I), priv: ex.privJwk, pub: C.b64(ex.pub), kr })));
   const c = {
     id: C.hex(C.rand(8)), name, dir: "a", rv: 0,
-    pend: { ta: ik.tagA, da: ik.delA, tb: ik.tagB, exp: nowSec() + INVITE_SECONDS, s: C.b64(salt), c: C.b64(sealed) },
+    pend: { ta: ik.tagA, da: delA, tb: ik.tagB, exp: nowSec() + INVITE_SECONDS, s: C.b64(salt), c: C.b64(sealed) },
   };
   S.acct.ch.unshift(c);
   runOf(c).ps = { I, priv: ex.privJwk, pub: ex.pub, kr, pwKey, salt };
@@ -1363,6 +1409,7 @@ async function completeInvite(c, block, ps) {
   const r = runOf(c);
   try {
     const ik = await C.inviteKeys(ps.I);
+    const offerTag = c.pend.ta, offerDel = c.pend.da;
     const ans = await C.openJson(ik.key, block, C.BLOCK);
     const pubB = C.unb64(String(ans.p || ""));
     const keys = await C.channelKeys(await C.channelRoot(ps.priv, pubB, ps.I, ps.pub, pubB));
@@ -1375,8 +1422,7 @@ async function completeInvite(c, block, ps) {
     await saveAccount();
     // Die beiden Blöcke des Einmal-Codes später unauffällig entfernen.
     const wait = randBetween(15000, 90000);
-    queueDelete(ik.tagA, ik.delA, wait);
-    queueDelete(ik.tagB, ik.delB, wait + randBetween(500, 5000));
+    queueDelete(offerTag, offerDel, wait);      // die Antwort entfernt das Gegenüber selbst
     toast("Kanal „" + c.name + "“ ist verbunden.", "ok");
     if ($("#sheet .qr-canvas")) closeSheet();
     renderList();
@@ -1413,8 +1459,11 @@ async function joinChannel(codeText, name, password) {
   const own = await installKeys(c, keys, pwKey, salt);
   if (offer.kr) c.rq = ["keep"];
   const answer = await C.sealJson(ik.key, { t: "answer", p: C.b64(ex.pub) }, C.BLOCK);
-  const code = await pilePost(ik.tagB, answer, ik.delB);
+  const delB = C.hex(C.rand(16));
+  const code = await pilePost(ik.tagB, answer, delB);
   if (code !== 200) throw new Error(invalid);
+  // Die eigene Antwort wird entfernt, sobald das Gegenüber sich meldet (oder nach einem Tag).
+  c.ib = { t: ik.tagB, d: delB, exp: nowSec() + INVITE_SECONDS + 3600 };
   pileDrop(ik.tagA);
   S.acct.ch.unshift(c);
   const r = runOf(c);
@@ -1427,9 +1476,16 @@ async function joinChannel(codeText, name, password) {
 }
 
 // Abgelaufene Einmal-Codes entfernen (24 Stunden).
+function dropAnswerBlock(c) {
+  if (!c.ib) return;
+  queueDelete(c.ib.t, c.ib.d, randBetween(2000, 30000));
+  delete c.ib;
+  saveLazy();
+}
 function expireInvites() {
   if (!S.acct) return;
   for (const c of [...S.acct.ch]) {
+    if (c.ib && c.ib.exp <= nowSec()) dropAnswerBlock(c);
     // Ist das Gegenüber schon beigetreten, läuft nichts mehr ab: es fehlt nur das Passwort.
     if (c.pend && !c.pend.ans && c.pend.exp <= nowSec()) {
       queueDelete(c.pend.ta, c.pend.da);
@@ -1467,7 +1523,7 @@ function startLoops() {
   loop(async () => {
     const big = randInt(40) === 0;
     const tag = C.hex(C.rand(16)), token = C.hex(C.rand(16));
-    const code = await pilePost(tag, C.rand(big ? 65564 : 4124), token, 20);
+    const code = await pilePost(tag, C.rand(big ? 65564 : 4124), token, 24);
     if (code === 200) queueDelete(tag, token, randBetween(4000, 90000));
   }, () => Math.round(randExp(10000, 1200, 45000)));
   // Ablauf der Anzeige-Zeit und der Einmal-Schlüssel
@@ -1750,10 +1806,10 @@ function stopScan() {
 }
 async function startScan(video, onText) {
   stopScan();
-  if (!navigator.mediaDevices || !window.jsQR) throw new Error("Die Kamera steht hier nicht zur Verfügung. Bitte den Code abtippen.");
+  if (!navigator.mediaDevices || !window.jsQR) throw new Error("Die Kamera steht hier nicht zur Verfügung. Bitte den Schlüssel einfügen.");
   let stream;
   try { stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" }, audio: false }); }
-  catch (e) { throw new Error("Kein Zugriff auf die Kamera. Bitte den Code abtippen."); }
+  catch (e) { throw new Error("Kein Zugriff auf die Kamera. Bitte den Schlüssel einfügen."); }
   video.srcObject = stream;
   video.setAttribute("playsinline", "");
   await video.play().catch(() => {});
@@ -1923,15 +1979,21 @@ async function endMode(c, kind) {
 
 function channelMenu(c) {
   const items = [];
-  items.push(menuItem("Alle Nachrichten bei beiden löschen", "Sofort und ohne Zustimmung deines Gegenübers. Gilt auch für einen behaltenen Verlauf. Der Kanal bleibt bestehen.", true, () => clearForBoth(c)));
+  items.push(menuItem("Alle Nachrichten bei beiden löschen", "Sofort und ohne Zustimmung deines Gegenübers. Gilt auch für einen behaltenen Verlauf. Der Kanal bleibt bestehen.", true, () => confirmClear(c)));
   if (c.keep) items.push(menuItem("Verlauf nicht mehr behalten", "Sofort und ohne Zustimmung deines Gegenübers. Der gespeicherte Verlauf wird bei euch beiden gelöscht, ab dann verschwinden Nachrichten wieder.", false, () => endMode(c, "keep")));
   else items.push(menuItem("Verlauf behalten anfragen", "Standard ist: alles verschwindet. Dein Gegenüber muss zustimmen. Abschalten kann es später jeder von euch allein.", false, () => requestMode(c, "keep")));
   if (c.shots) items.push(menuItem("Screenshots wieder verbieten", "Sofort und ohne Zustimmung deines Gegenübers.", false, () => endMode(c, "shots")));
   else items.push(menuItem("Screenshots erlauben anfragen", "Standard ist: Ein erkannter Screenshot-Versuch löst den Kanal bei euch beiden auf. Am Handy kann eine Webseite Screenshots nicht erkennen.", false, () => requestMode(c, "shots")));
   const sym = el("div", "sheet-item static");
-  sym.appendChild(el("span", "sheet-label", "Prüf-Zahl"));
+  sym.appendChild(el("span", "sheet-label", c.vf ? "Prüf-Zahl (geprüft)" : "Prüf-Zahl (noch nicht geprüft)"));
   sym.appendChild(el("span", "sym-row", c.sym || ""));
-  sym.appendChild(el("span", "sheet-sub", "Steht bei deinem Gegenüber dieselbe Zahl, hat sich niemand dazwischengedrängt."));
+  sym.appendChild(el("span", "sheet-sub", "Vergleicht diese Zahl einmal, am besten persönlich oder am Telefon. Steht bei deinem Gegenüber dieselbe Zahl, hat sich niemand dazwischengedrängt."));
+  if (!c.vf) {
+    const okBtn = el("button", "ghost small", "Die Zahl stimmt überein");
+    okBtn.type = "button";
+    okBtn.addEventListener("click", () => { c.vf = 1; bump(c); saveSoon(); closeSheet(); renderChat(); toast("Kanal als geprüft markiert.", "ok"); });
+    sym.appendChild(okBtn);
+  }
   items.push(sym);
   items.push(menuItem("Kanal umbenennen", "", false, () => {
     formSheet("Kanal umbenennen", {
@@ -1980,19 +2042,63 @@ async function deleteForBoth(c, m) {
 
 // Leert den Kanal auf diesem Gerät: angezeigte Nachrichten, Anhänge und ein
 // gespeicherter Verlauf. Der Kanal selbst und seine Einstellungen bleiben.
+// Kurze Rückfrage, damit niemand aus Versehen alles löscht.
+function confirmClear(c) {
+  const yes = el("button", "sheet-choice danger-fill", "Ja, alles bei beiden löschen");
+  yes.type = "button";
+  yes.addEventListener("click", () => { closeSheet(); clearForBoth(c); });
+  const no = el("button", "sheet-choice", "Abbrechen");
+  no.type = "button";
+  no.addEventListener("click", closeSheet);
+  openSheetNodes("Alle Nachrichten löschen?", [
+    infoNode("Alle Nachrichten in diesem Kanal verschwinden sofort bei dir und bei deinem Gegenüber, auch ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
+    no, yes,
+  ], true);
+}
 function clearLocal(c) {
   const r = runOf(c);
   for (const m of r.msgs) dropMedia(c, m, true);
   r.msgs = [];
-  if (c.hist) { c.hist = ""; bump(c); }
+  c.hist = "";
+  c.hv = (c.hv || 0) + 1;
+  bump(c);
   if (_histTimers[c.id]) { clearTimeout(_histTimers[c.id]); delete _histTimers[c.id]; }
   saveSoon();
   if (S.active === c.id) renderChat();
 }
 
-// Löscht ALLE Nachrichten dieses Kanals bei beiden, sofort und ohne Zustimmung
-// des Gegenübers. Gilt auch für einen behaltenen Verlauf und für Nachrichten,
-// die das Gegenüber noch gar nicht geöffnet hat.
+// Sieht in den wartenden stillen Steuerzeichen nach, ob das Gegenüber alles
+// gelöscht oder „Verlauf behalten“ abgeschaltet hat, und setzt das um, BEVOR
+// Verlauf geladen oder Nachrichten geöffnet werden. Jeder Auftrag wird genau
+// einmal umgesetzt. Die Steuerzeichen selbst bleiben liegen und werden danach
+// ganz normal verarbeitet (und vom Server gelöscht).
+async function applyPendingClear(c, kMsg) {
+  const r = runOf(c), p = peerDir(c);
+  const done = new Set(c.ca || []);
+  const fresh = [];
+  let cutoff = -1, keepOff = false;
+  for (const [n, block] of r.cwait) {
+    if (done.has(n)) continue;
+    let b = null;
+    try { b = await C.openJson(await C.msgKey(kMsg, p + "c", n), block, C.BLOCK); } catch (e) { continue; }
+    if (!b || typeof b !== "object") continue;
+    if (b.t === "clr" && Number.isInteger(b.upto) && b.upto >= 0) { cutoff = Math.max(cutoff, b.upto); fresh.push(n); }
+    else if (b.t === "set" && b.k === "keep" && !b.v) { keepOff = true; fresh.push(n); }
+  }
+  if (!fresh.length) return;
+  c.ca = [...(c.ca || []), ...fresh].filter(n => n >= (c.rc || 0) - WINDOW_BACK).slice(-64);
+  if (keepOff && c.keep) c.keep = 0;
+  if (cutoff >= 0) {
+    c.cf = Math.max(c.cf || 0, cutoff);
+    clearLocal(c);
+  } else if (keepOff) {
+    c.hist = "";
+    c.hv = (c.hv || 0) + 1;
+    bump(c);
+    saveSoon();
+  }
+}
+
 async function clearForBoth(c) {
   const r = runOf(c);
   if (!r.kMsg || !r.kDel) return;
@@ -2072,6 +2178,9 @@ function renderList() {
     meta.appendChild(line);
     row.appendChild(av); row.appendChild(meta);
     row.addEventListener("click", () => openChannel(c.id));
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.addEventListener("keydown", (e) => { if (e.key === "Enter") openChannel(c.id); });
     list.appendChild(row);
   }
   document.title = (unread > 0 ? "(" + unread + ") " : "") + APP_NAME;
@@ -2127,6 +2236,7 @@ function renderChat(forceBottom) {
   if (c.keep) chip("Verlauf wird behalten (verschlüsselt, nur für euch beide). Jeder von euch kann ihn jederzeit bei beiden löschen.");
   else chip("Deine Nachrichten bleiben " + fmtDuration(S.acct.set.view) + " nach dem Öffnen sichtbar, danach werden sie gelöscht. Beim Verlassen des Chats sofort.", ICON.timer);
   chip(c.shots ? "Screenshots erlaubt" : "Screenshots verboten");
+  if (!c.vf) chip("Noch nicht geprüft: Vergleicht einmal eure Prüf-Zahl (Menü oben rechts).");
   if (c.ro.length) chip("Anfrage gesendet: wartet auf Zustimmung");
 
   const nearBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 140;
@@ -2171,6 +2281,8 @@ function messageRow(c, m) {
     if (e.target.closest("button, a, audio, video")) return;
     messageMenu(c, m);
   });
+  bubble.tabIndex = 0;
+  bubble.addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target === bubble) messageMenu(c, m); });
   row.appendChild(bubble);
   return row;
 }
@@ -2287,7 +2399,7 @@ function bindUI() {
     const msg = $("#auth-msg");
     msg.textContent = "Anmelden …";
     try { await doLogin(e.target.words.value); msg.textContent = ""; e.target.words.value = ""; }
-    catch (err) { if (S.me) logout(); msg.textContent = err.message || "Anmeldung nicht möglich"; }
+    catch (err) { if (S.me) logout(); if (err.gone) e.target.words.value = ""; msg.textContent = err.message || "Anmeldung nicht möglich"; }
   });
   $("#form-register").addEventListener("submit", async (e) => {
     e.preventDefault();

@@ -198,15 +198,18 @@
   }
   // Aus dem gemeinsamen Geheimnis: Schlüssel für Marken, Inhalt, Löschen, Auflösen.
   async function channelKeys(root) {
+    // Prüf-Zahl: 12 Ziffern aus dem gemeinsamen Geheimnis. Steht bei beiden
+    // dieselbe Zahl, hat sich niemand dazwischengedrängt.
     const sym = await hkdf(root, "chatmesh2|verify", 8);
-    const EMOJI = ["🔑","🌙","🐬","⚡","🍀","🔥","🎈","🌵","🐝","🍉","🚲","🎧","🧩","🪁","🦊","🐢","🌻","🍋","⛵","🎲","🪐","🐙","🍄","🧭","🎯","🦉","🌈","🥝","🛼","🪴","🐳","🍒"];
+    let v = 0;
+    for (let i = 0; i < 5; i++) v = v * 256 + sym[i];
+    const digits = String(v % 1e12).padStart(12, "0");
     return {
       kTag: await hkdf(root, "chatmesh2|ch|tag"),
       kMsg: await hkdf(root, "chatmesh2|ch|msg"),
       kDel: await hkdf(root, "chatmesh2|ch|del"),
       kDis: await hkdf(root, "chatmesh2|ch|dissolve"),
-      // 8 Symbole (40 Bit): ein Dazwischendrängen lässt sich nicht passend zurechtprobieren.
-      symbols: Array.from(sym).map(v => EMOJI[v % EMOJI.length]).join(" "),
+      symbols: digits.slice(0, 4) + " " + digits.slice(4, 8) + " " + digits.slice(8),
     };
   }
   function dn(dir, n) { return dir + "|" + String(n); }

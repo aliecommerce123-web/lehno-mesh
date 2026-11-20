@@ -71,7 +71,7 @@ bekommt nur Geheimtext.
   und ein Schlüssel. Unter der ersten Marke liegt das verschlüsselte Angebot
   mit einem frischen ECDH-Schlüssel (P-256), unter der zweiten die Antwort.
   Aus ECDH-Geheimnis, Code und beiden öffentlichen Schlüsseln entsteht per
-  HKDF die Wurzel des Kanals. Acht Prüf-Symbole zeigen beiden Seiten, dass
+  HKDF die Wurzel des Kanals. Eine Prüf-Zahl (12 Ziffern) zeigt beiden Seiten, dass
   sich niemand dazwischengedrängt hat.
 - **Kanal:** Aus der Wurzel entstehen vier Schlüssel: für Marken, Inhalt,
   Löschen und Auflösen. Für jede Nachricht werden daraus per HMAC/HKDF eine
@@ -103,8 +103,12 @@ bekommt nur Geheimtext.
   Anfrage, immer Status 200, gleiche Länge und Mindestdauer der Antwort.
 - Abrufe des Haufens, Schein-Blöcke und das Speichern des Kontos laufen in
   zufälligen Abständen, mit und ohne Anlass.
-- Der Server setzt keine Cookies, speichert nichts im Browser, schreibt kein
-  Zugriffsprotokoll und liest keine IP-Adresse oder Gerätekennung.
+- Der Server setzt keine Cookies, schreibt kein Zugriffsprotokoll und liest
+  keine IP-Adresse oder Gerätekennung.
+- Im Browser liegt nur die Anmeldung, verschlossen mit dem eigenen Code des
+  Nutzers, und nur im Speicher dieses einen Fensters: Nach dem Neu-Laden der
+  Seite genügt der Code. Fenster zu oder abgemeldet, und sie ist weg.
+- Die App beobachtet weder Maus noch Tastatur, um Untätigkeit zu erkennen.
 
 ## Was der Server nicht kann
 

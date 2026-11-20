@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b141c" />
+  <meta name="theme-color" content="#14171a" />
   <meta name="referrer" content="no-referrer" />
   <title>chatmesh</title>
   <link rel="manifest" href="/manifest.json" />
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2323d5ab'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
-  <link rel="stylesheet" href="/s/style.css?v=5" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2314171a'/%3E%3Ctext x='32' y='43' font-size='34' text-anchor='middle' fill='%23ffffff' font-family='Arial,sans-serif' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/s/style.css?v=9" />
 </head>
 <body>
 <noscript>
@@ -38,11 +38,7 @@
     </form>
 
     <form id="form-register" class="auth-form">
-      <p class="hint">Dein Konto hat keinen Namen und kein Passwort. Du bekommst zweimal 12 Wörter:</p>
-      <ul class="plain-list">
-        <li><b>12 Anmeldewörter:</b> damit meldest du dich an.</li>
-        <li><b>12 Löschwörter:</b> Gibst du sie bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, bei dir und bei deinen Gegenübern. Ohne Rückfrage. Es sieht danach so aus, als hätte es das Konto nie gegeben.</li>
-      </ul>
+      <p class="hint">Dein Konto hat keinen Namen und kein Passwort. Dein Konto sind 12 Wörter, die nur du kennst. Mit ihnen meldest du dich an.</p>
       <p class="hint">Es gibt keine Wiederherstellung. Wer die Wörter verliert, verliert das Konto. Ein Konto, das ein Jahr lang nicht benutzt wird, wird vom Server entfernt.</p>
       <button type="submit" class="primary" data-needs-js disabled>Anonymes Konto anlegen</button>
     </form>
@@ -62,15 +58,14 @@
 <!-- ================= WÖRTER NACH DEM ANLEGEN ================= -->
 <section id="view-words" class="view">
   <div class="mnemonic-card">
-    <h2>Deine zwei Wort-Sätze</h2>
-    <p>Schreib beide auf Papier oder lade die Datei herunter und bewahre sie offline auf. Niemals als Foto oder in einer Cloud speichern. Wir kennen diese Wörter nicht und können sie nicht wiederherstellen. Die Wörter sind englisch, weil das die weltweit übliche Liste ist.</p>
+    <h2>Deine 12 Wörter</h2>
+    <p>Schreib sie auf Papier oder lade die Datei herunter und bewahre sie offline auf. Niemals als Foto oder in einer Cloud speichern. Wir kennen diese Wörter nicht und können sie nicht wiederherstellen. Die Wörter sind englisch, weil das die weltweit übliche Liste ist.</p>
 
-    <h3 class="words-title">1. Anmeldewörter</h3>
-    <p class="small-note">Damit meldest du dich an.</p>
+    <p class="small-note" style="margin-top:14px">Mit diesen 12 Wörtern meldest du dich an:</p>
     <div id="words-login" class="mnemonic-grid"></div>
 
-    <h3 class="words-title danger-text">2. Löschwörter</h3>
-    <p class="small-note">Gibst du diese Wörter bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, ohne Rückfrage. Es gibt dafür keinen eigenen Knopf. Nicht mit den Anmeldewörtern verwechseln.</p>
+    <h3 class="words-title danger-text">Für den Notfall: Löschwörter</h3>
+    <p class="small-note">Gibst du diese Wörter bei „Anmelden“ ein, wird alles sofort unwiderruflich gelöscht, ohne Rückfrage. Es gibt dafür keinen eigenen Knopf. Nicht mit deinen 12 Wörtern verwechseln.</p>
     <div id="words-wipe" class="mnemonic-grid wipe"></div>
 
     <div class="btn-row">
@@ -78,9 +73,29 @@
     </div>
     <label class="confirm-row">
       <input type="checkbox" id="words-confirm">
-      <span>Ich habe beide Wort-Sätze gesichert. Mir ist klar, dass es keinen anderen Weg zurück ins Konto gibt.</span>
+      <span>Ich habe meine Wörter gesichert. Mir ist klar, dass es keinen anderen Weg zurück ins Konto gibt.</span>
     </label>
     <button id="words-continue" class="primary" disabled>Weiter</button>
+  </div>
+</section>
+
+<!-- ================= EIGENER CODE ================= -->
+<section id="view-code" class="view">
+  <div class="auth-card">
+    <div class="brand"><h1>chatmesh</h1></div>
+    <h2 id="code-title" class="code-title"></h2>
+    <p id="code-info" class="hint"></p>
+    <form id="form-code" class="auth-form active code-form">
+      <label><span>Dein Code</span>
+        <input name="code" class="pw" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+      </label>
+      <label id="code-repeat"><span>Code wiederholen</span>
+        <input name="code2" class="pw" type="text" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false">
+      </label>
+      <button type="submit" class="primary" id="code-submit" data-needs-js disabled>Weiter</button>
+    </form>
+    <div id="code-msg" class="msg"></div>
+    <button type="button" class="ghost small code-out" id="code-logout">Abmelden</button>
   </div>
 </section>
 
@@ -150,11 +165,11 @@
 </div>
 
 <!-- Kein Inline-Script (strenge CSP). -->
-<script src="/s/vendor/qrcode.js?v=5"></script>
-<script src="/s/vendor/jsqr.js?v=5"></script>
-<script src="/s/bip39.js?v=5"></script>
-<script src="/s/crypto.js?v=5"></script>
-<script src="/s/media.js?v=5"></script>
-<script src="/s/app.js?v=5"></script>
+<script src="/s/vendor/qrcode.js?v=9"></script>
+<script src="/s/vendor/jsqr.js?v=9"></script>
+<script src="/s/bip39.js?v=9"></script>
+<script src="/s/crypto.js?v=9"></script>
+<script src="/s/media.js?v=9"></script>
+<script src="/s/app.js?v=9"></script>
 </body>
 </html>

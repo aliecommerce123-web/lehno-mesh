@@ -3,22 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0a0e1a" />
+  <meta name="theme-color" content="#14171a" />
   <title>chatmesh über Tor</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2300d4a8'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2314171a'/%3E%3Ctext x='32' y='43' font-size='34' text-anchor='middle' fill='%23ffffff' font-family='Arial,sans-serif' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
   <style>
     :root {
-      --bg: #0a0e1a;
-      --bg-2: #111726;
-      --bg-3: #1a2236;
-      --line: #243049;
-      --text: #e6edf7;
-      --text-dim: #8794ad;
-      --text-dimmer: #5a6580;
-      --accent: #00d4a8;
-      --accent-dark: #00b893;
-      --warn: #ffb347;
+      --bg: #f6f7f8; --bg-2: #ffffff; --bg-3: #eceef0; --line: #e0e3e7; --text: #14171a; --text-dim: #5c6570; --text-dimmer: #8b939d;
+      --accent: #2563eb; --accent-dark: #1d4fc0; --warn: #9a5b00;
     }
+    @media (prefers-color-scheme: dark) { :root { --bg: #101214; --bg-2: #181b1e; --bg-3: #22262a; --line: #2b3035; --text: #eceef0; --text-dim: #9da5ae; --text-dimmer: #6f7780; --accent: #3b82f6; --accent-dark: #2f6fe0; --warn: #e0a84a; } }
     * { box-sizing: border-box; }
     html, body {
       margin: 0; padding: 0; min-height: 100vh;
@@ -35,14 +28,14 @@
       padding: 32px;
       max-width: 580px;
       width: 100%;
-      box-shadow: 0 8px 40px rgba(0,0,0,0.45);
+      
     }
     .brand {
       display: flex; align-items: center; gap: 10px; margin-bottom: 8px;
     }
     .brand-dot {
       width: 12px; height: 12px; border-radius: 50%;
-      background: var(--accent); box-shadow: 0 0 12px var(--accent);
+      display: none;
     }
     h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.5px; }
     h2 { margin: 24px 0 10px; font-size: 17px; }
@@ -71,7 +64,7 @@
     }
     .step-num {
       background: var(--accent);
-      color: #001b14;
+      color: #ffffff;
       width: 26px; height: 26px;
       border-radius: 50%;
       display: flex; align-items: center; justify-content: center;
@@ -110,7 +103,7 @@
     button, .btn {
       cursor: pointer;
       background: var(--accent);
-      color: #001b14;
+      color: #ffffff;
       border: 0;
       padding: 10px 18px;
       border-radius: 9px;
@@ -233,6 +226,6 @@
   </div>
 </div>
 
-<script src="/s/landing.js?v=2"></script>
+<script src="/s/landing.js?v=6"></script>
 </body>
 </html>

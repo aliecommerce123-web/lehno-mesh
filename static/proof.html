@@ -3,46 +3,42 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b141c" />
+  <meta name="theme-color" content="#14171a" />
   <meta name="referrer" content="no-referrer" />
   <title>chatmesh: Beweis</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='28' fill='%2323d5ab'/%3E%3Ctext x='32' y='42' font-size='32' text-anchor='middle' fill='%23001b14' font-family='monospace' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2314171a'/%3E%3Ctext x='32' y='43' font-size='34' text-anchor='middle' fill='%23ffffff' font-family='Arial,sans-serif' font-weight='700'%3Ec%3C/text%3E%3C/svg%3E" />
   <style>
-    :root { --bg:#0b141c; --bg2:#131d27; --bg3:#1b2835; --line:#22303e; --text:#eaf1f8; --dim:#8a9bb0; --dimmer:#5d6f84; --accent:#23d5ab; --blue:#3aa0ff; --warn:#ffb347; }
+    :root { --bg:#ffffff; --bg2:#f6f7f8; --bg3:#eceef0; --line:#e0e3e7; --text:#14171a; --dim:#5c6570; --dimmer:#8b939d; --accent:#2563eb; --warn:#9a5b00; --code:#f6f7f8; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#101214; --bg2:#181b1e; --bg3:#22262a; --line:#2b3035; --text:#eceef0; --dim:#9da5ae; --dimmer:#6f7780; --accent:#3b82f6; --warn:#e0a84a; --code:#181b1e; } }
     * { box-sizing: border-box; }
-    html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif; }
+    html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; }
     a { color: var(--accent); }
-    .wrap { max-width: 980px; margin: 0 auto; padding: 22px 14px 60px; }
+    .wrap { max-width: 900px; margin: 0 auto; padding: 22px 14px 60px; }
     header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .dot { width: 14px; height: 14px; border-radius: 50%; background: linear-gradient(135deg, var(--accent), var(--blue)); box-shadow: 0 0 16px rgba(35,213,171,.7); }
-    h1 { font-size: 26px; margin: 0; letter-spacing: -0.5px; }
+    .dot { display: none; }
+    h1 { font-size: 24px; margin: 0; letter-spacing: -0.4px; }
     h2 { font-size: 18px; margin: 0 0 6px; }
     h3 { font-size: 15px; margin: 16px 0 4px; }
     .lead { color: var(--dim); margin: 10px 0 18px; max-width: 760px; }
-    .card { background: var(--bg2); border: 1px solid var(--line); border-radius: 18px; padding: 16px; margin: 14px 0; }
+    .card { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin: 14px 0; }
     .card p { color: var(--dim); margin: 6px 0 10px; font-size: 14px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
-    .stat { background: var(--bg3); border-radius: 14px; padding: 12px; }
+    .stat { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
     .stat b { display: block; font-size: 22px; }
     .stat span { font-size: 12px; color: var(--dim); }
-    .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 12px; border: 1px solid var(--line); }
+    .scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: 10px; border: 1px solid var(--line); }
     table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 420px; }
     th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
-    th { color: var(--dimmer); font-weight: 600; background: var(--bg3); }
-    pre, code, .mono { font-family: ui-monospace, "JetBrains Mono", Menlo, monospace; }
-    pre { background: #0a1118; border: 1px solid var(--line); border-radius: 12px; padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.45; color: #cfe6ff; white-space: pre; margin: 8px 0; max-height: 420px; }
-    .tails { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
-    .tails span { font-family: ui-monospace, monospace; font-size: 12.5px; background: var(--bg3); border-radius: 8px; padding: 3px 8px; }
-    .row { display: flex; gap: 8px; flex-wrap: wrap; }
-    input { flex: 1; min-width: 200px; background: var(--bg3); border: 1px solid var(--line); border-radius: 12px; padding: 11px 12px; color: var(--text); font: inherit; font-size: 16px; }
-    button { background: linear-gradient(135deg, var(--accent), #2bb7d6); color: #021a14; border: 0; border-radius: 12px; padding: 11px 16px; font: inherit; font-weight: 600; cursor: pointer; }
+    th { color: var(--dim); font-weight: 600; background: var(--bg2); }
+    pre, code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.45; color: var(--text); white-space: pre; margin: 8px 0; max-height: 420px; }
     .ok { color: var(--accent); } .warn { color: var(--warn); }
-    .pill { display: inline-block; font-size: 11.5px; padding: 2px 9px; border-radius: 999px; border: 1px solid rgba(35,213,171,.4); color: var(--accent); margin-left: 6px; font-weight: 500; }
+    .pill { display: inline-block; font-size: 11.5px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line); color: var(--dim); margin-left: 6px; font-weight: 500; }
     ul { color: var(--dim); font-size: 14px; padding-left: 20px; }
     li { margin: 6px 0; }
     li b { color: var(--text); }
     .small { font-size: 12.5px; color: var(--dimmer); }
-    .files a { font-family: ui-monospace, monospace; }
+    .files a { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .to-app { margin-left: auto; }
   </style>
 </head>
@@ -109,6 +105,6 @@
     <p class="small">Ehrliche Grenzen: Die App kommt als Webseite von diesem Server. Deshalb ist der Quelltext oben offen und mit Prüfsummen versehen, damit jeder kontrollieren kann, was ausgeliefert wird. Alles oben beschreibt, was dieser Quelltext tut: Er speichert und wertet nichts aus. Ein heimlich veränderter Server könnte mehr mitschreiben, zum Beispiel wann welche Verbindung einen Block löscht. Genau dagegen helfen die Prüfsummen und der Tor-Browser. Das Verschwinden von Nachrichten setzt die App deines Gegenübers um. Ein Screenshot-Versuch am Rechner löst den Kanal auf, sicher verhindern kann eine Webseite Bildschirmfotos aber nicht, vor allem nicht am Handy, und niemand kann verhindern, dass jemand den Bildschirm abfotografiert. Bei gewöhnlichen Dateien (zum Beispiel PDF) können eingebettete Angaben nicht entfernt werden, bei Bildern, Videos und Sprachnachrichten schon.</p>
   </div>
 </div>
-<script src="/s/proof.js?v=2"></script>
+<script src="/s/proof.js?v=6"></script>
 </body>
 </html>

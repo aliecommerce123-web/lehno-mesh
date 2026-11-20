@@ -31,10 +31,15 @@ import json
 import math
 import os
 import secrets
+import struct
 import sys
 from collections import deque
 
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 TARGET = os.environ.get("LEHNO_MESH_BOT_TARGET", "http://127.0.0.1:8000")
 HOST = os.environ.get("LEHNO_MESH_BOT_HOST", "localhost").strip().lower()
@@ -49,7 +54,7 @@ MAX_LINGER = 400                         # so viele Blöcke dürfen ohne Löschu
 MAX_ATTACHMENTS = 2                      # so viele Schein-Anhänge gleichzeitig unterwegs
 MAX_LINGER_ATTACHMENTS = 30              # so viele kleine Schein-Anhänge dürfen liegen bleiben
 MAX_WORK_BITS = 24                       # wird die Rechenaufgabe schwerer, pausieren die Bots (wie die Schein-Blöcke der App)
-CLIENT_VER = 2            # dieselbe Fassungs-Angabe wie die App
+CLIENT_VER = 3            # dieselbe Fassungs-Angabe wie die App
 
 PEOPLE_MIN, PEOPLE_MAX = 5, 24           # so viele Schein-Menschen gibt es gleichzeitig
 NEW_PER_DAY_MAX = 6                      # mehr neue Schein-Konten entstehen nie an einem Tag
@@ -111,10 +116,109 @@ class Mood:
 mood = Mood()
 
 
+X_SIZES = (512, 1024, 2048, 4608)
+X_BLOCK_REQ = 4608
+X_BIN_FIELDS = ("data", "blob", "wipe_blob")
+X_BLOCK_OPS = {("POST", "/api/v2/pile"), ("POST", "/api/v2/pile/fetch"), ("POST", "/api/v2/pile/delete")}
+
+
+class Answer:
+    """Antwort aus einem versiegelten Umschlag (so viel, wie dieses Programm braucht)."""
+    def __init__(self, status: int, headers: dict, content: bytes):
+        self.status_code, self.headers, self.content = status, headers, content
+
+    def json(self):
+        return json.loads(self.content.decode())
+
+
+class Sealed:
+    """Schickt jede Anfrage wie die App im versiegelten Umschlag an den einen Eingang."""
+    def __init__(self, raw: httpx.AsyncClient):
+        self.raw = raw
+        self.pub = None
+
+    async def key(self):
+        if self.pub is None:
+            r = await self.raw.get("/api/v2/config")
+            pub = base64.b64decode(r.json()["seal"])
+            if len(pub) != 65:
+                raise ValueError("seal key")
+            self.pub = pub
+        return self.pub
+
+    async def request(self, method: str, path: str, **kw) -> Answer:
+        if path == "/healthz":
+            r = await self.raw.request(method, path)
+            return Answer(r.status_code, {}, r.content)
+        req = self.raw.build_request(method, path, **kw)
+        body = req.read()
+        # Wie die App: Binärdaten roh in den Umschlag, die übrigen Angaben in den Kopf.
+        extra = {}
+        data = kw.get("json")
+        if isinstance(data, dict) and any(isinstance(data.get(k), str) for k in X_BIN_FIELDS):
+            parts, bins = [], []
+            rest = {}
+            for k, v in data.items():
+                if k in X_BIN_FIELDS and isinstance(v, str):
+                    raw = base64.b64decode(v)
+                    parts.append([k, len(raw)])
+                    bins.append(raw)
+                else:
+                    rest[k] = v
+            body = b"".join(bins)
+            extra = {"j": rest, "b": parts}
+        for attempt in (0, 1):
+            pub = await self.key()
+            head = json.dumps({
+                "m": method, "p": req.url.path, "q": req.url.query.decode(),
+                "a": req.headers.get("authorization", ""), "w": req.headers.get("x-work", ""),
+                "c": req.headers.get("content-type", "") if body else "", "n": len(body), **extra,
+            }, separators=(",", ":")).encode()
+            plain = struct.pack(">H", len(head)) + head + body
+            size = len(plain)
+            if (method, req.url.path) in X_BLOCK_OPS and size <= X_BLOCK_REQ:
+                size = X_BLOCK_REQ
+            else:
+                fit = [z for z in X_SIZES if size <= z]
+                step = 1024 if size <= 16384 else (4096 if size <= 262144 else 16384)
+                size = fit[0] if fit else -(-size // step) * step
+            plain += b"\x00" * (size - len(plain))
+            priv = ec.generate_private_key(ec.SECP256R1())
+            eph = priv.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+            shared = priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub))
+            kq = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"chatmesh2|x|req|" + eph + pub).derive(shared)
+            kr = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"chatmesh2|x|res|" + eph + pub).derive(shared)
+            nonce = os.urandom(12)
+            r = await self.raw.post("/api/v2/x", content=eph + nonce + AESGCM(kq).encrypt(nonce, plain, None), headers={"content-type": "application/octet-stream"})
+            if r.status_code == 400 and attempt == 0:
+                self.pub = None                 # Schlüssel des Eingangs hat gewechselt
+                continue
+            if r.status_code != 200:
+                return Answer(r.status_code, {}, b"")
+            out = AESGCM(kr).decrypt(r.content[:12], r.content[12:], None)
+            hlen = struct.unpack(">H", out[:2])[0]
+            rh = json.loads(out[2:2 + hlen].decode())
+            return Answer(int(rh["s"]), {"x-pile": rh.get("x") or ""}, out[2 + hlen:2 + hlen + int(rh.get("n", 0))])
+        return Answer(400, {}, b"")
+
+    async def get(self, path, **kw):
+        return await self.request("GET", path, **kw)
+
+    async def post(self, path, **kw):
+        return await self.request("POST", path, **kw)
+
+    async def put(self, path, **kw):
+        return await self.request("PUT", path, **kw)
+
+    async def delete(self, path, **kw):
+        return await self.request("DELETE", path, **kw)
+
+
 class Api:
     def __init__(self):
-        self.client = httpx.AsyncClient(base_url=TARGET, headers={"host": HOST}, timeout=60.0)
+        self.client = Sealed(httpx.AsyncClient(base_url=TARGET, headers={"host": HOST}, timeout=60.0))
         self.work = {"salt": "", "pile": [12, 16], "delete": 8, "account": [17, 19, 21, 23, 25], "upload": [16, 18, 20, 22]}
+        self.fresh = 0          # neue Einträge im zuletzt abgerufenen Verzeichnis
 
     def subject(self, raw: bytes) -> bytes:
         """Gegenstand der Rechenaufgabe: aktuelles Salz des Servers + Kennung + Art."""
@@ -166,7 +270,7 @@ class Api:
                     continue
                 work = await asyncio.to_thread(solve, self.subject(bytes.fromhex(tag) + b"d"), bits)
                 base = len(json.dumps({"tag": tag, "token": token, "work": work, "pad": ""}, separators=(",", ":")))
-                body = {"tag": tag, "token": token, "work": work, "pad": "x" * max(0, POST_LEN - base)}
+                body = {"tag": tag, "token": token, "work": work, "pad": ""}
                 r = await self.client.post("/api/v2/pile/delete", json=body)
                 if r.status_code == 200:
                     answer = r.json()
@@ -190,6 +294,7 @@ class Api:
             r = await self.client.get("/api/v2/pile/index", params={"since": cursor})
             if r.status_code != 200:
                 return cursor
+            self.fresh += len(r.content) // 5
             state = (r.headers.get("x-pile") or "ende:%d:0" % cursor).split(":")
             try:
                 cursor = max(cursor, int(state[1]))
@@ -213,9 +318,7 @@ class Api:
         return token if r.status_code == 200 else None
 
     async def download(self, token: str):
-        async with self.client.stream("GET", f"/api/attachments/{token}") as r:
-            async for _ in r.aiter_bytes():
-                pass
+        await self.client.get(f"/api/attachments/{token}")
 
     async def delete_upload(self, token: str):
         for wait in (0, 5, 30, 120):
@@ -386,11 +489,19 @@ async def session(api: Api, account: Account, spawn):
     next_save = account.save_pause()
     next_decoy = expo(10, 1.2, 45)
     chatting = 0
+    tokens = 1.0
     while loop.time() < end:
         step = 0.6 + rng.random() * 1.1           # Abruf wie die App
         await asyncio.sleep(step)
         try:
+            api.fresh = 0
             cursor = await api.fetch_pile(cursor)
+            # Wie die App: auf neue Einträge mit einem Schein-Abruf reagieren (begrenzt).
+            tokens = min(3.0, tokens + step / 6.0)
+            for _ in range(min(api.fresh, 12)):
+                if tokens >= 1 and rng.random() < 0.35:
+                    tokens -= 1
+                    spawn(later(rng.random() * 0.15, api.fetch_block, secrets.token_hex(16)))
             next_decoy -= step
             if next_decoy <= 0:
                 # Schein-Block der App: kurz da, dann wieder weg

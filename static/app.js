@@ -17,6 +17,9 @@
 // - Es gibt nirgends Uhrzeiten. Auf dem Gerät liegt nur die mit dem eigenen Code
 //   verschlossene Anmeldung, und nur bis das Browser-Fenster geschlossen wird.
 // - Schein-Verkehr: Abrufe und Schein-Blöcke in unregelmäßigen Abständen.
+// - Versiegelter Umschlag: Jede Anfrage geht verschlossen an einen einzigen Eingang,
+//   den nur der Server öffnen kann. Dazwischen ist nur zu sehen, von welchem Anschluss
+//   ein Umschlag kommt, nicht was darin steht. Der Server liest keine IP-Adresse.
 (function () {
 "use strict";
 const C = window.CM;
@@ -101,26 +104,142 @@ function el(tag, cls, text) {
 // =========================================================================
 class ApiError extends Error { constructor(m, status) { super(m); this.status = status; } }
 
+// -------------------------------------------------------------------------
+// Versiegelter Umschlag
+// Jede Anfrage geht verschlossen an einen einzigen Eingang. Öffnen kann sie nur
+// der Server. Wer dazwischen sitzt, sieht, von welchem Anschluss ein Umschlag
+// kommt, aber nicht, was darin steht. Der Server öffnet ihn, liest aber keine
+// IP-Adresse. Ablegen, Abholen und Löschen eines kleinen Blocks sind gleich groß.
+// -------------------------------------------------------------------------
+const X_PATH = "/api/v2/x";
+const X_SIZES = [512, 1024, 2048, 4608];
+const X_BLOCK_REQ = 4608;
+const X_BIN_FIELDS = ["data", "blob", "wipe_blob"];      // reisen roh statt als Base64
+const X_BLOCK_OPS = new Set(["POST /api/v2/pile", "POST /api/v2/pile/fetch", "POST /api/v2/pile/delete"]);
+let _sealKey = null, _sealAt = 0, _sealP = null, _tap = null, _failRe = null;
+const SEAL_FRESH_MS = 8 * 60 * 1000;     // der Server wechselt den Schlüssel alle zehn Minuten, der vorige gilt weiter
+function xPadLen(n, blockOp) {
+  if (blockOp && n <= X_BLOCK_REQ) return X_BLOCK_REQ;
+  for (const z of X_SIZES) if (n <= z) return z;
+  const step = n <= 16384 ? 1024 : (n <= 262144 ? 4096 : 16384);
+  return Math.ceil(n / step) * step;
+}
+// Der öffentliche Schlüssel des Eingangs steht in den öffentlichen Einstellungen.
+// Nur er und die Seite selbst werden ohne Umschlag geladen. Ohne ihn wird nichts
+// gesendet: Es gibt keinen unverschlossenen Ersatzweg.
+function sealRefresh() {
+  if (!_sealP) _sealP = (async () => {
+    let stop = null;
+    try {
+      const init = { cache: "no-store" };
+      if (typeof AbortController !== "undefined") { const ac = new AbortController(); init.signal = ac.signal; stop = setTimeout(() => { try { ac.abort(); } catch (e) {} }, 10000); }
+      const r = await fetch("/api/v2/config", init);
+      const c = await r.json();
+      const k = C.unb64(String(c.seal || ""));
+      if (k.length === 65 && k[0] === 4) { _sealKey = k; _sealAt = Date.now(); }
+    } catch (e) {}
+    if (stop) clearTimeout(stop);
+    _sealP = null;
+    return _sealKey;
+  })();
+  return _sealP;
+}
+async function sealKey() {
+  if (_sealKey) {
+    // Vorsorglich im Hintergrund erneuern, bevor er abläuft. Der alte gilt so lange weiter.
+    if (Date.now() - _sealAt > SEAL_FRESH_MS) sealRefresh().catch(() => {});
+    return _sealKey;
+  }
+  return await sealRefresh();
+}
+async function bodyBytes(body, headers) {
+  if (body === undefined || body === null) return new Uint8Array(0);
+  if (typeof body === "string") return C.utf8(body);
+  if (body instanceof Uint8Array) return body;
+  if (body instanceof ArrayBuffer) return new Uint8Array(body);
+  // Formular (Anhang): vom Browser in Bytes wandeln lassen, samt Inhalts-Angabe.
+  const tmp = new Response(body);
+  const ct = tmp.headers.get("content-type");
+  if (ct && !headers["content-type"]) headers["content-type"] = ct;
+  return new Uint8Array(await tmp.arrayBuffer());
+}
+async function sealedFetch(method, path, headers, body, signal, keepalive, json) {
+  const cut = path.indexOf("?");
+  const p = cut < 0 ? path : path.slice(0, cut), q = cut < 0 ? "" : path.slice(cut + 1);
+  if (_failRe && _failRe.test(method + " " + p)) throw new ApiError("Keine Verbindung zum Server", 0);
+  // Binärdaten (Block, Konto) gehen roh in den Umschlag, der Rest der Angaben in den Kopf.
+  let raw, extra = null;
+  if (json && typeof json === "object" && X_BIN_FIELDS.some(k => typeof json[k] === "string")) {
+    const j = {}, parts = [], bins = [];
+    for (const [k, v] of Object.entries(json)) {
+      if (X_BIN_FIELDS.includes(k) && typeof v === "string") { const b = C.unb64(v); parts.push([k, b.length]); bins.push(b); }
+      else j[k] = v;
+    }
+    raw = C.concat(...bins);
+    extra = { j, b: parts };
+  } else raw = await bodyBytes(body, headers);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const key = await sealKey();
+    if (!key) throw new ApiError("Keine Verbindung zum Server", 0);
+    const head = C.utf8(JSON.stringify(Object.assign({ m: method, p, q, a: headers["authorization"] || "", w: headers["x-work"] || "", c: headers["content-type"] || "", n: raw.length }, extra || {})));
+    const plain = new Uint8Array(xPadLen(2 + head.length + raw.length, X_BLOCK_OPS.has(method + " " + p)));
+    plain[0] = head.length >> 8; plain[1] = head.length & 255;
+    plain.set(head, 2); plain.set(raw, 2 + head.length);
+    const env = await C.xSeal(key, plain);
+    const init = { method: "POST", headers: { "content-type": "application/octet-stream" }, body: env.body, cache: "no-store" };
+    if (signal) init.signal = signal;
+    if (keepalive && env.body.length < 60000) init.keepalive = true;
+    let r;
+    try { r = await fetch(X_PATH, init); }
+    catch (e) {
+      // Der Browser erlaubt nur wenige Anfragen, die das Schließen der Seite überdauern dürfen.
+      // Ist dieses Kontingent erschöpft, geht dieselbe Anfrage noch einmal ohne diese Eigenschaft.
+      r = null;
+      if (init.keepalive && !(signal && signal.aborted)) { delete init.keepalive; try { r = await fetch(X_PATH, init); } catch (e2) { r = null; } }
+      if (!r) { if (_tap) _tap({ m: method, p, q, err: "netz " + (e && e.name), attempt }); throw new ApiError("Keine Verbindung zum Server", 0); }
+    }
+    if (!r.ok) {
+      // Antwort immer zu Ende lesen: Sonst hält der Browser die Verbindung als offen fest.
+      try { await r.arrayBuffer(); } catch (e) {}
+      if (r.status === 400 && attempt === 0) { if (_sealKey === key) _sealKey = null; continue; }      // Schlüssel des Eingangs hat gewechselt: neu holen
+      if (_tap) _tap({ m: method, p, q, err: "außen " + r.status, attempt });
+      throw new ApiError(r.status === 413 ? "too large" : "Keine Verbindung zum Server", r.status === 400 ? 0 : r.status);
+    }
+    let out;
+    try {
+      out = await C.open(env.resKey, new Uint8Array(await r.arrayBuffer()));
+    } catch (e) { throw new ApiError("Keine Verbindung zum Server", 0); }
+    const hl = (out[0] << 8) | out[1];
+    const rh = JSON.parse(C.fromUtf8(out.subarray(2, 2 + hl)));
+    const data = out.slice(2 + hl, 2 + hl + (rh.n || 0));
+    if (_tap) { try { _tap({ m: method, p, q, req: typeof body === "string" ? body : "", up: env.body.length, down: 12 + out.length + 16, status: rh.s, res: data }); } catch (e) {} }
+    return {
+      ok: rh.s >= 200 && rh.s < 300, status: rh.s, statusText: "",
+      headers: { get: (k) => { k = String(k).toLowerCase(); return (k === "x-pile" ? rh.x : k === "content-type" ? rh.c : "") || null; } },
+      json: async () => JSON.parse(C.fromUtf8(data)),
+      arrayBuffer: async () => data.buffer,
+      blob: async () => new Blob([data], { type: rh.c || "application/octet-stream" }),
+    };
+  }
+  throw new ApiError("Keine Verbindung zum Server", 0);
+}
+
 async function api(method, path, opt = {}) {
   const headers = Object.assign({}, opt.headers || {});
   const sid = S.sid;
   if (opt.auth) headers["authorization"] = "Bearer " + S.me.id + "." + S.me.token;
   let body = opt.body;
   if (opt.json !== undefined) { headers["content-type"] = "application/json"; body = JSON.stringify(opt.json); }
-  let r;
-  const init = { method, headers, body, cache: "no-store" };
-  if (opt.keepalive && typeof body === "string" && body.length < 60000) init.keepalive = true;
   // Mit Zeitgrenze: Ein hängender Abruf darf die folgenden nicht aufhalten.
-  let stop = null;
+  let stop = null, signal = null;
   if (opt.timeout && typeof AbortController !== "undefined") {
     const ac = new AbortController();
-    init.signal = ac.signal;
+    signal = ac.signal;
     stop = setTimeout(() => { try { ac.abort(); } catch (e) {} }, opt.timeout);
   }
-  try { r = await fetch(path, init); }
-  catch (e) { if (stop) clearTimeout(stop); throw new ApiError("Keine Verbindung zum Server", 0); }
-  if (stop && !opt.raw) clearTimeout(stop);
-  if (stop && opt.raw) r.__stop = stop;
+  let r;
+  try { r = await sealedFetch(method, path, headers, body, signal, !!opt.keepalive, opt.json); }
+  finally { if (stop) clearTimeout(stop); }
   if (!r.ok) {
     let detail = r.statusText;
     try { const j = await r.json(); if (j && j.detail) detail = String(j.detail); } catch (e) {}
@@ -136,6 +255,7 @@ async function loadConfig() {
   try {
     const c = await api("GET", "/api/v2/config");
     if (c && Number.isInteger(c.min_client) && c.min_client > CLIENT_VER) needReload();
+    if (c && typeof c.seal === "string") { try { const k = C.unb64(c.seal); if (k.length === 65 && k[0] === 4) { _sealKey = k; _sealAt = Date.now(); } } catch (e) {} }
     if (c && c.work && Array.isArray(c.work.pile) && Array.isArray(c.work.account) && Array.isArray(c.work.upload) && /^[0-9a-f]{16}$/.test(String(c.work.salt || ""))) S.work = c.work;
   } catch (e) {}
 }
@@ -169,7 +289,7 @@ async function pileDelete(tag, token) {
     if (bits > 24) return false;
     const work = await C.work(subject(tag, "d"), bits);
     const base = JSON.stringify({ tag, token, work, pad: "" }).length;
-    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "x".repeat(Math.max(0, POST_LEN - base)) } });
+    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "" } });
     if (r && r.code === 428) { await loadConfig(); return false; }
     return !!(r && (r.ok || r.code === 404));
   } catch (e) { return false; }
@@ -183,7 +303,7 @@ async function pileDeleteState(tag, token) {
     if (bits > 24) return "fail";
     const work = await C.work(subject(tag, "d"), bits);
     const base = JSON.stringify({ tag, token, work, pad: "" }).length;
-    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "x".repeat(Math.max(0, POST_LEN - base)) } });
+    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "" } });
     if (r && r.ok) return "ok";
     if (r && r.code === 404) return "gone";
     if (r && r.code === 428) await loadConfig();
@@ -785,7 +905,7 @@ async function startSession() {
 }
 // Fassung dieser App. Der Server nimmt Speicherungen älterer Fassungen nicht mehr an,
 // damit ein altes, noch offenes Fenster keine neueren Angaben überschreibt.
-const CLIENT_VER = 2;
+const CLIENT_VER = 3;
 let _reloadTold = false;
 // Der Server verlangt eine neuere Fassung: Ab hier würde nichts mehr gespeichert.
 // Deshalb wird die Bedienung angehalten, bis die Seite neu geladen ist. Die
@@ -948,32 +1068,59 @@ async function fetchBlocks(tags) {
   const out = new Map();
   for (const tag of tags) {
     const resp = await api("POST", "/api/v2/pile/fetch", { raw: true, timeout: 30000, json: { tags: [tag] } });
-    let buf;
-    try { buf = new Uint8Array(await resp.arrayBuffer()); } finally { if (resp.__stop) clearTimeout(resp.__stop); }
+    const buf = new Uint8Array(await resp.arrayBuffer());
     for (const [t, block] of parseBlocks(buf)) if (t === tag) out.set(t, block);
   }
   return out;
 }
 function pileDrop(tag) { S.index.delete(tag.slice(0, PFX)); }
+// Schein-Abrufe: Erscheint irgendwo ein neuer Block, reagieren mehrere zufällige Apps
+// mit einem Abruf, der von außen wie ein echter aussieht (er fragt nach einer Marke, die
+// es nicht gibt, und bekommt eine gleich große leere Antwort). So sieht es aus, als würde
+// jede Nachricht von mehreren abgeholt, ohne dass jemand fremde Nachrichten bekommt.
+const REACT_P = 35, REACT_EVERY = 12000, REACT_MAX = 2;
+let _reactTokens = 1, _reactAt = 0;
+function reactTo(count) {
+  const now = Date.now();
+  _reactTokens = Math.min(REACT_MAX, _reactTokens + (now - (_reactAt || now)) / REACT_EVERY);
+  _reactAt = now;
+  for (let i = 0; i < Math.min(count, 12) && _reactTokens >= 1; i++) {
+    if (randInt(100) >= REACT_P) continue;
+    _reactTokens -= 1;
+    const sid = S.sid, alive = () => S.me && sid === S.sid;
+    const t = setTimeout(async () => {
+      S.timers.delete(t);
+      if (!alive()) return;
+      try {
+        // Wie ein Empfang: abholen und, als wäre der Chat offen, Stand sichern und löschen.
+        await api("POST", "/api/v2/pile/fetch", { raw: true, timeout: 30000, json: { tags: [C.hex(C.rand(16))] } });
+        if (!alive() || randInt(2) === 0) return;
+        await saveAccount();
+        if (!alive()) return;
+        await pileDelete(C.hex(C.rand(16)), C.hex(C.rand(16)));
+      } catch (e) {}
+    }, randBetween(0, 150));
+    S.timers.add(t);
+  }
+}
 let _syncing = null, _indexFloor = 0;
 async function pileSync(initial) {
   const sid = S.sid;
   if (_syncing === sid || !S.me) return;
   _syncing = sid;
-  let fresh = false;
+  let fresh = false, added = 0;
   const fromZero = S.cursor === 0;
   try {
     for (let round = 0; round < 400; round++) {
       const resp = await api("GET", "/api/v2/pile/index?since=" + S.cursor, { raw: true, timeout: 30000 });
       const state = String(resp.headers.get("X-Pile") || "ende:" + S.cursor).split(":");
-      let buf;
-      try { buf = new Uint8Array(await resp.arrayBuffer()); } finally { if (resp.__stop) clearTimeout(resp.__stop); }
+      const buf = new Uint8Array(await resp.arrayBuffer());
       if (sid !== S.sid) return;
       const step = PFX / 2;
       if (buf.length % step || buf.length > INDEX_MAX * step) throw new Error("Verzeichnis ungültig");
       for (let o = 0; o + step <= buf.length; o += step) {
         const p = C.hex(buf.subarray(o, o + step));
-        if (!S.index.has(p)) S.index.set(p, S.indexN++);
+        if (!S.index.has(p)) { S.index.set(p, S.indexN++); added++; }
         fresh = true;
       }
       const last = Number(state[1]);
@@ -981,6 +1128,7 @@ async function pileSync(initial) {
       if (state[0] !== "weiter") break;
     }
     if (fromZero) _indexFloor = S.index.size;
+    else if (added) reactTo(added);
   } finally { if (_syncing === sid) _syncing = null; }
   if (initial) { matchPile().catch(() => {}); }
   else if (fresh || _matchRetry) await matchPile();
@@ -1378,19 +1526,46 @@ function freeUrls(r) { for (const u of r.urls) { try { URL.revokeObjectURL(u); }
 
 // Lädt einen Anhang, entschlüsselt ihn in den Arbeitsspeicher und löscht ihn
 // (außer bei „Verlauf behalten“) sofort vom Server.
+// Anhänge laden: höchstens zwei gleichzeitig. Ist der Server gerade voll oder die
+// Verbindung weg, wird mit Abstand wiederholt. "Nicht mehr verfügbar" heißt es nur,
+// wenn der Server ausdrücklich sagt, dass es den Anhang nicht mehr gibt.
+const MEDIA_PARALLEL = 2;
+let _mediaBusy = 0;
+const _mediaQueue = [];
+function mediaSlot() {
+  if (_mediaBusy < MEDIA_PARALLEL) { _mediaBusy++; return Promise.resolve(); }
+  return new Promise(res => _mediaQueue.push(res));
+}
+function mediaDone() {
+  const next = _mediaQueue.shift();
+  if (next) next(); else _mediaBusy--;
+}
 async function fetchMedia(c, m) {
   const r = runOf(c);
   if (m.url || m.loading) return;
   m.loading = true;
+  const sid = S.sid, wanted = () => sid === S.sid && S.me && S.active === c.id && r.msgs.includes(m);
+  await mediaSlot();
   try {
-    const resp = await api("GET", "/api/attachments/" + m.a.t, { raw: true });
-    const plain = await C.decryptFile(C.unb64(m.a.k), new Uint8Array(await resp.arrayBuffer()));
-    if (S.active !== c.id || !r.msgs.includes(m)) { m.loading = false; return; }
-    const show = (SHOW_MIMES[m.k] || []).includes(m.a.m);
-    m.url = URL.createObjectURL(new Blob([plain], { type: show ? m.a.m : "application/octet-stream" }));
-    r.urls.push(m.url);
-    if (!c.keep) dropAttachment(m.a.t);
-  } catch (e) { m.gone = true; }
+    for (let attempt = 0; attempt < 6; attempt++) {
+      if (!wanted()) { m.loading = false; return; }
+      try {
+        const resp = await api("GET", "/api/attachments/" + m.a.t, { raw: true });
+        const plain = await C.decryptFile(C.unb64(m.a.k), new Uint8Array(await resp.arrayBuffer()));
+        if (!wanted()) { m.loading = false; return; }
+        const show = (SHOW_MIMES[m.k] || []).includes(m.a.m);
+        m.url = URL.createObjectURL(new Blob([plain], { type: show ? m.a.m : "application/octet-stream" }));
+        r.urls.push(m.url);
+        if (!c.keep) dropAttachment(m.a.t);
+        break;
+      } catch (e) {
+        // 404: gibt es nicht mehr. Lässt sich die Datei nicht entschlüsseln, hilft Wiederholen auch nicht.
+        if (e && (e.status === 404 || !(e instanceof ApiError))) { m.gone = true; break; }
+        if (attempt === 5) { m.gone = true; break; }
+        await sleep(randBetween(1500, 3000) * (attempt + 1));
+      }
+    }
+  } finally { mediaDone(); }
   m.loading = false;
   if (S.active === c.id) renderChat();
 }
@@ -2016,26 +2191,42 @@ function loop(fn, nextDelay) {
 function startLoops() {
   // Verzeichnis abrufen
   loop(() => pileSync(false), () => randBetween(600, 1700));
-  // Schein-Blöcke: sehen aus wie echte, werden nach kurzer Zeit wieder gelöscht
+  // Schein-Vorgänge: Ein Schein-Block wird abgelegt und danach genau so behandelt wie
+  // eine echte empfangene Nachricht: abholen, Stand sichern, löschen, oft eine
+  // Bestätigung ablegen. Von außen ist die Abfolge von einer echten nicht zu unterscheiden.
   loop(async () => {
     const big = randInt(40) === 0;
     const tag = C.hex(C.rand(16)), token = C.hex(C.rand(16));
     const code = await pilePost(tag, C.rand(big ? 65564 : 4124), token, 24);
-    if (code === 200) {
-      // Meist wird er vorher abgeholt, so wie eine echte Nachricht vom Gegenüber abgeholt wird.
-      if (randInt(5) !== 0) {
-        const sid = S.sid, t = setTimeout(() => { S.timers.delete(t); if (S.me && sid === S.sid) fetchBlocks([tag]).catch(() => {}); }, randBetween(700, 3500));
-        S.timers.add(t);
-      }
-      queueDelete(tag, token, randBetween(4000, 90000));
-    }
-  }, () => Math.round(randExp(10000, 1200, 45000)));
+    if (code !== 200) return;
+    const sid = S.sid, alive = () => S.me && sid === S.sid;
+    const t = setTimeout(async () => {
+      S.timers.delete(t);
+      if (!alive()) return;
+      try {
+        if (randInt(6) === 0) { queueDelete(tag, token, randBetween(4000, 90000)); return; }      // bleibt "ungeöffnet" liegen
+        await fetchBlocks([tag]);
+        if (!alive()) return;
+        if (randInt(4) === 0) { queueDelete(tag, token, randBetween(4000, 90000)); return; }      // abgeholt, Chat aber nicht offen
+        await saveAccount();
+        if (!alive()) return;
+        queueDelete(tag, token);
+        if (randInt(5) !== 0) {
+          await sleep(randBetween(40, 400));
+          if (!alive()) return;
+          const tag2 = C.hex(C.rand(16)), token2 = C.hex(C.rand(16));
+          if ((await pilePost(tag2, C.rand(4124), token2, 24)) === 200) queueDelete(tag2, token2, randBetween(3000, 90000));
+        }
+      } catch (e) { queueDelete(tag, token, randBetween(4000, 90000)); }
+    }, randBetween(700, 3500));
+    S.timers.add(t);
+  }, () => Math.round(randExp(20000, 2500, 90000)));
   // Ablauf der Anzeige-Zeit und der Einmal-Schlüssel
   loop(async () => { tickExpiry(); expireInvites(); expireUnread(); }, () => 1000);
   // Konto in unregelmäßigen Abständen speichern, mit und ohne Anlass: von außen
   // sieht beides gleich aus. Größere Konten (mit behaltenem Verlauf) seltener.
   loop(async () => { await saveAccount(); }, () => {
-    const mean = (S.blobLen || 0) < 100000 ? 14000 : ((S.blobLen || 0) < 400000 ? 45000 : 120000);
+    const mean = (S.blobLen || 0) < 100000 ? 40000 : ((S.blobLen || 0) < 400000 ? 60000 : 120000);
     return Math.round(randExp(mean, mean / 4, mean * 4));
   });
   // Schwere der Rechenaufgabe ab und zu neu holen
@@ -3104,12 +3295,13 @@ function bindUI() {
 }
 
 // Nur in der lokalen Testumgebung: Zugriff für automatische Prüfungen.
-if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount, noPw };
+if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount, noPw, tap: (f) => { _tap = f; }, failOn: (src) => { _failRe = src ? new RegExp(src) : null; } };
 
 // Start. Dieses Skript steht am Ende der Seite: alle Bausteine sind schon da.
 // Es wird sofort entschieden, welche Ansicht erscheint. Liegt in diesem Fenster
 // eine Anmeldung, kommt direkt die Code-Eingabe und nie die Anmelde-Seite.
 function init() {
+  sealKey();
   bindUI();
   bindShield();
   if (readSession()) showCode("unlock"); else show("auth");

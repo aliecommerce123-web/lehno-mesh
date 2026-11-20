@@ -48,6 +48,18 @@ er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
    legt außerdem laufend neue Schein-Konten an und benutzt sie wie ein Mensch.
    Er merkt sich nichts dauerhaft: Es gibt keine Liste, aus der sich ablesen
    ließe, welches Konto ein Schein-Konto ist, auch nicht für den Betreiber.
+   Erscheint irgendwo ein neuer Block, schickt außerdem jede offene App mit
+   etwa einem Drittel Wahrscheinlichkeit (und begrenzt in der Menge) einen
+   Schein-Abruf, der von außen wie ein echter aussieht. So wirkt es, als würde
+   eine Nachricht von mehreren abgeholt, ohne dass jemand fremde Nachrichten
+   bekommt.
+7. **Versiegelter Umschlag.** Die App schickt jede Anfrage verschlossen an
+   einen einzigen Eingang. Öffnen kann sie nur der Server. Wer zwischen App
+   und Server sitzt (Netzanbieter, vorgeschaltete Netzdienste), sieht, von
+   welchem Anschluss ein Umschlag kommt, aber nicht, was darin steht: nicht,
+   ob etwas abgelegt, abgeholt oder gelöscht wird, keine Marke, keine
+   Konto-Kennung. Wer unterwegs die IP-Adresse sieht, kann den Umschlag nicht
+   öffnen. Der Server öffnet ihn, liest aber keine IP-Adresse.
 
 ## Was auf dem Server liegt
 
@@ -99,6 +111,17 @@ bekommt nur Geheimtext.
   verschlüsselten Konto, die 12 Anmeldewörter genügen dann zum Öffnen.
   Ein später festgelegtes Passwort schützt ab diesem Zeitpunkt, nicht
   rückwirkend.
+- **Versiegelter Umschlag:** Für jede Anfrage erzeugt die App einen neuen
+  kurzlebigen ECDH-Schlüssel (P-256). Aus dem gemeinsamen Geheimnis mit dem
+  öffentlichen Schlüssel des Eingangs entstehen per HKDF-SHA256 zwei
+  Schlüssel (AES-256-GCM): einer für die Anfrage, einer für die Antwort. Der
+  öffentliche Schlüssel steht in den öffentlichen Einstellungen. Der geheime
+  liegt nur im Arbeitsspeicher des Servers, in keiner Datei, und wird alle
+  zehn Minuten ersetzt: Wer später den Server bekommt, kann früher
+  mitgeschnittene Umschläge nicht mehr öffnen. Ein mitgeschnittener Umschlag
+  lässt sich auch nicht ein zweites Mal einspielen. Anfragen und
+  Antworten werden auf feste Größen aufgefüllt. Ablegen, Abholen und Löschen
+  eines kleinen Blocks sind in beiden Richtungen gleich groß.
 - **Rechenaufgabe:** Jede Einlieferung bringt eine kleine Rechenaufgabe mit
   (SHA-256 mit führenden Null-Bits). Sie wird schwerer, je voller der Speicher
   ist und je mehr gerade eingeliefert wird. Der Server kennt keine
@@ -126,8 +149,9 @@ bekommt nur Geheimtext.
 
 ## Gleichförmigkeit
 
-- Einliefern und Löschen eines Blocks sehen gleich aus: gleiche Länge der
-  Anfrage, immer Status 200, gleiche Länge und Mindestdauer der Antwort.
+- Einliefern, Abholen und Löschen eines kleinen Blocks sehen von außen gleich aus:
+  gleiche Größe der Anfrage und der Antwort, immer derselbe Eingang, immer
+  Status 200, gleiche Mindestdauer.
 - Abrufe des Verzeichnisses, Schein-Blöcke (sie werden wie echte auch wieder
   abgeholt) und das Speichern des Kontos laufen in zufälligen Abständen, mit
   und ohne Anlass.
@@ -150,8 +174,21 @@ bekommt nur Geheimtext.
 - Die App kommt als Webseite vom Server. Wer dem Server nicht traut, vergleicht
   die Prüfsummen unter `/beweis` mit diesem Verzeichnis.
 - Im normalen Internet sehen Netzanbieter und vorgeschaltete Netzdienste die
-  IP-Adresse (nicht den Inhalt). Über den Tor-Browser und die Onion-Adresse
-  entfällt das.
+  IP-Adresse, dazu Zeitpunkt und Größe jedes Umschlags, aber nicht den
+  Inhalt. Große Blöcke, Anhänge und das Speichern großer Konten haben andere
+  Größen und fallen auf. Mit dem Tor-Browser und der Onion-Adresse sieht der
+  Netzanbieter nur, dass Tor genutzt wird, und niemand sieht die IP-Adresse.
+- Der versiegelte Umschlag schützt vor dem Mitlesen. Wer zwischen App und
+  Server aktiv eingreift, könnte den Schlüssel des Eingangs austauschen oder
+  die App verändern und dann mitlesen. Das Prüf-Programm erkennt nur eine
+  veränderte App. Sicher schützt die Onion-Adresse.
+- Schein-Verkehr und Schein-Abrufe erschweren es, aus Zeitpunkten zu
+  schließen, wer mit wem schreibt. Unmöglich machen sie es nicht: Wer sehr
+  lange alle Anschlüsse beobachtet, kann Häufungen erkennen. Je mehr Apps
+  gleichzeitig offen sind, desto schwerer wird das.
+- Für ältere, noch offene Fenster nimmt der Server Anfragen übergangsweise
+  auch ohne Umschlag an. Die aktuelle App lädt nur die Seite selbst und den
+  öffentlichen Schlüssel des Eingangs ohne Umschlag, alles andere mit.
 - Das Verschwinden von Nachrichten setzt die App des Gegenübers um. Eine
   veränderte App könnte Inhalte behalten.
 - Die Frist für ungeöffnete Nachrichten löscht der Absender selbst vom
@@ -166,9 +203,9 @@ bekommt nur Geheimtext.
   chatmesh verbunden ist. Große Anhänge fallen als größere Übertragung auf.
 - Holt eine App einen Block ab, sieht der Server, dass genau dieser Block
   abgeholt wurde, aber nicht von wem: Er liest keine IP-Adresse und es gibt
-  dabei keine Anmeldung. Wer davor am Netz die IP-Adressen mitliest, könnte
-  Einliefern und Abholen desselben Blocks zwei Anschlüssen zuordnen. Dagegen
-  hilft der Zugang über Tor.
+  dabei keine Anmeldung. Wer davor am Netz die IP-Adressen sieht, kann wegen
+  des versiegelten Umschlags nicht erkennen, welcher Block es war oder ob
+  überhaupt etwas abgeholt wurde.
 - Warten mehrere Nachrichten auf ein Gerät, holt die App sie kurz
   hintereinander ab. Der Server könnte aus der zeitlichen Nähe schließen, dass
   diese Blöcke an dasselbe Gerät gehen, und sieht am Abholen, dass ein
@@ -208,7 +245,7 @@ Speicherformat, Quelltext und Prüfsummen.
 ## Selbst betreiben und prüfen
 
 ```
-pip install fastapi uvicorn aiosqlite python-multipart httpx
+pip install fastapi uvicorn aiosqlite python-multipart httpx cryptography
 python3 scripts/update_hashes.py
 LEHNO_MESH_ALLOW_LOCAL=1 uvicorn app:app --port 8000 --no-access-log --no-server-header --no-date-header
 python3 bots.py

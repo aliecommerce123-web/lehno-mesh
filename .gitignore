@@ -10,3 +10,5 @@ attachments.db-*
 chatmesh.db
 chatmesh.db-*
 bots.seed
+seal.key
+*.key

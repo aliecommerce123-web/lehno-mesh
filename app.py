@@ -16,6 +16,10 @@ Grundidee:
   Empfänger). Auch das läuft ohne Anmeldung.
 - Im Hintergrund erzeugen Schein-Nutzer (bots.py) ständig gleich aussehenden
   Verkehr, damit echte Aktivität nicht auffällt.
+- Die App schickt jede Anfrage in einem versiegelten Umschlag an einen einzigen
+  Eingang (siehe "Versiegelter Umschlag"). Wer unterwegs die IP-Adresse sieht,
+  kann den Umschlag nicht öffnen; der Server öffnet ihn, liest aber keine
+  IP-Adresse.
 - Zeit: Der Server speichert keine Uhrzeiten. Blöcke und Anhänge tragen nur die
   Kalenderwoche, damit nie Abgeholtes irgendwann verschwindet.
 """
@@ -46,6 +50,10 @@ from fastapi.staticfiles import StaticFiles
 from typing import List
 
 from pydantic import BaseModel, Field, constr
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH  = BASE_DIR / "chatmesh.db"
@@ -381,7 +389,7 @@ async def lifespan(app: FastAPI):
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(name).setLevel(logging.WARNING)
     init_db()
-    tasks = [asyncio.create_task(cleanup_loop()), asyncio.create_task(proof_loop()), asyncio.create_task(work_loop())]
+    tasks = [asyncio.create_task(cleanup_loop()), asyncio.create_task(proof_loop()), asyncio.create_task(work_loop()), asyncio.create_task(seal_loop())]
     try:
         yield
     finally:
@@ -476,11 +484,24 @@ BIG_ROUTES = {
     ("PUT", "/api/v2/account"):   ("account", 48, 300, MAX_BODY_ACCOUNT, True),
     ("POST", "/api/attachments"): ("upload", 16, 330, MAX_BODY_ATTACHMENT, False),
 }
-# Wege, die nur winzige Anfragen brauchen.
-SMALL_BODIES = {("POST", "/api/v2/pile/fetch"): 2048}
+# Wege mit eigener Größen-Grenze.
+X_PATH = "/api/v2/x"
+X_BIG_BYTES = 262144        # ab dieser Größe gilt ein Umschlag (oder seine Antwort) als groß
+X_BIG_PARALLEL = 8
+SMALL_BODIES = {("POST", "/api/v2/pile/fetch"): 2048, ("POST", X_PATH): MAX_BODY_ATTACHMENT + 131072}
 # Kopfzeilen, mit denen sich das Änderungsdatum von Dateien erfragen ließe.
 STRIP_REQUEST_HEADERS = (b"if-modified-since", b"if-none-match", b"if-range", b"range", b"if-unmodified-since")
 DEFAULT_TIMEOUT = 60
+
+
+async def _slot_wait(name: str, limit: int, seconds: float = 20.0) -> bool:
+    """Wartet kurz, bis einer der wenigen Plätze für Großes frei ist."""
+    end = time.monotonic() + seconds
+    while _INFLIGHT[name] >= limit:
+        if time.monotonic() >= end:
+            return False
+        await asyncio.sleep(0.1)
+    return True
 
 
 def _json(status: int, detail: str) -> JSONResponse:
@@ -535,6 +556,18 @@ async def guard(request: Request, call_next):
         elif method == "GET" and path.startswith("/api/attachments/"):
             # Zeitlimit und Platzvergabe regelt die Antwort selbst (stückweise).
             timeout = None
+        if resp is None and method == "POST" and path == X_PATH:
+            # Im Umschlag kann ein großer Anhang stecken: Zeit nach Größe, und von den
+            # großen nur wenige gleichzeitig (sie liegen ganz im Arbeitsspeicher).
+            size = int(request.headers.get("content-length") or 0)
+            timeout = 60 + size / 40000
+            if size > X_BIG_BYTES:
+                # Auf einen freien Platz wird kurz gewartet (der Inhalt ist noch nicht gelesen).
+                if not await _slot_wait("xbig", X_BIG_PARALLEL):
+                    resp = _json(503, "busy, try again in a moment")
+                else:
+                    counter = "xbig"
+                    _INFLIGHT["xbig"] += 1
         if resp is None:
             try:
                 if timeout is None:
@@ -549,9 +582,14 @@ async def guard(request: Request, call_next):
     finally:
         if counter:
             _INFLIGHT[counter] -= 1
-    for k, v in SECURITY_HEADERS.items():
-        resp.headers[k] = v
-    resp.headers["Content-Security-Policy"] = CSP
+    if path == X_PATH:
+        # Antworten des Eingangs sind verschlossene Bytes: wenige Kopfzeilen genügen.
+        for k in ("Cache-Control", "X-Content-Type-Options"):
+            resp.headers[k] = SECURITY_HEADERS[k]
+    else:
+        for k, v in SECURITY_HEADERS.items():
+            resp.headers[k] = v
+        resp.headers["Content-Security-Policy"] = CSP
     for k in DROP_HEADERS:
         if k in resp.headers:
             del resp.headers[k]
@@ -585,10 +623,10 @@ class AccountCreateReq(StrictModel):
 # Fassungen ohne diese Angabe (0) dürfen weiter speichern: Sie würden eine
 # Ablehnung nicht verstehen, und Angelegtes (etwa ein Einmal-Schlüssel) ginge verloren.
 MIN_CLIENT = max(0, int(os.environ.get("LEHNO_MESH_MIN_CLIENT", "0")))
-# Ab dieser Fassung holt die App ihre Blöcke gezielt ab. Offene Fenster mit einer
-# älteren Fassung, die den Hinweis schon kennen, werden gebeten, neu zu laden.
-# Speichern dürfen sie weiter.
-RELOAD_HINT = 2
+# Ab dieser Fassung schickt die App alles im versiegelten Umschlag. Offene Fenster
+# mit einer älteren Fassung, die den Hinweis schon kennen, werden gebeten, neu zu
+# laden. Speichern dürfen sie weiter.
+RELOAD_HINT = 3
 
 
 class AccountPutReq(StrictModel):
@@ -972,6 +1010,7 @@ async def config():
     return {
         "row_hex": BUCKET_HEX, "block_bytes": BLOCK_BYTES, "keep_weeks": PILE_KEEP_WEEKS,
         "min_client": max(MIN_CLIENT, RELOAD_HINT),
+        "seal": base64.b64encode(_seals[0]["pub"]).decode(),
         "index_hex": INDEX_HEX, "fetch_max": FETCH_MAX,
         "work": {
             "salt": _work_salts[0].hex(),
@@ -982,6 +1021,238 @@ async def config():
             "upload": [work_bits_upload(i) for i in range(len(ATTACHMENT_BUCKETS))],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Versiegelter Umschlag
+# Die App schickt jede Anfrage verschlossen an EINEN Eingang. Öffnen kann sie
+# nur dieser Server (ECDH P-256, HKDF-SHA256, AES-256-GCM). Wer zwischen App und
+# Server sitzt, sieht dann zwar, von welchem Anschluss ein Umschlag kommt, aber
+# nicht, was darin steht: nicht, ob etwas abgelegt, abgeholt oder gelöscht
+# wird, keine Marke, keine Konto-Kennung. Der Server öffnet den Umschlag, liest
+# aber keine IP-Adresse. Anfragen und Antworten haben feste Größen.
+# ---------------------------------------------------------------------------
+# Der geheime Schlüssel des Eingangs liegt nur im Arbeitsspeicher und wird regelmäßig
+# ersetzt (der vorige gilt noch eine Runde weiter). Er steht in keiner Datei. Wer später
+# den Server in die Hand bekommt, kann früher mitgeschnittene Umschläge nicht mehr öffnen.
+# Je Schlüssel wird gemerkt, welche Umschläge schon da waren: Ein mitgeschnittener
+# Umschlag lässt sich nicht ein zweites Mal einspielen.
+X_SEEN_MAX = 400000
+
+
+def _seal_new():
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pub = priv.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+    return {"priv": priv, "pub": pub, "seen": set()}
+
+
+_seals = [_seal_new(), None]
+
+
+def seal_rotate():
+    _seals[1] = _seals[0]
+    _seals[0] = _seal_new()
+
+
+SEAL_ROTATE_SECONDS = max(2, int(os.environ.get("LEHNO_MESH_SEAL_SECONDS", "600")))
+
+
+async def seal_loop():
+    while True:
+        await asyncio.sleep(SEAL_ROTATE_SECONDS)
+        seal_rotate()
+
+
+# Was im Umschlag erlaubt ist: nur die Wege der App, nie der Eingang selbst.
+X_ROUTES = re.compile(r"/api/(v2/(account|wipe|config|pile|pile/index|pile/fetch|pile/delete)|attachments(/[0-9a-f]{32})?)")
+# Ablegen, Abholen und Löschen eines kleinen Blocks sehen von außen gleich aus.
+X_BLOCK_OPS = {("POST", "/api/v2/pile"), ("POST", "/api/v2/pile/fetch"), ("POST", "/api/v2/pile/delete")}
+X_SIZES = (512, 1024, 2048, 4608)
+X_BLOCK_MIN = 4608
+X_BLOCK_SECONDS = 0.075     # Mindestdauer eines Block-Vorgangs im Umschlag
+X_BIN_FIELDS = ("data", "blob", "wipe_blob")
+
+
+def _x_pad_len(n: int, block_op: bool) -> int:
+    if block_op and n <= X_BLOCK_MIN:
+        return X_BLOCK_MIN
+    for s in X_SIZES:
+        if n <= s:
+            return s
+    step = 1024 if n <= 16384 else (4096 if n <= 262144 else 16384)
+    return -(-n // step) * step
+
+
+def _x_keys(shared: bytes, eph_pub: bytes, own_pub: bytes):
+    info = eph_pub + own_pub
+    kq = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"chatmesh2|x|req|" + info).derive(shared)
+    kr = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=b"chatmesh2|x|res|" + info).derive(shared)
+    return kq, kr
+
+
+async def _x_inner(method: str, path: str, query: str, headers: list, body: bytes):
+    """Führt die Anfrage aus dem Umschlag aus, als wäre sie direkt gekommen:
+    dieselben Prüfungen, dieselben Grenzen. Gibt (Status, Kopfzeilen, Inhalt) zurück."""
+    done = asyncio.Event()
+    sent = False
+    out = {"status": 500, "headers": [], "body": bytearray()}
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await done.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+            out["headers"] = message.get("headers", [])
+        elif message["type"] == "http.response.body":
+            out["body"] += message.get("body", b"")
+            if not message.get("more_body"):
+                done.set()
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+        "method": method, "scheme": "https", "path": path, "raw_path": path.encode(),
+        "query_string": query.encode(), "root_path": "", "headers": headers, "client": None, "server": None,
+    }
+    try:
+        await app(scope, receive, send)
+    finally:
+        done.set()
+    return out["status"], out["headers"], bytes(out["body"])
+
+
+class SealedReply(Response):
+    """Schickt eine große versiegelte Antwort in Stücken. Liest der Client nicht,
+    wird abgebrochen. Der Platz wird erst nach dem letzten Stück wieder frei."""
+
+    def __init__(self, body: bytes):
+        self.status_code = 200
+        self.background = None
+        self.body = body
+        self.init_headers({"content-type": "application/octet-stream", "content-length": str(len(body))})
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await send({"type": "http.response.start", "status": 200, "headers": self.raw_headers})
+            for offset in range(0, len(self.body), DOWNLOAD_CHUNK):
+                await asyncio.wait_for(
+                    send({"type": "http.response.body", "body": self.body[offset:offset + DOWNLOAD_CHUNK], "more_body": True}),
+                    timeout=DOWNLOAD_SEND_TIMEOUT,
+                )
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        finally:
+            self.body = b""
+            _INFLIGHT["xdown"] -= 1
+
+
+def _x_open(raw: bytes):
+    """Öffnet einen Umschlag. Gibt (Kopf, Inhalt, Antwort-Schlüssel) zurück oder None."""
+    eph = raw[:65]
+    try:
+        peer = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), eph)
+    except Exception:
+        return None
+    for s in _seals:
+        if s is None:
+            continue
+        try:
+            kq, kr = _x_keys(s["priv"].exchange(ec.ECDH(), peer), eph, s["pub"])
+            plain = AESGCM(kq).decrypt(raw[65:77], raw[77:], None)
+        except Exception:
+            continue
+        mark = hashlib.sha256(eph).digest()[:12]
+        if mark in s["seen"]:
+            return None                    # derselbe Umschlag noch einmal: abgelehnt
+        if len(s["seen"]) < X_SEEN_MAX:
+            s["seen"].add(mark)
+        try:
+            hlen = struct.unpack(">H", plain[:2])[0]
+            head = json.loads(plain[2:2 + hlen].decode())
+            n = int(head.get("n", 0))
+            if not isinstance(head, dict) or n < 0 or 2 + hlen + n > len(plain):
+                return None
+            return head, plain[2 + hlen:2 + hlen + n], kr
+        except Exception:
+            return None
+    return None
+
+
+def _x_close(kr: bytes, status: int, rh: list, rbody: bytes, block_op: bool) -> bytes:
+    rhd = {k.decode().lower(): v.decode() for k, v in rh}
+    rhead = json.dumps({"s": status, "x": rhd.get("x-pile", ""), "c": rhd.get("content-type", ""), "n": len(rbody)}, separators=(",", ":")).encode()
+    packed = struct.pack(">H", len(rhead)) + rhead + rbody
+    packed += b"\x00" * (_x_pad_len(len(packed), block_op) - len(packed))
+    nonce = os.urandom(12)
+    return nonce + AESGCM(kr).encrypt(nonce, packed, None)
+
+
+@app.post(X_PATH)
+async def sealed_entry(request: Request):
+    """Eingang für versiegelte Umschläge.
+    Anfrage:  kurzlebiger Schlüssel (65) | Zufallswert (12) | Geheimtext.
+    Klartext: 2 Bytes Länge | Kopf (JSON: m, p, q, a, w, c, n) | Inhalt | Nullen.
+    Antwort:  Zufallswert (12) | Geheimtext; Klartext: 2 Bytes Länge | Kopf (s, x, c, n) | Inhalt | Nullen."""
+    started = time.monotonic()
+    raw = await request.body()
+    if len(raw) < 65 + 12 + 16 + 2:
+        raise HTTPException(400, "bad envelope")
+    big = len(raw) > X_BIG_BYTES
+    opened = await asyncio.to_thread(_x_open, raw) if big else _x_open(raw)
+    del raw
+    if opened is None:
+        raise HTTPException(400, "bad envelope")
+    head, body, kr = opened
+    method, path, query = str(head.get("m", "")), str(head.get("p", "")), str(head.get("q", ""))
+    if method not in ("GET", "POST", "PUT", "DELETE") or not X_ROUTES.fullmatch(path) or len(query) > 64 or not re.fullmatch(r"[a-z0-9=&]*", query):
+        raise HTTPException(400, "bad envelope")
+    headers = [(b"host", request.headers.get("host", "").encode())]
+    for key, name, limit in (("a", b"authorization", 160), ("w", b"x-work", 120), ("c", b"content-type", 200)):
+        v = head.get(key)
+        if isinstance(v, str) and v and len(v) <= limit and v.isascii() and v.isprintable():
+            headers.append((name, v.encode()))
+    if method != "GET":
+        headers.append((b"content-length", str(len(body)).encode()))
+    block_op = (method, path) in X_BLOCK_OPS
+    # Binärdaten reisen im Umschlag roh statt als Base64 (spart ein Drittel): Kopf "j" trägt
+    # die übrigen Angaben, "b" nennt Feldnamen und Längen der rohen Teile im Inhalt.
+    if "j" in head or "b" in head:
+        j, parts = head.get("j"), head.get("b")
+        if not isinstance(j, dict) or not isinstance(parts, list) or len(parts) > 3:
+            raise HTTPException(400, "bad envelope")
+        obj, offset = dict(j), 0
+        for part in parts:
+            if not (isinstance(part, list) and len(part) == 2 and part[0] in X_BIN_FIELDS and isinstance(part[1], int) and 0 <= part[1] <= len(body) - offset):
+                raise HTTPException(400, "bad envelope")
+            obj[part[0]] = base64.b64encode(body[offset:offset + part[1]]).decode()
+            offset += part[1]
+        body = json.dumps(obj, separators=(",", ":")).encode()
+        headers = [h for h in headers if h[0] not in (b"content-type", b"content-length")]
+        headers += [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+    status, rh, rbody = await _x_inner(method, path, query, headers, body)
+    del body
+    if len(rbody) > X_BIG_BYTES:
+        # Große Antwort (Anhang, großes Konto): nur wenige gleichzeitig und in Stücken.
+        if not await _slot_wait("xdown", X_BIG_PARALLEL):
+            raise HTTPException(503, "busy, try again in a moment")
+        _INFLIGHT["xdown"] += 1
+        try:
+            sealed = await asyncio.to_thread(_x_close, kr, status, rh, rbody, block_op)
+        except Exception:
+            _INFLIGHT["xdown"] -= 1
+            raise
+        return SealedReply(sealed)
+    sealed = _x_close(kr, status, rh, rbody, block_op)
+    if block_op:
+        # Ablegen, Abholen und Löschen dauern von außen gleich lang.
+        rest = X_BLOCK_SECONDS + secrets.randbelow(15) / 1000 - (time.monotonic() - started)
+        if rest > 0:
+            await asyncio.sleep(rest)
+    return Response(content=sealed, media_type="application/octet-stream")
 
 
 # ---------------------------------------------------------------------------

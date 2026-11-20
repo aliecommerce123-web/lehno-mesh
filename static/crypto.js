@@ -282,6 +282,19 @@
     const key = await hkdf(shared, concat(utf8("chatmesh2|box|"), eph.pub, pubRaw));
     return concat(eph.pub, await seal(key, plain));
   }
+  // Versiegelter Umschlag an den Server: Nur er kann ihn öffnen. Für jede Anfrage
+  // entsteht ein neuer kurzlebiger Schlüssel; die Antwort kommt unter einem
+  // zweiten Schlüssel zurück, den nur diese Anfrage kennt.
+  async function xSeal(serverPub, plain) {
+    const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, false, ["deriveBits"]);
+    const ephPub = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
+    const pub = await crypto.subtle.importKey("raw", serverPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
+    const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: "ECDH", public: pub }, pair.privateKey, 256));
+    const info = concat(ephPub, serverPub);
+    const kq = await hkdf(shared, concat(utf8("chatmesh2|x|req|"), info));
+    const kr = await hkdf(shared, concat(utf8("chatmesh2|x|res|"), info));
+    return { body: concat(ephPub, await seal(kq, plain)), resKey: kr };
+  }
   async function boxOpen(privJwk, pubRaw, sealed) {
     const b = sealed instanceof Uint8Array ? sealed : new Uint8Array(sealed);
     const ephPub = b.subarray(0, 65);
@@ -392,6 +405,6 @@
     msgTag, msgTags, msgDelToken, msgKey, delHash, dissolveKeys,
     passwordKey, wrapWithKey, wrapWithPassword, unwrapWithPassword,
     encryptFile, decryptFile, FILE_SIZES,
-    boxSeal, boxOpen, work, bytesToCode, codeToBytes,
+    boxSeal, boxOpen, xSeal, work, bytesToCode, codeToBytes,
   };
 })();

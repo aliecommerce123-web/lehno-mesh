@@ -44,6 +44,7 @@ SERVED = {
     "/s/landing.js": "static/landing.js",
     "/s/vendor/jsqr.js": "static/vendor/jsqr.js",
     "/s/vendor/qrcode.js": "static/vendor/qrcode.js",
+    "/s/tick.js": "static/tick.js",
 }
 
 

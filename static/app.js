@@ -16,7 +16,8 @@
 //   sofort beim Verlassen des Chats. Verlauf behalten nur, wenn beide zustimmen.
 // - Es gibt nirgends Uhrzeiten. Auf dem Gerät liegt nur die mit dem eigenen Code
 //   verschlossene Anmeldung, und nur bis das Browser-Fenster geschlossen wird.
-// - Schein-Verkehr: Abrufe und Schein-Blöcke in unregelmäßigen Abständen.
+// - Fester Takt: Die App sendet in gleichmäßigen Zufallsabständen gleich große Umschläge,
+//   mit oder ohne Inhalt. Von außen ist nicht zu sehen, ob und mit wem geschrieben wird.
 // - Versiegelter Umschlag: Jede Anfrage geht verschlossen an einen einzigen Eingang,
 //   den nur der Server öffnen kann. Dazwischen ist nur zu sehen, von welchem Anschluss
 //   ein Umschlag kommt, nicht was darin steht. Der Server liest keine IP-Adresse.
@@ -24,11 +25,11 @@
 "use strict";
 const C = window.CM;
 const APP_NAME = "chatmesh";
-const WINDOW_BACK = 32, WINDOW_AHEAD = 256, RESERVE = 8;
+const WINDOW_BACK = 32, WINDOW_AHEAD = 256, RESERVE = 16, RESERVE_LOW = 6;
 const LIM = { keep: 300000 };            // so viele Verzeichnis-Einträge bleiben höchstens im Arbeitsspeicher
 const INDEX_MAX = 60000;                 // so viele Einträge schickt der Server höchstens je Antwort
 const PFX = 10;                          // ein Verzeichnis-Eintrag: die ersten 5 Bytes einer Marke (10 Hex-Zeichen)
-const FETCH_MAX = 4;                     // so viele Marken werden am Stück verarbeitet (jede in einem eigenen Abruf)
+const FETCH_MAX = 8;                     // so viele Abrufe warten höchstens gleichzeitig in der Schlange (je Schlag eine Marke)
 const VIEW_MIN = 5, VIEW_MAX = 30 * 86400, VIEW_DEFAULT = 600;
 const INVITE_SECONDS = 24 * 3600;
 const HIST_BYTES = 200000;              // Verlauf je Chat-Kanal (verschlüsselt im Konto)
@@ -59,6 +60,7 @@ const S = {
   wipeBig: false,
   index: new Map(),    // Verzeichnis: Anfang (5 Bytes) der Marke -> Platz in der Reihenfolge der Einlieferung
   indexN: 0,
+  aux: { map: new Map(), version: 0 },      // kleiner Zusatz-Block: Reservierungen, die noch nicht im Konto stehen
   cursor: 0,
   synced: false,
   expect: new Map(),   // Marke -> { id, kind, lane, n }
@@ -115,7 +117,7 @@ const X_PATH = "/api/v2/x";
 const X_SIZES = [512, 1024, 2048, 4608];
 const X_BLOCK_REQ = 4608;
 const X_BIN_FIELDS = ["data", "blob", "wipe_blob"];      // reisen roh statt als Base64
-const X_BLOCK_OPS = new Set(["POST /api/v2/pile", "POST /api/v2/pile/fetch", "POST /api/v2/pile/delete"]);
+const X_BLOCK_OPS = new Set(["POST /api/v2/pile", "POST /api/v2/pile/fetch", "POST /api/v2/pile/delete", "POST /api/v2/pile/beat"]);
 let _sealKey = null, _sealAt = 0, _sealP = null, _tap = null, _failRe = null;
 const SEAL_FRESH_MS = 8 * 60 * 1000;     // der Server wechselt den Schlüssel alle zehn Minuten, der vorige gilt weiter
 function xPadLen(n, blockOp) {
@@ -265,7 +267,68 @@ const subject = (hexId, letter, extra) => C.concat(C.unhex(S.work.salt || ""), C
 // Einliefern und Löschen sehen von außen gleich aus: gleiche Länge der Anfrage,
 // gleiche Länge und Dauer der Antwort.
 const POST_LEN = JSON.stringify({ tag: "0".repeat(32), data: "x".repeat(5500), del_hash: "0".repeat(64), work: "0".repeat(16) }).length;
-async function pilePost(tag, bytes, delToken, maxBits = 26) {
+// -------------------------------------------------------------------------
+// FESTER TAKT
+// Solange man angemeldet ist, schickt die App in gleichmäßigen Zufallsabständen
+// einen "Schlag": einen Umschlag immer gleicher Größe. Jeder Schlag trägt
+// höchstens EINEN Vorgang (einen Block ablegen, abholen oder löschen), sonst
+// geht er leer hinaus. Von außen sieht ein Anschluss deshalb immer gleich aus,
+// ob gerade geschrieben wird oder nicht. Weil nie zwei Vorgänge im selben
+// Schlag stecken, kann auch der Server nicht sehen, welche Vorgänge vom
+// selben Gerät kommen. Echte Vorgänge warten in einer Schlange.
+// -------------------------------------------------------------------------
+const BEAT_MIN = 750, BEAT_MAX = 2150;          // Abstand zweier Schläge in Millisekunden
+const BEAT_CODE = { 0: 0, 1: 200, 2: 409, 3: 428, 4: 507, 5: 429, 6: 404, 7: 400 };
+const BEAT_BIG = 0xFFFFFFFF, BEAT_TRIES = 6;
+const LOGIN_BEATS = 30, LOGIN_GAP = 120;       // nach dem Anmelden: feste Zahl Schläge in dichter Folge
+let _beatOn = false;
+const _beatQ = [], _saveWaiters = [];
+// Rang 0: Nachrichten (ablegen, abholen). Rang 1: stille Steuerzeichen. Rang 2: Löschen.
+function qPush(item) {
+  let i = _beatQ.length;
+  while (i > 0 && _beatQ[i - 1].prio > item.prio) i--;
+  _beatQ.splice(i, 0, item);
+}
+// Beim Abmelden: Wartendes ergebnislos beenden.
+function beatReset() {
+  _beatOn = false;
+  for (const it of _beatQ.splice(0)) { try { it.done(null); } catch (e) {} }
+  for (const f of _saveWaiters.splice(0)) { try { f(false); } catch (e) {} }
+  auxReset();
+}
+async function beatTick() {
+  const sid = S.sid;
+  const op = _beatQ.shift() || null;
+  const json = {};
+  if (op && op.kind === "post") { json.post_tag = op.tag; json.post_del_hash = op.delHash; json.post_work = op.work; json.data = C.b64(op.bytes); }
+  else if (op && op.kind === "del") { json.del_tag = op.tag; json.del_token = op.token; json.del_work = op.work; }
+  else if (op) json.fetch = op.tag;
+  let out = null;
+  try {
+    const resp = await api("POST", "/api/v2/pile/beat", { raw: true, timeout: 30000, json });
+    const b = new Uint8Array(await resp.arrayBuffer());
+    if (b.length >= 6) {
+      const len = ((b[2] << 24) | (b[3] << 16) | (b[4] << 8) | b[5]) >>> 0;
+      out = { post: b[0], del: b[1], big: len === BEAT_BIG, block: len && len !== BEAT_BIG && b.length >= 6 + len ? b.slice(6, 6 + len) : null };
+    }
+  } catch (e) { out = null; }
+  if (!op) return;
+  if (!out) {
+    // Der Schlag kam nicht durch: Sein Inhalt geht zurück an den Anfang der Schlange und
+    // reist mit einem der nächsten Schläge. Erst nach vielen Fehlversuchen gilt er als gescheitert.
+    op.tries = (op.tries || 0) + 1;
+    if (_beatOn && sid === S.sid && op.tries < BEAT_TRIES) { op.again = true; _beatQ.unshift(op); }
+    else op.done(null);
+    return;
+  }
+  if (op.kind === "post") op.done({ code: BEAT_CODE[out.post] || 500, again: !!op.again });
+  else if (op.kind === "del") op.done(BEAT_CODE[out.del] || 500);
+  else op.done({ block: out.block, big: out.big });
+}
+
+// Legt einen Block ab. Die Rechenaufgabe wird vorher gelöst, damit der Schlag selbst
+// keine Zeit kostet. prio: 0 = Nachricht, 1 = stilles Steuerzeichen.
+async function pilePost(tag, bytes, delToken, maxBits = 26, prio = 1) {
   if (!S.work.salt) await loadConfig();
   const delHash = await C.delHash(delToken);
   const idx = bytes.byteLength > 5000 ? 1 : 0;
@@ -273,42 +336,52 @@ async function pilePost(tag, bytes, delToken, maxBits = 26) {
     const bits = S.work.pile[idx] || 0;
     if (bits > maxBits) return 428;      // Server unter Last: nicht endlos rechnen
     const work = await C.work(subject(tag, "p"), bits);
-    const r = await api("POST", "/api/v2/pile", { json: { tag, data: C.b64(bytes), del_hash: delHash, work } });
-    if (r && r.ok === true) return 200;
-    const code = (r && r.code) || 500;
+    let code;
+    if (_beatOn && !idx) {
+      const res = await new Promise(done => qPush({ kind: "post", prio, tag, bytes, delHash, work, done }));
+      if (res === null) throw new ApiError("Keine Verbindung zum Server", 0);
+      code = res.code;
+      if (code === 409 && res.again) {
+        // Nach einem Fehlversuch "Marke schon vergeben": Meist kam der erste Versuch doch an.
+        // Liegt genau unser Block dort, ist alles in Ordnung.
+        try { const got = await fetchBlocks([tag], { prio }); const b = got.get(tag); if (b && b.byteLength === bytes.byteLength && b.every((x, k) => x === bytes[k])) code = 200; } catch (e) {}
+      }
+    } else {
+      // Große Blöcke passen nicht in einen Schlag; vor der Anmeldung gibt es noch keinen Takt.
+      const r = await api("POST", "/api/v2/pile", { json: { tag, data: C.b64(bytes), del_hash: delHash, work } });
+      code = r && r.ok === true ? 200 : ((r && r.code) || 500);
+    }
+    if (code === 200) return 200;
     if (code !== 428) return code;
     await loadConfig();                 // Aufgabe ist schwerer geworden: neu holen, noch einmal
   }
   return 428;
 }
 
-async function pileDelete(tag, token) {
-  try {
-    if (!S.work.salt) await loadConfig();
-    const bits = S.work.delete || 0;
-    if (bits > 24) return false;
-    const work = await C.work(subject(tag, "d"), bits);
-    const base = JSON.stringify({ tag, token, work, pad: "" }).length;
-    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "" } });
-    if (r && r.code === 428) { await loadConfig(); return false; }
-    return !!(r && (r.ok || r.code === 404));
-  } catch (e) { return false; }
-}
-
-// Wie pileDelete, sagt aber, ob der Block noch da war: "ok", "gone" oder "fail".
-async function pileDeleteState(tag, token) {
+// Löscht einen Block: "ok" (war noch da), "gone" (schon weg) oder "fail".
+async function pileDeleteState(tag, token, prio = 2) {
   try {
     if (!S.work.salt) await loadConfig();
     const bits = S.work.delete || 0;
     if (bits > 24) return "fail";
     const work = await C.work(subject(tag, "d"), bits);
-    const base = JSON.stringify({ tag, token, work, pad: "" }).length;
-    const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "" } });
-    if (r && r.ok) return "ok";
-    if (r && r.code === 404) return "gone";
-    if (r && r.code === 428) await loadConfig();
+    let code;
+    if (_beatOn) {
+      code = await new Promise(done => qPush({ kind: "del", prio, tag, token, work, done }));
+      if (code === null) return "fail";
+    } else {
+      const r = await api("POST", "/api/v2/pile/delete", { json: { tag, token, work, pad: "" } });
+      code = r && r.ok ? 200 : ((r && r.code) || 500);
+    }
+    if (code === 200) return "ok";
+    if (code === 404) return "gone";
+    if (code === 428) await loadConfig();
     return "fail";
   } catch (e) { return "fail"; }
+}
+async function pileDelete(tag, token) {
+  const state = await pileDeleteState(tag, token);
+  return state === "ok" || state === "gone";
 }
 // Löschen mit Wiederholung: geht ein Versuch verloren, folgen weitere.
 function queueDelete(tag, token, delay = 0) {
@@ -502,19 +575,207 @@ function dropRuntime(id) {
 // Alle Speichervorgänge laufen nacheinander.
 let _saveChain = Promise.resolve(true);
 let _saveWarned = false;
-function saveAccount() { _saveChain = _saveChain.then(doSave, doSave); return _saveChain; }
+// Sofort speichern: nur für seltene, vom Nutzer ausgelöste Schritte (Einstellungen,
+// Passwort, Abmelden, Fenster schließen). Alles andere wartet auf den nächsten festen
+// Speicher-Zeitpunkt: So verrät das Speichern nicht, wann etwas kam oder ging.
+function saveNow() { _saveChain = _saveChain.then(doSave, doSave); return _saveChain; }
+function saveAccount() {
+  if (!_beatOn) return saveNow();
+  return new Promise(res => _saveWaiters.push(res));
+}
+async function saveTick() {
+  const waiting = _saveWaiters.splice(0);
+  const ok = await saveNow();
+  for (const f of waiting) { try { f(ok); } catch (e) {} }
+}
+
+// -------------------------------------------------------------------------
+// NUMMERN-VORRAT (kleiner Zusatz-Block)
+// Vor dem Senden muss eine Nummer reserviert und auf dem Server vermerkt sein, damit
+// nach einem Absturz oder mit zwei Geräten nie eine Nummer zweimal benutzt wird. Das
+// ganze Konto dafür zu speichern, wäre teuer und würde verraten, dass gleich gesendet
+// wird. Deshalb gibt es je Konto einen kleinen verschlüsselten Zusatz-Block. Er wird
+// in festen Zufallsabständen geschrieben, mit und ohne Anlass, und trägt die neuesten
+// Reservierungen. Reserviert wird nur, wenn wirklich gesendet werden soll: So laufen
+// die Nummern nie ohne Nachrichten voraus. Geschrieben wird nur, wenn dieses Gerät den
+// aktuellen Stand kennt; sonst bekommt es den aktuellen zurück und plant neu. Zwei
+// Geräte bekommen deshalb nie denselben Bereich.
+// -------------------------------------------------------------------------
+const AUX_PLAIN = 512, AUX_WAIT_MS = 25000;
+let _auxKeyFor = null, _auxKey = null;
+function auxReset() {
+  S.aux = { map: new Map(), version: 0 };
+  _auxKeyFor = null; _auxKey = null;
+  if (!S.run) return;
+  for (const r of Object.values(S.run)) {
+    for (const key of ["sn", "cn"]) { const cb = r.resCb && r.resCb[key]; if (cb) { try { cb.rej(new Error("abgemeldet")); } catch (e) {} } }
+    r.resCb = {}; r.resP = {}; r.resv = {}; r.rng = {};
+  }
+}
+async function auxKey() {
+  if (_auxKeyFor !== S.me.encKey) { _auxKey = await C.hkdf(S.me.encKey, "chatmesh2|aux"); _auxKeyFor = S.me.encKey; }
+  return _auxKey;
+}
+// Ein anderes Gerät (oder eine frühere Sitzung) hat bis R reserviert.
+function auxLearn(c, rkey, R) {
+  if (!Number.isInteger(R) || R < 0) return;
+  const key = rkey === "sr" ? "sn" : "cn", r = runOf(c);
+  if (R > (c[rkey] || 0)) c[rkey] = R;
+  // Ein hier geplanter, noch nicht bestätigter Bereich, der sich damit überschneidet, wird neu geplant.
+  const p = r.resv && r.resv[key];
+  if (p && R > p[0]) r.resv[key] = null;
+}
+async function auxFold(b64text) {
+  if (!b64text || /^A+$/.test(b64text)) return;
+  let obj = null;
+  try { obj = await C.openJson(await auxKey(), C.unb64(b64text), [AUX_PLAIN]); } catch (e) { return; }
+  for (const [id, pair] of Object.entries((obj && obj.r) || {})) {
+    if (!Array.isArray(pair)) continue;
+    const c = chan(id);
+    if (!c || c.pend) continue;
+    auxLearn(c, "sr", pair[0]); auxLearn(c, "cr", pair[1]);
+    const have = S.aux.map.get(id) || [0, 0];
+    S.aux.map.set(id, [Math.max(have[0], Number(pair[0]) || 0), Math.max(have[1], Number(pair[1]) || 0)]);
+  }
+}
+// Nach einem erfolgreichen Speichern des Kontos stehen dessen Reservierungen im Konto selbst.
+function auxPrune(snap) {
+  for (const [id, sr, cr] of snap) {
+    const v = S.aux.map.get(id);
+    if (v && v[0] <= sr && v[1] <= cr) S.aux.map.delete(id);
+  }
+  for (const id of [...S.aux.map.keys()]) if (!chan(id)) S.aux.map.delete(id);
+}
+// Wartet, bis für diese Spur ein neuer Bereich reserviert und vermerkt ist.
+function reserveNumbers(c, key) {
+  const r = runOf(c);
+  r.resP = r.resP || {}; r.resCb = r.resCb || {};
+  if (!r.resP[key]) {
+    r.resP[key] = new Promise((res, rej) => { r.resCb[key] = { res, rej, t: Date.now() }; });
+    r.resP[key].catch(() => {});
+  }
+  return r.resP[key];
+}
+function rangesLeft(c, key) {
+  const r = runOf(c), at = c[key] || 0;
+  let n = 0;
+  for (const [from, to] of ((r.rng && r.rng[key]) || [])) n += Math.max(0, to - Math.max(from, at));
+  return n;
+}
+// Nächste freie Nummer aus den eigenen reservierten Bereichen, oder null.
+function takeNumber(c, key) {
+  const r = runOf(c);
+  r.rng = r.rng || {};
+  const list = r.rng[key] = r.rng[key] || [];
+  while (list.length && list[0][1] <= (c[key] || 0)) list.shift();
+  if (!list.length) return null;
+  if ((c[key] || 0) < list[0][0]) c[key] = list[0][0];
+  const n = c[key];
+  c[key] = n + 1;
+  return n;
+}
+// Ein zweites Gerät am selben Konto schreibt denselben Zusatz-Block. Kommt es dazwischen,
+// wird sein Stand übernommen und sofort noch einmal geschrieben: So wartet keines der
+// beiden Geräte lange auf seine Nummern.
+async function auxTick() {
+  for (let attempt = 0; attempt < 3; attempt++) { if ((await auxOnce()) !== "retry") return; }
+}
+async function auxOnce() {
+  if (!S.me || !S.acct) return;
+  const sid = S.sid, now = Date.now();
+  // Was soll neu reserviert werden?
+  const plans = [];
+  for (const c of S.acct.ch) {
+    if (c.pend) continue;
+    const r = S.run[c.id];
+    if (!r || !r.resCb) continue;
+    const any = r.resCb.sn || r.resCb.cn;
+    for (const [key, rkey] of [["sn", "sr"], ["cn", "cr"]]) {
+      const cb = r.resCb[key];
+      // Wird für eine Spur reserviert, bekommt die andere gleich mit einen Vorrat, wenn sie knapp ist:
+      // So wartet ein Lösch-Auftrag oder eine Lesebestätigung später nicht eigens darauf.
+      if (!cb) { if (any && r.kMsg && rangesLeft(c, key) < RESERVE_LOW) { r.resv = r.resv || {}; if (!r.resv[key]) { const start = Math.max(c[rkey] || 0, c[key] || 0); r.resv[key] = [start, start + RESERVE]; } plans.push([c, key, rkey, r.resv[key]]); } continue; }
+      if (now - cb.t > AUX_WAIT_MS) { r.resCb[key] = null; r.resP[key] = null; r.resv[key] = null; cb.rej(new ApiError("Keine Verbindung zum Server", 0)); continue; }
+      r.resv = r.resv || {};
+      if (!r.resv[key]) { const start = Math.max(c[rkey] || 0, c[key] || 0); r.resv[key] = [start, start + RESERVE]; }
+      plans.push([c, key, rkey, r.resv[key]]);
+    }
+  }
+  // Inhalt: bekannte Reservierungen, die noch nicht im gespeicherten Konto stehen, plus die neuen.
+  const out = {};
+  for (const [id, v] of S.aux.map) out[id] = v.slice();
+  const used = [];
+  for (const p of plans) {
+    const [c, key, rkey, range] = p;
+    const before = out[c.id] ? out[c.id].slice() : null;
+    const cur = out[c.id] || [c.sr || 0, c.cr || 0];
+    cur[rkey === "sr" ? 0 : 1] = Math.max(cur[rkey === "sr" ? 0 : 1], range[1]);
+    out[c.id] = cur;
+    if (C.utf8(JSON.stringify({ r: out })).byteLength > AUX_PLAIN - 8) { if (before) out[c.id] = before; else delete out[c.id]; continue; }   // passt nicht mehr: nächstes Mal
+    used.push(p);
+  }
+  let res = null;
+  try {
+    const data = C.b64(await C.sealJson(await auxKey(), { r: out }, [AUX_PLAIN]));
+    res = await api("POST", "/api/v2/account/aux", { auth: true, timeout: 20000, noLogout: true, json: { data, expected: S.aux.version, cv: CLIENT_VER } });
+  } catch (e) { return; }
+  if (sid !== S.sid || !res) return;
+  if (res.ok) {
+    S.aux.version = res.version;
+    for (const [id, v] of Object.entries(out)) S.aux.map.set(id, v);
+    for (const [c, key, rkey, range] of used) {
+      const r = S.run[c.id];
+      if (!r || chan(c.id) !== c || r.resv[key] !== range) continue;
+      c[rkey] = Math.max(c[rkey] || 0, range[1]);
+      r.rng = r.rng || {};
+      (r.rng[key] = r.rng[key] || []).push(range);
+      r.resv[key] = null;
+      const cb = r.resCb[key];
+      r.resCb[key] = null; r.resP[key] = null;
+      if (cb) cb.res(true);
+    }
+    return;
+  }
+  // Ein anderes Gerät war schneller: dessen Stand übernehmen und neu planen.
+  S.aux.version = res.version;
+  await auxFold(res.aux);
+  if (sid !== S.sid) return;
+  // Hat das andere Gerät inzwischen auch das Konto gespeichert, stehen dort Reservierungen,
+  // die im Zusatz-Block schon nicht mehr vorkommen: Konto holen und zusammenführen.
+  if (res.acct && res.acct !== S.version) { try { await pullAccount(); } catch (e) {} }
+  return sid === S.sid ? "retry" : undefined;
+}
+
+// Holt den Stand des Kontos vom Server und führt ihn mit dem eigenen zusammen.
+async function pullAccount() {
+  const sid = S.sid;
+  const r = await api("GET", "/api/v2/account", { auth: true });
+  if (sid !== S.sid) return false;
+  const remote = sanitizeAccount(await C.openJson(S.me.encKey, C.unb64(r.blob), C.ACCOUNT));
+  mergeAccount(S.acct, remote);
+  S.version = r.version;
+  for (const c of S.acct.ch) runOf(c);
+  await applyHistMerges();
+  await applyWrapMerges();
+  if (_mergeRender) { _mergeRender = false; renderChat(); }
+  await rebuildExpect();
+  renderList();
+  return true;
+}
 async function doSave() {
   const sid = S.sid;
   if (!S.me || !S.acct) return false;
   let work = "";
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
+      const snap = S.acct.ch.map(c => [c.id, c.sr || 0, c.cr || 0]);
       const blobs = await accountBlobs();
       const body = { ...blobs, expected_version: S.version, cv: CLIENT_VER };
       if (work) body.work = work;
       const r = await api("PUT", "/api/v2/account", { auth: true, keepalive: true, json: body });
       if (sid !== S.sid) return false;
       S.version = r.version;
+      auxPrune(snap);
       if (!_saveTimer) S.urgent = false;
       S.dirty = false;
       if (_saveWarned) { _saveWarned = false; setSync(""); }
@@ -535,19 +796,7 @@ async function doSave() {
         break;
       }
       // Ein anderes Gerät hat gespeichert: Stand holen und zusammenführen.
-      try {
-        const r = await api("GET", "/api/v2/account", { auth: true });
-        if (sid !== S.sid) return false;
-        const remote = sanitizeAccount(await C.openJson(S.me.encKey, C.unb64(r.blob), C.ACCOUNT));
-        mergeAccount(S.acct, remote);
-        S.version = r.version;
-        for (const c of S.acct.ch) runOf(c);
-        await applyHistMerges();
-        await applyWrapMerges();
-        if (_mergeRender) { _mergeRender = false; renderChat(); }
-        await rebuildExpect();
-        renderList();
-      } catch (e2) { break; }
+      try { if (!(await pullAccount())) return false; } catch (e2) { break; }
     }
   }
   if (sid === S.sid) S.dirty = true;
@@ -558,8 +807,9 @@ let _saveTimer = null;
 function saveSoon() {
   S.dirty = true;
   S.urgent = true;
+  if (_beatOn) return;                 // geht mit dem nächsten festen Speicher-Zeitpunkt mit
   if (_saveTimer) return;
-  _saveTimer = setTimeout(() => { _saveTimer = null; saveAccount(); }, 700);
+  _saveTimer = setTimeout(() => { _saveTimer = null; saveNow(); }, 700);
 }
 // Ruhig: Zähler und Kleinigkeiten. Sie gehen mit dem nächsten Hintergrund-Speichern
 // mit, das ohnehin in unregelmäßigen Abständen läuft. So verrät der Zeitpunkt
@@ -638,6 +888,9 @@ async function loginWithBytes(L, fromWords) {
   }
   S.acct = sanitizeAccount(await C.openJson(ak.encKey, C.unb64(r.blob), C.ACCOUNT));
   S.version = r.version;
+  // Reservierungen aus dem kleinen Zusatz-Block: Sie können neuer sein als das Konto.
+  S.aux = { map: new Map(), version: Number(r.aux_version) || 0 };
+  await auxFold(r.aux);
   // Wurde die letzte Sitzung nicht sauber beendet, könnten reservierte Nummern
   // schon benutzt sein. Dann geht es hinter der Reservierung weiter.
   for (const c of S.acct.ch) { if (c.pend) continue; c.sn = Math.max(c.sn, c.sr); c.cn = Math.max(c.cn, c.cr); }
@@ -649,29 +902,55 @@ async function loginWithBytes(L, fromWords) {
 // bleibt man angemeldet und gibt nur diesen Code ein. Dafür liegt die Anmeldung
 // verschlossen mit dem Code im Speicher dieses einen Browser-Fensters. Sie ist
 // weg, sobald das Fenster geschlossen wird, man sich abmeldet oder der Code
-// fünfmal falsch war. Sonst speichert chatmesh nichts auf dem Gerät.
+// fünfmal falsch war. Nur wer "angemeldet bleiben" einschaltet, behält sie auf
+// dem Gerät. Sonst speichert chatmesh nichts auf dem Gerät.
 // =========================================================================
 const SESSION_KEY = "cm";
+// Wer es in den Einstellungen einschaltet, bleibt auf diesem Gerät angemeldet, auch wenn das
+// Fenster geschlossen wird. Dann liegt dieselbe mit dem Code verschlossene Anmeldung zusätzlich
+// im dauerhaften Speicher des Browsers, bis man sich abmeldet oder es wieder ausschaltet.
+const STAY_KEY = "cmk";
 const CODE_MIN = 8, CODE_TRIES = 5;
 let _pendingLogin = null, _codeMode = null;
+function stayOn() { try { return localStorage.getItem(STAY_KEY) !== null; } catch (e) { return false; } }
 function readSession() {
-  try {
-    const j = JSON.parse(sessionStorage.getItem(SESSION_KEY) || "null");
-    return j && typeof j.s === "string" && typeof j.c === "string" ? j : null;
-  } catch (e) { return null; }
+  for (const [store, key] of [["sessionStorage", SESSION_KEY], ["localStorage", STAY_KEY]]) {
+    try {
+      const j = JSON.parse(window[store].getItem(key) || "null");
+      if (j && typeof j.s === "string" && typeof j.c === "string") return j;
+    } catch (e) {}
+  }
+  return null;
 }
-function clearSession() { try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {} }
+function writeSession(text) {
+  sessionStorage.setItem(SESSION_KEY, text);
+  if (stayOn()) { try { localStorage.setItem(STAY_KEY, text); } catch (e) {} }
+}
+function clearSession() {
+  try { sessionStorage.removeItem(SESSION_KEY); } catch (e) {}
+  try { localStorage.removeItem(STAY_KEY); } catch (e) {}
+}
+// Schaltet "angemeldet bleiben" für dieses Gerät ein oder aus. Gibt zurück, ob es geklappt hat.
+function setStay(on) {
+  try {
+    if (!on) { localStorage.removeItem(STAY_KEY); return true; }
+    const text = sessionStorage.getItem(SESSION_KEY);
+    if (!text) return false;
+    localStorage.setItem(STAY_KEY, text);
+    return localStorage.getItem(STAY_KEY) === text;
+  } catch (e) { return false; }
+}
 async function storeSession(loginBytes, code) {
   const salt = C.rand(16);
   const key = await C.passwordKey(code, salt);
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify({ s: C.b64(salt), c: C.b64(await C.seal(key, loginBytes)), n: 0 }));
+  writeSession(JSON.stringify({ s: C.b64(salt), c: C.b64(await C.seal(key, loginBytes)), n: 0 }));
 }
 function showCode(mode) {
   _codeMode = mode;
   const set = mode === "set";
   $("#code-title").textContent = set ? "Lege deinen Code fest" : "Gib deinen Code ein";
   $("#code-info").textContent = set
-    ? "Diesen Code wählst du selbst: mindestens 8 Zeichen, auch nur Zahlen sind möglich. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter."
+    ? "Diesen Code wählst du selbst: mindestens 8 Zeichen, auch nur Zahlen sind möglich. Lädst du die Seite neu, bleibst du angemeldet und gibst nur diesen Code ein. Schließt du das Fenster oder meldest dich ab, brauchst du wieder deine 12 Wörter. In den Einstellungen kannst du einschalten, dass du auf diesem Gerät angemeldet bleibst."
     : "Du bist noch angemeldet. Gib deinen Code ein, um weiterzumachen. Code vergessen? Dann auf „Abmelden“ tippen und mit deinen 12 Wörtern neu anmelden.";
   $("#code-repeat").hidden = !set;
   $("#code-submit").textContent = set ? "Weiter" : "Entsperren";
@@ -710,12 +989,13 @@ async function submitCode() {
     btn.disabled = false;
     sess.n = (Number(sess.n) || 0) + 1;
     if (sess.n >= CODE_TRIES) { logout("Der Code war zu oft falsch. Bitte melde dich mit deinen 12 Wörtern an."); return; }
-    try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(sess)); } catch (e) {}
+    try { writeSession(JSON.stringify(sess)); } catch (e) {}
     const left = CODE_TRIES - sess.n;
     msg.textContent = "Falscher Code. Noch " + left + (left === 1 ? " Versuch." : " Versuche.");
     return;
   }
-  if (sess.n) { sess.n = 0; try { sessionStorage.setItem(SESSION_KEY, JSON.stringify(sess)); } catch (e) {} }
+  sess.n = 0;
+  try { writeSession(JSON.stringify(sess)); } catch (e) {}
   try { await loginWithBytes(L, false); }
   catch (e) {
     btn.disabled = false;
@@ -857,6 +1137,7 @@ function downloadWords() {
 }
 
 function logout(message) {
+  beatReset();
   clearSession();
   _pendingLogin = null;
   try { closeChannel(true); } catch (e) {}
@@ -892,6 +1173,7 @@ async function startSession() {
   renderList();
   renderChat();
   setSync("Synchronisiere …");
+  _beatOn = true;                      // ab jetzt reist alles im Takt, auch das Abholen von Wartendem
   await loadConfig();
   // Erst ausrechnen, welche Marken uns gehören, dann das Verzeichnis laden.
   await rebuildExpect();
@@ -905,7 +1187,7 @@ async function startSession() {
 }
 // Fassung dieser App. Der Server nimmt Speicherungen älterer Fassungen nicht mehr an,
 // damit ein altes, noch offenes Fenster keine neueren Angaben überschreibt.
-const CLIENT_VER = 3;
+const CLIENT_VER = 4;
 let _reloadTold = false;
 // Der Server verlangt eine neuere Fassung: Ab hier würde nichts mehr gespeichert.
 // Deshalb wird die Bedienung angehalten, bis die Seite neu geladen ist. Die
@@ -996,7 +1278,7 @@ async function rebuildExpect() {
   await matchPile();
 }
 // Vergleicht die vorgemerkten Marken mit dem Verzeichnis. Steht der Anfang einer
-// eigenen Marke darin, wird genau dieser Block geholt: jeder in einem eigenen Abruf
+// eigenen Marke darin, wird genau dieser Block geholt: je Schlag eine Marke
 // und streng in der Reihenfolge, in der die Blöcke eingeliefert wurden. So kommen
 // Nachrichten und Lösch-Aufträge in derselben Folge an, in der sie gesendet wurden.
 let _matching = null, _matchAgain = false, _matchRetry = false;
@@ -1005,35 +1287,47 @@ async function matchPile() {
   if (_matching === sid) { _matchAgain = true; return; }
   _matching = sid;
   try {
-    for (let pass = 0; pass < 200; pass++) {
+    for (let pass = 0; pass < 400; pass++) {
       _matchAgain = false;
       _matchRetry = false;
       const hits = [];
-      for (const tag of S.expect.keys()) { const at = S.index.get(tag.slice(0, PFX)); if (at !== undefined) hits.push([at, tag]); }
-      hits.sort((x, y) => x[0] - y[0]);
-      let progress = false;
-      // Wenige Abrufe laufen gleichzeitig, verarbeitet wird trotzdem streng der Reihe nach.
-      for (let i = 0; i < hits.length; i += FETCH_MAX) {
-        if (sid !== S.sid || !S.me) return;
-        const part = hits.slice(i, i + FETCH_MAX).map(h => h[1]).filter(tag => S.expect.has(tag));
-        const res = await Promise.all(part.map(tag => fetchBlocks([tag]).then(m => ({ block: m.get(tag) }), () => ({ failed: true }))));
-        if (sid !== S.sid || !S.me) return;
-        for (let k = 0; k < part.length; k++) {
-          const tag = part[k];
-          // Scheitert ein Abruf, wird hier angehalten und beim nächsten Mal an derselben Stelle
-          // weitergemacht: Spätere Blöcke dürfen frühere nicht überholen.
-          if (res[k].failed) { _matchRetry = true; _matchAgain = false; return; }
-          const block = res[k].block;
-          // Nichts da: Der Block wurde inzwischen gelöscht, oder ein fremder Eintrag fing zufällig gleich an.
-          if (!block) { S.index.delete(tag.slice(0, PFX)); continue; }
-          const info = S.expect.get(tag);
-          if (!info) continue;                               // wird nicht mehr erwartet
-          await onMatch(tag, info, block);
-          progress = true;
-          if (sid !== S.sid || !S.me) return;
-        }
+      const due = new Map();
+      for (const [tag, info] of S.expect) {
+        const at = S.index.get(tag.slice(0, PFX));
+        if (at === undefined) continue;
+        // Der gerade offene Chat-Kanal kommt zuerst. Innerhalb eines Chat-Kanals gilt streng die
+        // Reihenfolge der Einlieferung: So kommt ein Lösch-Auftrag nie nach dem an, was danach
+        // geschrieben wurde.
+        hits.push([info.id === S.active ? 0 : 1, at, tag]);
+        if (info.kind === "msg" && !info.lane) due.set(info.id, (due.get(info.id) || 0) + 1);
       }
-      // Nach Treffern rückt das Fenster der erwarteten Marken weiter: noch einmal vergleichen.
+      // Ungelesenes zählt schon, sobald es im Verzeichnis steht, auch wenn der Block noch nicht geholt ist.
+      let changed = false;
+      for (const c of S.acct.ch) { const r = S.run[c.id]; if (!r) continue; const n = due.get(c.id) || 0; if ((r.dueN || 0) !== n) { r.dueN = n; changed = true; } }
+      if (changed) renderList();
+      if (!hits.length) break;
+      hits.sort((x, y) => x[0] - y[0] || x[1] - y[1]);
+      let progress = false;
+      // Wenige Abrufe warten gleichzeitig in der Schlange, verarbeitet wird streng der Reihe nach.
+      const part = hits.slice(0, FETCH_MAX);
+      const waits = part.map(h => fetchBlocks([h[2]], { prio: h[0] }).then(m => ({ block: m.get(h[2]) }), () => ({ failed: true })));
+      for (let k = 0; k < part.length; k++) {
+        const tag = part[k][2];
+        const one = await waits[k];                        // jeder Block wird verarbeitet, sobald er da ist
+        if (sid !== S.sid || !S.me) return;
+        // Scheitert ein Abruf endgültig, wird hier angehalten und später an derselben Stelle
+        // weitergemacht: Spätere Blöcke dürfen frühere nicht überholen. Schon geholte spätere
+        // Blöcke gehen dabei nicht verloren: Sie liegen weiter auf dem Server.
+        if (one.failed) { _matchRetry = true; _matchAgain = false; return; }
+        const block = one.block;
+        // Nichts da: Der Block wurde inzwischen gelöscht, oder ein fremder Eintrag fing zufällig gleich an.
+        if (!block) { S.index.delete(tag.slice(0, PFX)); progress = true; continue; }
+        const info = S.expect.get(tag);
+        if (!info) { progress = true; continue; }          // wird nicht mehr erwartet
+        await onMatch(tag, info, block);
+        progress = true;
+        if (sid !== S.sid || !S.me) return;
+      }
       if (!progress && !_matchAgain) break;
     }
   } finally {
@@ -1062,11 +1356,17 @@ function parseBlocks(buf) {
   return out;
 }
 // Holt Blöcke zu genau diesen Marken. Liefert Marke -> Block; was es nicht gibt, fehlt.
-// Jede Marke geht in einem eigenen Abruf: So sehen alle Abrufe gleich aus, auch die der
-// Schein-Blöcke, und der Server erfährt nicht, welche Blöcke zusammengehören.
-async function fetchBlocks(tags) {
+// Im Takt nimmt ein Schlag genau eine Marke mit. Ein großer Block passt nicht in einen
+// Schlag: Er wird eigens geholt (das fällt von außen auf wie ein Anhang).
+async function fetchBlocks(tags, opt = {}) {
   const out = new Map();
   for (const tag of tags) {
+    if (_beatOn) {
+      const res = await new Promise(done => qPush({ kind: "fetch", prio: opt.prio || 0, tag, done }));
+      if (!res) throw new ApiError("Keine Verbindung zum Server", 0);
+      if (res.block) { out.set(tag, res.block); continue; }
+      if (!res.big) continue;
+    }
     const resp = await api("POST", "/api/v2/pile/fetch", { raw: true, timeout: 30000, json: { tags: [tag] } });
     const buf = new Uint8Array(await resp.arrayBuffer());
     for (const [t, block] of parseBlocks(buf)) if (t === tag) out.set(t, block);
@@ -1074,41 +1374,12 @@ async function fetchBlocks(tags) {
   return out;
 }
 function pileDrop(tag) { S.index.delete(tag.slice(0, PFX)); }
-// Schein-Abrufe: Erscheint irgendwo ein neuer Block, reagieren mehrere zufällige Apps
-// mit einem Abruf, der von außen wie ein echter aussieht (er fragt nach einer Marke, die
-// es nicht gibt, und bekommt eine gleich große leere Antwort). So sieht es aus, als würde
-// jede Nachricht von mehreren abgeholt, ohne dass jemand fremde Nachrichten bekommt.
-const REACT_P = 35, REACT_EVERY = 12000, REACT_MAX = 2;
-let _reactTokens = 1, _reactAt = 0;
-function reactTo(count) {
-  const now = Date.now();
-  _reactTokens = Math.min(REACT_MAX, _reactTokens + (now - (_reactAt || now)) / REACT_EVERY);
-  _reactAt = now;
-  for (let i = 0; i < Math.min(count, 12) && _reactTokens >= 1; i++) {
-    if (randInt(100) >= REACT_P) continue;
-    _reactTokens -= 1;
-    const sid = S.sid, alive = () => S.me && sid === S.sid;
-    const t = setTimeout(async () => {
-      S.timers.delete(t);
-      if (!alive()) return;
-      try {
-        // Wie ein Empfang: abholen und, als wäre der Chat offen, Stand sichern und löschen.
-        await api("POST", "/api/v2/pile/fetch", { raw: true, timeout: 30000, json: { tags: [C.hex(C.rand(16))] } });
-        if (!alive() || randInt(2) === 0) return;
-        await saveAccount();
-        if (!alive()) return;
-        await pileDelete(C.hex(C.rand(16)), C.hex(C.rand(16)));
-      } catch (e) {}
-    }, randBetween(0, 150));
-    S.timers.add(t);
-  }
-}
 let _syncing = null, _indexFloor = 0;
 async function pileSync(initial) {
   const sid = S.sid;
   if (_syncing === sid || !S.me) return;
   _syncing = sid;
-  let fresh = false, added = 0;
+  let fresh = false;
   const fromZero = S.cursor === 0;
   try {
     for (let round = 0; round < 400; round++) {
@@ -1120,7 +1391,7 @@ async function pileSync(initial) {
       if (buf.length % step || buf.length > INDEX_MAX * step) throw new Error("Verzeichnis ungültig");
       for (let o = 0; o + step <= buf.length; o += step) {
         const p = C.hex(buf.subarray(o, o + step));
-        if (!S.index.has(p)) { S.index.set(p, S.indexN++); added++; }
+        if (!S.index.has(p)) S.index.set(p, S.indexN++);
         fresh = true;
       }
       const last = Number(state[1]);
@@ -1128,10 +1399,11 @@ async function pileSync(initial) {
       if (state[0] !== "weiter") break;
     }
     if (fromZero) _indexFloor = S.index.size;
-    else if (added) reactTo(added);
   } finally { if (_syncing === sid) _syncing = null; }
+  // Das Abholen läuft für sich weiter: Der nächste Verzeichnis-Abruf wartet nicht darauf.
+  // Sonst würde man am selteneren Abrufen erkennen, dass gerade etwas empfangen wird.
   if (initial) { matchPile().catch(() => {}); }
-  else if (fresh || _matchRetry) await matchPile();
+  else if (fresh || _matchRetry) { matchPile().catch(() => {}); }
   // Arbeitsspeicher begrenzen: Im Lauf einer langen Sitzung sammeln sich Einträge längst
   // gelöschter Blöcke. Dann wird das Verzeichnis einmal frisch geholt.
   if (sid === S.sid && S.me && S.index.size > Math.max(LIM.keep, _indexFloor * 2)) { S.index = new Map(); S.indexN = 0; S.cursor = 0; }
@@ -1177,8 +1449,24 @@ async function onMatch(tag, info, block) {
 }
 
 // Öffnet alle wartenden Blöcke eines Kanals (nur wenn der Chat offen ist),
-// löscht sie sofort vom Server und zeigt sie an.
+// zeigt sie an und entfernt sie kurz darauf vom Server.
 let _processing = false;
+// Lesebestätigungen werden kurz gesammelt und gebündelt gesendet: ein Block für mehrere Nachrichten.
+function queueSeen(c, ids) {
+  const r = runOf(c);
+  r.seenOut = (r.seenOut || []).concat(ids);
+  if (r.seenT) return;
+  r.seenT = setTimeout(() => flushSeen(c), randBetween(1200, 3200));
+  S.timers.add(r.seenT);
+}
+function flushSeen(c) {
+  const r = S.run[c.id];
+  if (!r) return;
+  if (r.seenT) { clearTimeout(r.seenT); S.timers.delete(r.seenT); r.seenT = null; }
+  const ids = r.seenOut || [];
+  r.seenOut = [];
+  if (ids.length && r.kMsg && r.ch) sendObj(c, { t: "seen", ids: ids.slice(0, 200) }, "c").catch(() => {});
+}
 async function processWaiting(c) {
   const r = runOf(c);
   if (_processing || !r.kMsg || S.active !== c.id) return;
@@ -1228,6 +1516,7 @@ async function processWaiting(c) {
           continue;
         }
         if (!lane && r.arr) { body.__arr = r.arr.get(n); r.arr.delete(n); }
+        if (!lane) body.__n = n;
         const shown = await handleIncoming(c, body);
         if (shown) seenIds.push(shown);
         // Wurde der Chat genau in diesem Augenblick verlassen, bleibt nichts sichtbar zurück.
@@ -1235,15 +1524,22 @@ async function processWaiting(c) {
       }
     }
     if (jobs.length) {
-      // Erst im Konto merken, dass diese Nummern verarbeitet sind, dann sofort vom
-      // Server löschen. So lässt sich ein gelesener Block nie wieder unterschieben.
-      saveAccount().catch(() => false).then(async () => {
-        for (const [d, n] of jobs) { try { queueDelete(await C.msgTag(kt, d, n), await C.msgDelToken(kDel, d, n)); } catch (e) {} }
-      });
+      // Gelesene Blöcke werden vom Server entfernt: jeder für sich, kurz und zufällig versetzt,
+      // damit die Löschungen nicht als Gruppe auffallen. Mit behaltenem Verlauf erst, nachdem
+      // der Verlauf im Konto gespeichert ist: Sonst ginge die Nachricht bei einem Neuladen
+      // dazwischen verloren. Ohne Verlauf lebt sie ohnehin nur im Arbeitsspeicher.
+      const gone = async () => {
+        for (const [d, n] of jobs) { try { queueDelete(await C.msgTag(kt, d, n), await C.msgDelToken(kDel, d, n), randBetween(600, 9000)); } catch (e) {} }
+      };
+      if (c.keep) saveAccount().catch(() => false).then(gone);
+      else { saveLazy(); gone(); }
     }
-    if (advanced && c.ib) dropAnswerBlock(c);
+    // Das Gegenüber hat sich gemeldet. Die eigene Antwort auf den Einmal-Schlüssel bleibt trotzdem
+    // noch eine gute halbe Stunde liegen: Das Gegenüber speichert seinen neuen Chat-Kanal erst mit
+    // seinem nächsten festen Speichern und braucht sie, falls sein Gerät vorher abstürzt.
+    if (advanced && c.ib && !c.ib.k) { c.ib.k = 1; c.ib.exp = Math.min(c.ib.exp, nowSec() + randBetween(1800, 2700)); saveLazy(); }
     if (advanced) { await refreshExpect(c); await matchPile(); }
-    if (seenIds.length && alive()) sendObj(c, { t: "seen", ids: seenIds.slice(0, 200) }, "c").catch(() => {});
+    if (seenIds.length && alive()) queueSeen(c, seenIds);
     renderList();
     renderChat();
   } finally { _processing = false; }
@@ -1289,10 +1585,11 @@ async function handleIncoming(c, body) {
       return null;
     }
     const m = { i: id, me: 0, k: kind, x: kind === "text" ? String(body.x || "").slice(0, 60000) : "", vs: clampView(body.vs) };
+    if (Number.isInteger(body.__n)) m.n = body.__n;      // Nummer beim Gegenüber (für "alles löschen bis hierher")
     if (kind !== "text") { m.a = cleanAtt(body.a); if (!m.a) return null; }
     if (!c.keep) m.exp = Date.now() + m.vs * 1000;       // Zeit läuft ab dem Öffnen
     r.msgs.push(m);
-    if (kind !== "text") fetchMedia(c, m);
+    if (kind !== "text") fetchMedia(c, m, true);
     if (c.keep) saveHistorySoon(c);
     return body.i;
   }
@@ -1369,27 +1666,10 @@ function setMode(c, kind, value) {
 // Schritten. Benutzt wird eine Nummer erst, wenn die Reservierung wirklich
 // gespeichert ist. So wird nach einem Absturz oder mit zwei Geräten nie eine
 // Nummer zweimal vergeben.
-const _reserving = {};
-function reserveNumbers(c, key) {
-  const rkey = key === "sn" ? "sr" : "cr", slot = c.id + key;
-  if (!_reserving[slot]) {
-    _reserving[slot] = (async () => {
-      try {
-        c[rkey] = Math.max(c[rkey] || 0, c[key] || 0) + RESERVE;
-        if (!(await saveAccount())) throw new ApiError("Keine Verbindung zum Server", 0);
-        // Nach dem Speichern gilt, was im Konto steht (ein anderes Gerät kann
-        // inzwischen weiter sein: dann ist c[key] schon dahinter gesetzt).
-        if (chan(c.id) === c) runOf(c).ok[key] = c[rkey];
-      } finally { delete _reserving[slot]; }
-    })();
-  }
-  return _reserving[slot];
-}
-
 // Verschließt einen Inhalt und legt ihn als Block auf dem Server ab.
 // lane "" = Nachricht, lane "c" = stilles Steuerzeichen (gelesen, gelöscht, Antwort).
 // Gibt die Nummer zurück, unter der er liegt.
-async function sendObj(c, obj, lane = "") {
+async function sendObj(c, obj, lane = "", prio = null) {
   const r = runOf(c);
   const kMsg = r.kMsg, kDel = r.kDel, ch = r.ch;
   if (!kMsg || !ch) throw new Error("Chat-Kanal ist gesperrt");
@@ -1397,15 +1677,16 @@ async function sendObj(c, obj, lane = "") {
   const key = lane ? "cn" : "sn";
   const kt = C.unb64(c.kt), dir = c.dir + lane;
   for (let attempt = 0; attempt < 8; attempt++) {
-    while ((c[key] || 0) >= (r.ok[key] || 0)) { await reserveNumbers(c, key); if (sid !== S.sid) throw new Error("abgemeldet"); }
-    const n = c[key] || 0;
-    c[key] = n + 1;
+    let n = takeNumber(c, key);
+    while (n === null) { await reserveNumbers(c, key); if (sid !== S.sid) throw new Error("abgemeldet"); n = takeNumber(c, key); }
+    // Geht der Vorrat zur Neige, während gesendet wird, im Hintergrund nachfüllen.
+    if (rangesLeft(c, key) < RESERVE_LOW) reserveNumbers(c, key);
     saveLazy();
     const mk = await chainUse(ch[dir], n, false);
     if (!mk) throw new Error("Senden nicht möglich. Bitte den Chat-Kanal schließen und neu öffnen.");
     r.chDirty = true;
     const block = await C.sealJson(mk, obj, C.BLOCK);
-    const code = await pilePost(await C.msgTag(kt, dir, n), block, await C.msgDelToken(kDel, dir, n));
+    const code = await pilePost(await C.msgTag(kt, dir, n), block, await C.msgDelToken(kDel, dir, n), 26, prio === null ? (lane ? 1 : 0) : prio);
     if (sid !== S.sid) throw new Error("abgemeldet");
     if (code === 200) return n;
     if (code !== 409) throw new ApiError(code === 507 ? "Der Server ist gerade voll." : (code === 429 || code === 428 ? "Der Server ist gerade überlastet, bitte kurz warten." : "Senden nicht möglich"), code);
@@ -1422,7 +1703,6 @@ function sendText(c, text) {
   const obj = { t: "m", i: m.i, x: text, vs };
   if (S.acct.set.unread > 0) obj.xu = 1;      // ungeöffnet nur bis zu einer Frist gültig (wird beim Senden gesetzt)
   if (!C.fitsJson(obj, C.BLOCK)) { toast("Die Nachricht ist zu lang.", "err"); return false; }
-  if (!c.keep) m.exp = Date.now() + vs * 1000;
   r.msgs.push(m);                       // sofort anzeigen, das Senden läuft im Hintergrund
   renderChat(true);
   deliver(c, m, obj, true);
@@ -1440,6 +1720,7 @@ async function deliver(c, m, obj, canRetry) {
   try {
     m.n = await sendObj(c, obj);
     m.st = "sent";
+    if (!c.keep && !m.exp) m.exp = Date.now() + (m.vs || S.acct.set.view) * 1000;      // die Anzeige-Zeit läuft ab dem Versand
     delete m.retry;
     const tag = kDel ? await C.msgTag(kt, c.dir, m.n) : null;
     const del = kDel ? await C.msgDelToken(kDel, c.dir, m.n) : null;
@@ -1525,7 +1806,7 @@ async function sendMediaInner(c, file, kind, name) {
 function freeUrls(r) { for (const u of r.urls) { try { URL.revokeObjectURL(u); } catch (e) {} } r.urls = []; }
 
 // Lädt einen Anhang, entschlüsselt ihn in den Arbeitsspeicher und löscht ihn
-// (außer bei „Verlauf behalten“) sofort vom Server.
+// (außer bei „Verlauf behalten“) kurz darauf vom Server.
 // Anhänge laden: höchstens zwei gleichzeitig. Ist der Server gerade voll oder die
 // Verbindung weg, wird mit Abstand wiederholt. "Nicht mehr verfügbar" heißt es nur,
 // wenn der Server ausdrücklich sagt, dass es den Anhang nicht mehr gibt.
@@ -1540,11 +1821,14 @@ function mediaDone() {
   const next = _mediaQueue.shift();
   if (next) next(); else _mediaBusy--;
 }
-async function fetchMedia(c, m) {
+async function fetchMedia(c, m, fresh) {
   const r = runOf(c);
   if (m.url || m.loading) return;
   m.loading = true;
   const sid = S.sid, wanted = () => sid === S.sid && S.me && S.active === c.id && r.msgs.includes(m);
+  // Ein eben eingetroffener Anhang wird erst nach einer kurzen Zufallszeit geladen: So folgt
+  // das Herunterladen nicht im festen Abstand auf das Hochladen beim Gegenüber.
+  if (fresh) { await sleep(randBetween(1500, 9000)); if (!wanted()) { m.loading = false; return; } }
   await mediaSlot();
   try {
     for (let attempt = 0; attempt < 6; attempt++) {
@@ -1595,14 +1879,16 @@ async function saveHistory(c, msgs, kMsg) {
   let bytes = 2;
   for (let i = msgs.length - 1; i >= 0; i--) {
     const m = msgs[i];
-    if (m.st === "failed") continue;
+    if (m.st === "failed" || m.st === "sending") continue;      // erst nach dem Versand gehört sie in den Verlauf
     const e = { i: m.i, me: m.me, k: m.k, x: m.x, a: m.a, st: m.st === "seen" ? "seen" : "sent", n: m.n };
     bytes += C.utf8(JSON.stringify(e)).byteLength + 1;
     if (bytes > HIST_BYTES) break;
     list.unshift(e);
   }
-  const sealed = C.b64(await C.seal(await histKey(kMsg), C.utf8(JSON.stringify(list))));
+  // Ein leerer Verlauf wird gar nicht erst gespeichert.
+  const sealed = list.length ? C.b64(await C.seal(await histKey(kMsg), C.utf8(JSON.stringify(list)))) : "";
   if (!c.keep || !chan(c.id)) return;
+  if (!sealed && !c.hist) return;
   c.hist = sealed;
   bump(c);
   saveSoon();
@@ -1856,7 +2142,7 @@ async function setChannelPassword(c, newPw) {
   r.rewrapP = job.catch(() => {});
   await job;
   // Die Änderung gilt hier bereits. Klappt das Sichern gerade nicht, wird es nachgeholt.
-  const saved = await saveAccount();
+  const saved = await saveNow();
   // Hat gleichzeitig ein anderes Gerät geändert und dessen Stand gilt, ist diese Änderung verworfen.
   if (chan(c.id) !== c || !c.wrap || c.wrap.s !== C.b64(salt)) return "lost";
   if (!saved) { saveSoon(); return "later"; }
@@ -1933,6 +2219,7 @@ function closeChannel(silent) {
     }
     r.msgs = [];
     r.loaded = false;
+    flushSeen(c);                      // gesammelte Lesebestätigungen noch absenden
     if (S.acct && S.acct.set.lockOn) lockKeys(c);
   }
   closeSheet();
@@ -1960,7 +2247,7 @@ function dissolveLocal(c, reason, mine) {
   S.acct.gone = [...S.acct.gone.filter(x => x !== c.id), c.id].slice(-300);
   if (!(mine && reason === "deleted")) S.acct.notes.push(reasonText(c.name, reason, mine));
   S.acct.notes = S.acct.notes.slice(-20);
-  saveAccount();
+  saveNow();
   $("#view-chat").classList.remove("peek-chat");
   renderList();
   renderChat();
@@ -2057,7 +2344,8 @@ async function createChannel(name, password, keepReq) {
   S.acct.ch.unshift(c);
   runOf(c).ps = { I, priv: ex.privJwk, pub: ex.pub, kr, pwKey, salt, nk };
   await refreshExpect(c);
-  await saveAccount();
+  // Sofort speichern: Ein vergebener Einmal-Schlüssel darf nicht verloren gehen.
+  await saveNow();
   renderList();
   return c;
 }
@@ -2090,7 +2378,7 @@ async function completeInvite(c, block, ps) {
     r.ps = null;
     if (!S.acct.set.lockOn) { r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.ws = inst.ws; r.chDirty = false; }
     await refreshExpect(c);
-    await saveAccount();
+    saveSoon();
     // Die beiden Blöcke des Einmal-Codes später unauffällig entfernen.
     const wait = randBetween(15000, 90000);
     queueDelete(offerTag, offerDel, wait);      // die Antwort entfernt das Gegenüber selbst
@@ -2141,7 +2429,10 @@ async function joinChannel(codeText, name, password) {
   const r = runOf(c);
   r.kMsg = inst.kMsg; r.kDel = inst.kDel; r.own = inst.own; r.ch = inst.ch; r.pwKey = inst.pwKey; r.ws = inst.ws; r.chDirty = false;
   await refreshExpect(c);
-  await saveAccount();
+  // Sofort speichern: Der Einmal-Schlüssel ist jetzt verbraucht, der Chat-Kanal darf nicht
+  // verloren gehen. (Die andere Seite speichert erst mit ihrem nächsten festen Zeitpunkt:
+  // So speichern nie beide im selben Augenblick.)
+  await saveNow();
   renderList();
   await matchPile();
   return c;
@@ -2150,7 +2441,7 @@ async function joinChannel(codeText, name, password) {
 // Abgelaufene Einmal-Codes entfernen (24 Stunden).
 function dropAnswerBlock(c) {
   if (!c.ib) return;
-  queueDelete(c.ib.t, c.ib.d, randBetween(2000, 30000));
+  queueDelete(c.ib.t, c.ib.d, randBetween(1000, 20000));
   delete c.ib;
   saveLazy();
 }
@@ -2172,8 +2463,8 @@ function expireInvites() {
 }
 
 // =========================================================================
-// SCHLEIFEN: Abruf, Schein-Verkehr, Ablauf, Sperre
-// Alles in unregelmäßigen Abständen, damit kein Takt erkennbar ist.
+// SCHLEIFEN: Verzeichnis, fester Takt, Speichern, Ablauf
+// Alles in festen Zufallsabständen, unabhängig davon, ob gerade etwas zu tun ist.
 // =========================================================================
 function loop(fn, nextDelay) {
   const sid = S.sid;
@@ -2188,46 +2479,68 @@ function loop(fn, nextDelay) {
   plan();
 }
 
+// Zeitgeber über einen eigenen Arbeiter des Browsers: Browser bremsen die Zeitgeber einer
+// Seite im Hintergrund auf einmal je Sekunde oder Minute. Der Arbeiter läuft weiter, so
+// bleibt der Takt derselbe, ob das Fenster vorne liegt oder nicht. Geht das nicht, gilt
+// der gewöhnliche Zeitgeber.
+let _ticker = null, _tickN = 0;
+const _tickCb = new Map();
+function later(fn, ms) {
+  if (_ticker === null) {
+    try {
+      _ticker = new Worker("/s/tick.js");
+      _ticker.onmessage = (e) => { const f = _tickCb.get(e.data); if (f) { _tickCb.delete(e.data); f(); } };
+      _ticker.onerror = () => { _ticker = false; };
+    } catch (e) { _ticker = false; }
+  }
+  if (!_ticker) { setTimeout(fn, ms); return; }
+  const id = ++_tickN;
+  _tickCb.set(id, fn);
+  _ticker.postMessage({ id, ms });
+  // Rückfall, falls der Arbeiter ausfällt: der gewöhnliche Zeitgeber, etwas später.
+  setTimeout(() => { const f = _tickCb.get(id); if (f) { _tickCb.delete(id); f(); } }, ms + 2500);
+}
+// Wie loop, aber der Abstand hängt nicht davon ab, wie lange ein Durchlauf dauert: Der
+// nächste Zeitpunkt steht schon fest, bevor der Vorgang beginnt. So bleibt der Takt
+// derselbe, ob ein Schlag Inhalt trägt oder nicht.
+function tickLoop(fn, nextDelay) {
+  const sid = S.sid;
+  const plan = () => {
+    later(() => {
+      if (!S.me || sid !== S.sid) return;
+      plan();
+      try { Promise.resolve(fn()).catch(() => {}); } catch (e) {}
+    }, nextDelay());
+  };
+  plan();
+}
+
+// Direkt nach dem Anmelden gehen immer gleich viele Schläge in dichter Folge hinaus, egal ob
+// etwas wartet oder nicht. So ist Wartendes schnell da, und von außen ist nicht zu sehen,
+// wie viel gewartet hat.
+function loginBurst() {
+  const sid = S.sid;
+  for (let i = 0; i < LOGIN_BEATS; i++) {
+    later(() => { if (S.me && sid === S.sid) { try { Promise.resolve(beatTick()).catch(() => {}); } catch (e) {} } }, i * LOGIN_GAP);
+  }
+}
+
 function startLoops() {
+  loginBurst();
   // Verzeichnis abrufen
-  loop(() => pileSync(false), () => randBetween(600, 1700));
-  // Schein-Vorgänge: Ein Schein-Block wird abgelegt und danach genau so behandelt wie
-  // eine echte empfangene Nachricht: abholen, Stand sichern, löschen, oft eine
-  // Bestätigung ablegen. Von außen ist die Abfolge von einer echten nicht zu unterscheiden.
-  loop(async () => {
-    const big = randInt(40) === 0;
-    const tag = C.hex(C.rand(16)), token = C.hex(C.rand(16));
-    const code = await pilePost(tag, C.rand(big ? 65564 : 4124), token, 24);
-    if (code !== 200) return;
-    const sid = S.sid, alive = () => S.me && sid === S.sid;
-    const t = setTimeout(async () => {
-      S.timers.delete(t);
-      if (!alive()) return;
-      try {
-        if (randInt(6) === 0) { queueDelete(tag, token, randBetween(4000, 90000)); return; }      // bleibt "ungeöffnet" liegen
-        await fetchBlocks([tag]);
-        if (!alive()) return;
-        if (randInt(4) === 0) { queueDelete(tag, token, randBetween(4000, 90000)); return; }      // abgeholt, Chat aber nicht offen
-        await saveAccount();
-        if (!alive()) return;
-        queueDelete(tag, token);
-        if (randInt(5) !== 0) {
-          await sleep(randBetween(40, 400));
-          if (!alive()) return;
-          const tag2 = C.hex(C.rand(16)), token2 = C.hex(C.rand(16));
-          if ((await pilePost(tag2, C.rand(4124), token2, 24)) === 200) queueDelete(tag2, token2, randBetween(3000, 90000));
-        }
-      } catch (e) { queueDelete(tag, token, randBetween(4000, 90000)); }
-    }, randBetween(700, 3500));
-    S.timers.add(t);
-  }, () => Math.round(randExp(20000, 2500, 90000)));
+  tickLoop(() => pileSync(false), () => randBetween(600, 1700));
+  // Fester Takt: ein Schlag in gleichmäßigen Zufallsabständen, mit oder ohne Inhalt.
+  _beatOn = true;
+  tickLoop(beatTick, () => randBetween(BEAT_MIN, BEAT_MAX));
+  // Kleiner Zusatz-Block mit dem Nummern-Vorrat: ebenfalls in festen Zufallsabständen.
+  tickLoop(auxTick, () => randBetween(2000, 5000));
   // Ablauf der Anzeige-Zeit und der Einmal-Schlüssel
   loop(async () => { tickExpiry(); expireInvites(); expireUnread(); }, () => 1000);
-  // Konto in unregelmäßigen Abständen speichern, mit und ohne Anlass: von außen
-  // sieht beides gleich aus. Größere Konten (mit behaltenem Verlauf) seltener.
-  loop(async () => { await saveAccount(); }, () => {
-    const mean = (S.blobLen || 0) < 100000 ? 40000 : ((S.blobLen || 0) < 400000 ? 60000 : 120000);
-    return Math.round(randExp(mean, mean / 4, mean * 4));
+  // Konto in festen Zufallsabständen speichern, mit und ohne Anlass: von außen sieht
+  // beides gleich aus. Der Abstand hängt nur von der Größe des Kontos ab.
+  tickLoop(saveTick, () => {
+    const base = [20000, 60000, 180000, 600000, 1200000][Math.min(4, S.blobClass || 0)];
+    return randBetween(base, base * 2);
   });
   // Schwere der Rechenaufgabe ab und zu neu holen
   loop(loadConfig, () => randBetween(120000, 360000));
@@ -2679,7 +2992,9 @@ function settingsSheet() {
       { name: "us", type: "number", grid: true, label: "Sekunden", value: u % 60 },
       { node: el("div", "sheet-section", "Chat-Kanal-Sperre") },
       { name: "lockOn", type: "checkbox", label: "Passwort des Chat-Kanals jedes Mal verlangen: beim Öffnen und immer, wenn du einen Chat-Kanal verlassen hast. Ausgeschaltet fragt jeder Chat-Kanal nur einmal je Anmeldung. Betrifft nur Chat-Kanäle, für die du ein Passwort vergeben hast.", value: set.lockOn },
-      { node: infoNode("Lädst du die Seite neu, bleibst du angemeldet und gibst nur deinen Code ein. Schließt du das Fenster, bist du abgemeldet. chatmesh beobachtet nicht, ob du die Maus bewegst oder tippst.") },
+      { node: el("div", "sheet-section", "Anmeldung auf diesem Gerät") },
+      { node: infoNode("Lädst du die Seite neu, bleibst du angemeldet und gibst nur deinen Code ein. Schließt du das Fenster, bist du abgemeldet, außer du schaltest das Folgende ein. chatmesh beobachtet nicht, ob du die Maus bewegst oder tippst.") },
+      { name: "stay", type: "checkbox", label: "Auf diesem Gerät angemeldet bleiben, auch wenn das Fenster geschlossen wird. Beim nächsten Öffnen genügt dann dein Code. Dafür bleibt die Anmeldung, mit deinem Code verschlossen, auf diesem Gerät liegen, bis du dich abmeldest. Wer das Gerät in die Hände bekommt, könnte den Code durchprobieren: Nimm dann einen langen Code mit Buchstaben, und schalte es nie auf fremden Geräten ein.", value: stayOn() },
       { node: codeChangeButton() },
     ],
     submit: "Speichern",
@@ -2700,7 +3015,9 @@ function settingsSheet() {
         // Sperre wieder an: alle nicht geöffneten Kanäle sofort sperren.
         for (const c of S.acct.ch) if (S.active !== c.id) lockKeys(c);
       }
-      if (!(await saveAccount())) throw new Error("Speichern nicht möglich. Bitte Verbindung prüfen.");
+      if (!(await saveNow())) throw new Error("Speichern nicht möglich. Bitte Verbindung prüfen.");
+      // Gilt nur für dieses Gerät und steht nicht im Konto.
+      if (!!val.stay !== stayOn() && !setStay(!!val.stay)) throw new Error("„Angemeldet bleiben“ lässt sich in diesem Browser nicht einschalten (zum Beispiel im privaten Modus).");
       closeSheet();
       renderList();
       renderChat();
@@ -2782,7 +3099,7 @@ function channelMenu(c) {
     formSheet("Chat-Kanal umbenennen", {
       fields: [{ name: "name", label: "Neuer Name (siehst nur du)", value: c.name, max: 40 }],
       submit: "Speichern",
-      onSubmit: async (v) => { c.name = ((v.name || "").trim() || c.name).slice(0, 40); bump(c); await saveAccount(); closeSheet(); renderList(); renderChat(); },
+      onSubmit: async (v) => { c.name = ((v.name || "").trim() || c.name).slice(0, 40); bump(c); await saveNow(); closeSheet(); renderList(); renderChat(); },
     });
   }));
   if (noPw(c)) items.push(menuItem("Passwort festlegen", "Dieser Chat-Kanal hat bei dir kein eigenes Passwort. Mit Passwort wird es beim Öffnen und beim Löschen verlangt.", false, () => passwordSheet(c)));
@@ -2871,39 +3188,48 @@ function confirmClear(c) {
   no.type = "button";
   no.addEventListener("click", closeSheet);
   openSheetNodes("Alle Nachrichten löschen?", [
-    infoNode("Alle Nachrichten in diesem Chat-Kanal verschwinden sofort bei dir und bei deinem Gegenüber: Geöffnetes, noch nicht Geöffnetes und ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
+    infoNode("Alle Nachrichten in diesem Chat-Kanal verschwinden bei dir sofort und bei deinem Gegenüber nach wenigen Sekunden: Geöffnetes, noch nicht Geöffnetes und ein behaltener Verlauf. Das lässt sich nicht rückgängig machen."),
     no, yes,
   ], true);
 }
-function clearLocal(c) {
+// Leert den Chat hier. Mit upto/rupto (vom Gegenüber ausgelöst) bleibt stehen, was NACH dem
+// Löschen gesendet wurde: seine Nachrichten ab Nummer upto und eigene, die es beim Löschen
+// noch nicht hatte (ab Nummer rupto oder noch unterwegs).
+function clearLocal(c, upto, rupto) {
   const r = runOf(c);
-  for (const m of r.msgs) dropMedia(c, m, true);
-  r.msgs = [];
+  let stay = [];
+  if (Number.isInteger(upto) && S.active === c.id) {
+    stay = r.msgs.filter(m => m.me
+      ? (Number.isFinite(rupto) && !(Number.isInteger(m.n) && m.n < rupto) && m.st !== "failed")
+      : (Number.isInteger(m.n) && m.n >= upto));
+  }
+  for (const m of r.msgs) if (!stay.includes(m)) dropMedia(c, m, true);
+  r.msgs = stay;
   c.hist = "";
-  c.pu = [];
+  const ids = new Set(stay.filter(m => m.me).map(m => m.i));
+  c.pu = (c.pu || []).filter(e => ids.has(e.i));
   c.hv = (c.hv || 0) + 1;
   bump(c);
   if (_histTimers[c.id]) { clearTimeout(_histTimers[c.id]); delete _histTimers[c.id]; }
+  if (stay.length && c.keep) saveHistorySoon(c);
   saveSoon();
   if (S.active === c.id) renderChat();
 }
-
-// Sieht in den wartenden stillen Steuerzeichen nach, ob das Gegenüber alles
-// gelöscht oder „Verlauf behalten“ abgeschaltet hat, und setzt das um, BEVOR
-// Verlauf geladen oder Nachrichten geöffnet werden. Jeder Auftrag wird genau
-// einmal umgesetzt. Die Steuerzeichen selbst bleiben liegen und werden danach
-// ganz normal verarbeitet (und vom Server gelöscht).
 async function applyPendingClear(c, kMsg) {
   const r = runOf(c), p = peerDir(c);
   const done = new Set(c.ca || []);
   const fresh = [];
-  let cutoff = -1, keepOff = false;
+  let cutoff = -1, rcut = null, keepOff = false;
   for (const [n, block] of r.cwait) {
     if (done.has(n)) continue;
     let b = null;
     try { const mk = await chainPeek(r.ch && r.ch[p + "c"], n); if (!mk) continue; b = await C.openJson(mk, block, C.BLOCK); } catch (e) { continue; }
     if (!b || typeof b !== "object") continue;
-    if (b.t === "clr" && Number.isInteger(b.upto) && b.upto >= 0) { cutoff = Math.max(cutoff, b.upto); fresh.push(n); }
+    if (b.t === "clr" && Number.isInteger(b.upto) && b.upto >= 0) {
+      cutoff = Math.max(cutoff, b.upto);
+      rcut = Number.isInteger(b.rupto) && b.rupto >= 0 && rcut !== Infinity ? Math.max(rcut || 0, b.rupto) : Infinity;
+      fresh.push(n);
+    }
     else if (b.t === "set" && b.k === "keep" && !b.v) { keepOff = true; fresh.push(n); }
   }
   if (!fresh.length) return;
@@ -2913,7 +3239,7 @@ async function applyPendingClear(c, kMsg) {
     c.cf = Math.max(c.cf || 0, cutoff);
     // Schlüssel für gelöschte, nie geöffnete Nachrichten wegwerfen.
     if (r.ch && chainPrune(r.ch[p], c.cf, null)) r.chDirty = true;
-    clearLocal(c);
+    clearLocal(c, cutoff, rcut === Infinity ? undefined : rcut);
   } else if (keepOff) {
     c.hist = "";
     c.hv = (c.hv || 0) + 1;
@@ -2925,18 +3251,29 @@ async function applyPendingClear(c, kMsg) {
 async function clearForBoth(c) {
   const r = runOf(c);
   if (!r.kMsg || !r.kDel) return;
-  const upto = c.sn || 0;
-  try { await sendObj(c, { t: "clr", upto }, "c"); }
-  catch (e) { toast("Nicht gelöscht: " + (e.message || "keine Verbindung"), "err"); return; }
+  // Stand jetzt: Alles bis hierher wird gelöscht. Was danach geschrieben wird, bleibt.
+  const upto = c.sn || 0, rupto = c.rn || 0;
+  const kt = C.unb64(c.kt), kDel = r.kDel, dir = c.dir, sid = S.sid;
+  // Was gerade noch unterwegs ist, wird direkt nach dem Versand zurückgeholt.
+  for (const m of r.msgs) if (m.me && m.st === "sending") m.cancel = true;
+  clearLocal(c);                       // hier sofort leer
+  toast("Alle Nachrichten gelöscht. Beim Gegenüber verschwinden sie in wenigen Sekunden.", "ok");
   // Eigene Blöcke, die noch ungelesen auf dem Server liegen, direkt dort entfernen.
-  const kt = C.unb64(c.kt), kDel = r.kDel;
   const from = Math.max(0, upto - WINDOW_AHEAD);
   (async () => {
-    const tags = await C.msgTags(kt, c.dir, from, upto);
-    for (let n = from; n < upto; n++) { try { queueDelete(tags[n - from], await C.msgDelToken(kDel, c.dir, n)); } catch (e) {} }
+    const tags = await C.msgTags(kt, dir, from, upto);
+    for (let n = from; n < upto; n++) {
+      // Nur was laut Verzeichnis noch liegen kann (und das zuletzt Gesendete, das dort vielleicht noch fehlt).
+      if (!S.index.has(tags[n - from].slice(0, PFX)) && n < upto - 4) continue;
+      try { queueDelete(tags[n - from], await C.msgDelToken(kDel, dir, n)); } catch (e) {}
+    }
   })().catch(() => {});
-  clearLocal(c);
-  toast("Alle Nachrichten bei euch beiden gelöscht.", "ok");
+  // Dem Gegenüber Bescheid geben; bei Verbindungsproblemen mehrfach versuchen.
+  for (let attempt = 0; attempt < 6; attempt++) {
+    if (sid !== S.sid || chan(c.id) !== c || !r.kMsg) return;
+    try { await sendObj(c, { t: "clr", upto, rupto }, "c", 0); return; } catch (e) { await sleep(4000 + attempt * 3000); }
+  }
+  if (sid === S.sid) toast("Beim Gegenüber konnte gerade nicht gelöscht werden: keine Verbindung.", "err");
 }
 
 function messageMenu(c, m) {
@@ -2948,7 +3285,7 @@ function messageMenu(c, m) {
   }
   const items = [];
   if (c.shots && m.k === "text" && m.x) items.push(menuItem("Text kopieren", "", false, () => { navigator.clipboard.writeText(m.x).then(() => toast("Kopiert", "ok")).catch(() => {}); }));
-  items.push(menuItem("Bei beiden löschen", "Verschwindet sofort bei dir und beim Gegenüber. Geht jederzeit: ob schon geöffnet oder nicht, auch bei behaltenem Verlauf.", true, () => deleteForBoth(c, m)));
+  items.push(menuItem("Bei beiden löschen", "Verschwindet bei dir sofort, beim Gegenüber nach wenigen Sekunden. Geht jederzeit: ob schon geöffnet oder nicht, auch bei behaltenem Verlauf.", true, () => deleteForBoth(c, m)));
   openSheetNodes(null, items);
 }
 
@@ -2996,7 +3333,7 @@ function renderList() {
     else if (c.id === S.active) sub = "geöffnet";
     else if (!unlocked(c) && !noPw(c)) sub = "mit Passwort gesperrt";
     line.appendChild(el("div", "last" + (c.pend ? " warn" : ""), sub));
-    const waiting = r.wait.size;
+    const waiting = r.wait.size + (r.dueN || 0);
     if (waiting > 0 && c.id !== S.active) { unread += waiting; line.appendChild(el("span", "unread", waiting > 99 ? "99+" : String(waiting))); }
     meta.appendChild(line);
     row.appendChild(av); row.appendChild(meta);
@@ -3095,7 +3432,7 @@ function messageRow(c, m) {
   const meta = el("span", "ts");
   if (m.exp) { const cd = el("span", "countdown", fmtClock((m.exp - Date.now()) / 1000)); cd.dataset.exp = String(m.exp); cd.title = "So lange bleibt die Nachricht noch sichtbar"; meta.appendChild(cd); }
   if (m.me) {
-    const st = m.st === "seen" ? "✓✓" : (m.st === "sent" ? "✓" : (m.st === "failed" ? "nicht gesendet" : "…"));
+    const st = m.st === "seen" ? "✓✓" : (m.st === "sent" ? "✓" : (m.st === "failed" ? "nicht gesendet" : "wird gesendet …"));
     const tick = el("span", "tick", st);
     tick.title = m.st === "seen" ? "Gelesen" : (m.st === "sent" ? "Gesendet" : (m.st === "failed" ? "Antippen zum Wiederholen" : "Wird gesendet"));
     meta.appendChild(tick);
@@ -3243,7 +3580,7 @@ function bindUI() {
     btn.disabled = true;
     closeChannel(true);
     for (const r of Object.values(S.run)) { if (r.flush) { try { await r.flush; } catch (e) {} } }
-    try { await Promise.race([saveAccount(), sleep(6000)]); } catch (e) {}
+    try { await Promise.race([saveNow(), sleep(6000)]); } catch (e) {}
     btn.disabled = false;
     logout();
   });
@@ -3286,8 +3623,11 @@ function bindUI() {
   $("#sheet-bg").addEventListener("click", (e) => { if (e.target.id === "sheet-bg" && !$("#sheet .sheet-form") && !$("#sheet .sheet-choice")) closeSheet(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#sheet .sheet-choice")) closeSheet(); });
 
-  window.addEventListener("beforeunload", (e) => { if (S.me && S.urgent) { e.preventDefault(); e.returnValue = ""; } });
-  window.addEventListener("pagehide", () => { if (S.me && S.dirty) saveAccount(); });
+  window.addEventListener("beforeunload", (e) => { if (S.me && S.urgent && (S.blobLen || 0) > 40000) { e.preventDefault(); e.returnValue = ""; } });
+  window.addEventListener("pagehide", () => { if (S.me && S.dirty) saveNow(); });
+  // Geht das Fenster in den Hintergrund und steht noch etwas Wichtiges aus, wird gleich gespeichert:
+  // Handys beenden Seiten im Hintergrund manchmal ohne Vorwarnung.
+  document.addEventListener("visibilitychange", () => { if (document.hidden && S.me && S.urgent) saveNow(); });
 
   // Erst jetzt lassen sich die Formulare absenden (ohne JavaScript bleiben die
   // Knöpfe gesperrt, damit nie Wörter als normale Formularanfrage rausgehen).
@@ -3295,7 +3635,7 @@ function bindUI() {
 }
 
 // Nur in der lokalen Testumgebung: Zugriff für automatische Prüfungen.
-if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount, noPw, tap: (f) => { _tap = f; }, failOn: (src) => { _failRe = src ? new RegExp(src) : null; } };
+if (location.hostname === "127.0.0.1" || location.hostname === "localhost") window.__cmTest = { S, closeChannel, LIM, clearForBoth, saveAccount: saveNow, noPw, queues: () => [_beatQ.length, 0], auxTick, tap: (f) => { _tap = f; }, failOn: (src) => { _failRe = src ? new RegExp(src) : null; } };
 
 // Start. Dieses Skript steht am Ende der Seite: alle Bausteine sind schon da.
 // Es wird sofort entschieden, welche Ansicht erscheint. Liegt in diesem Fenster
@@ -3310,7 +3650,10 @@ function init() {
   // Reste früherer Fassungen entfernen: Service Worker, Zwischenspeicher, Browser-Speicher.
   if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then(rs => rs.forEach(r => r.unregister())).catch(() => {});
   if (typeof caches !== "undefined") caches.keys().then(ks => Promise.all(ks.map(k => caches.delete(k)))).catch(() => {});
-  try { localStorage.clear(); for (const k of Object.keys(sessionStorage)) if (k !== SESSION_KEY) sessionStorage.removeItem(k); } catch (e) {}
+  try {
+    for (const k of Object.keys(localStorage)) if (k !== STAY_KEY) localStorage.removeItem(k);
+    for (const k of Object.keys(sessionStorage)) if (k !== SESSION_KEY) sessionStorage.removeItem(k);
+  } catch (e) {}
 }
 init();
 })();

@@ -31,28 +31,31 @@ er gerade ausliefert. Mit `verify.py` lässt sich das von außen nachprüfen.
    erfährt der Server nicht, worauf eine App wartet. Den Block selbst gibt er
    nur gegen die volle Marke heraus: Fremde Blöcke kann niemand herunterladen.
    Der Server bekommt keine Angabe, für wen ein Block ist, und speichert
-   nicht, wer ihn abholt oder löscht. Die App fragt je Abruf genau eine Marke
-   ab, auch bei Schein-Blöcken: So sieht jeder Abruf gleich aus.
-   Übergang: Für ältere, noch offene Fenster liefert die frühere
-   Komplett-Abfrage noch bis 23.11.2026, 0 Uhr UTC. Danach bleibt sie leer.
-4. **Verschwinden.** Öffnet das Gegenüber den Chat, wird der Block sofort vom
-   Server gelöscht. Die Nachricht ist dann nur noch im Arbeitsspeicher des
-   Browsers und verschwindet nach der eingestellten Zeit (Standard 10 Minuten)
-   oder sofort, wenn man den Chat verlässt. Das gilt auch für den Absender.
+   nicht, wer ihn abholt oder löscht.
+4. **Verschwinden.** Hat das Gegenüber eine Nachricht geöffnet, wird der Block
+   wenige Sekunden später vom Server gelöscht. Die Nachricht ist dann nur noch
+   im Arbeitsspeicher des Browsers und verschwindet nach der eingestellten
+   Zeit (Standard 10 Minuten) oder sofort, wenn man den Chat verlässt. Das
+   gilt auch für den Absender.
 5. **Verlauf behalten** gibt es nur, wenn beide zustimmen. Dann liegt der
    Verlauf verschlüsselt im Konto-Block.
-6. **Schein-Verkehr.** Jede offene App und ein eigener Dienst auf dem Server
-   legen ständig Blöcke ab, holen sie ab und löschen sie wieder, in
-   unregelmäßigen Abständen.
-   Ein Schein-Block ist von einem echten nicht zu unterscheiden. Der Dienst
-   legt außerdem laufend neue Schein-Konten an und benutzt sie wie ein Mensch.
-   Er merkt sich nichts dauerhaft: Es gibt keine Liste, aus der sich ablesen
-   ließe, welches Konto ein Schein-Konto ist, auch nicht für den Betreiber.
-   Erscheint irgendwo ein neuer Block, schickt außerdem jede offene App mit
-   etwa einem Drittel Wahrscheinlichkeit (und begrenzt in der Menge) einen
-   Schein-Abruf, der von außen wie ein echter aussieht. So wirkt es, als würde
-   eine Nachricht von mehreren abgeholt, ohne dass jemand fremde Nachrichten
-   bekommt.
+6. **Fester Takt.** Solange man angemeldet ist, schickt die App in
+   gleichmäßigen Zufallsabständen (0,75 bis 2,15 Sekunden) einen Umschlag
+   immer gleicher Größe, einen "Schlag". Ein Schlag trägt höchstens einen
+   Vorgang: einen kleinen Block ablegen, abholen oder löschen. Gibt es nichts
+   zu tun, geht er leer hinaus. Auch das Verzeichnis, ein kleiner Zusatz-Block
+   und das Speichern des Kontos laufen in eigenen festen Zufallsabständen, mit
+   und ohne Anlass. Wer nur die Leitung sieht, erkennt deshalb nicht, ob
+   gerade geschrieben wird oder mit wem. Weil nie zwei Vorgänge im selben
+   Schlag stecken, sieht auch der Server nicht, welche Vorgänge vom selben
+   Gerät kommen. Der Preis: Echte Vorgänge warten auf den nächsten Schlag.
+   Eine Nachricht braucht meist 2 bis 5 Sekunden, viele Nachrichten in
+   schneller Folge gehen mit etwa einer je anderthalb Sekunden hinaus, und
+   die offene App verbraucht laufend Daten (rund 30 MB je Stunde).
+   Ein eigener Dienst auf dem Server legt außerdem laufend Schein-Blöcke und
+   Schein-Konten an und benutzt sie im selben Takt wie eine App. Er merkt sich
+   nichts dauerhaft: Es gibt keine Liste, aus der sich ablesen ließe, welches
+   Konto ein Schein-Konto ist, auch nicht für den Betreiber.
 7. **Versiegelter Umschlag.** Die App schickt jede Anfrage verschlossen an
    einen einzigen Eingang. Öffnen kann sie nur der Server. Wer zwischen App
    und Server sitzt (Netzanbieter, vorgeschaltete Netzdienste), sieht, von
@@ -68,7 +71,7 @@ unter `/api/proof/schema`.
 
 | Tabelle | Inhalt |
 | --- | --- |
-| `accounts` | Zufallskennung, Prüfwert des Zugangs, Prüfwert der Löschwörter, zwei verschlüsselte Blöcke in fester Größe, eine zufällige Versionsmarke, Abschnitt von vier Wochen der letzten Speicherung |
+| `accounts` | Zufallskennung, Prüfwert des Zugangs, Prüfwert der Löschwörter, zwei verschlüsselte Blöcke in fester Größe, eine zufällige Versionsmarke, ein kleiner verschlüsselter Zusatz-Block fester Größe mit eigener Versionsmarke, Abschnitt von vier Wochen der letzten Speicherung |
 | `pile` | Reihenfolge-Nummer, Zufallsmarke, Block in fester Größe (4124 oder 65564 Bytes), Prüfwert des Lösch-Geheimnisses, Kalenderwoche |
 | `blobs` | Zufallskennung, verschlüsselter Anhang in fester Größe (256 KB, 1 MB, 4 MB, 16 MB), Kalenderwoche |
 
@@ -149,17 +152,32 @@ bekommt nur Geheimtext.
 
 ## Gleichförmigkeit
 
-- Einliefern, Abholen und Löschen eines kleinen Blocks sehen von außen gleich aus:
-  gleiche Größe der Anfrage und der Antwort, immer derselbe Eingang, immer
-  Status 200, gleiche Mindestdauer.
-- Abrufe des Verzeichnisses, Schein-Blöcke (sie werden wie echte auch wieder
-  abgeholt) und das Speichern des Kontos laufen in zufälligen Abständen, mit
-  und ohne Anlass.
+- Einliefern, Abholen und Löschen eines kleinen Blocks reisen alle als
+  Schlag: gleiche Größe der Anfrage und der Antwort, immer derselbe Eingang,
+  immer Status 200, gleiche Mindestdauer, gleicher Takt mit und ohne Inhalt.
+- Der Taktgeber läuft in einem eigenen Arbeiter des Browsers, damit der Takt
+  derselbe bleibt, wenn das Fenster im Hintergrund liegt.
+- Abrufe des Verzeichnisses und das Speichern des Kontos laufen in eigenen
+  festen Zufallsabständen, mit und ohne Anlass. Wie oft das Konto gespeichert
+  wird, hängt nur von seiner Größe ab.
+- Vor dem Senden muss eine Nummer reserviert sein. Dafür gibt es je Konto einen
+  kleinen verschlüsselten Zusatz-Block fester Größe, der alle zwei bis fünf
+  Sekunden geschrieben wird, mit und ohne Anlass. So muss nie eigens das Konto
+  gespeichert werden, und zwei Geräte bekommen nie dieselben Nummern.
+- Lesebestätigungen werden kurz gesammelt und gebündelt gesendet. Gelesene
+  Blöcke werden einzeln und zufällig versetzt entfernt.
+- Ein eben eingetroffener Anhang wird erst nach einer kurzen Zufallszeit
+  geladen.
 - Der Server setzt keine Cookies, schreibt kein Zugriffsprotokoll und liest
   keine IP-Adresse oder Gerätekennung.
 - Im Browser liegt nur die Anmeldung, verschlossen mit dem eigenen Code des
   Nutzers, und nur im Speicher dieses einen Fensters: Nach dem Neu-Laden der
-  Seite genügt der Code. Fenster zu oder abgemeldet, und sie ist weg.
+  Seite genügt der Code. Fenster zu oder abgemeldet, und sie ist weg. Wer es
+  in den Einstellungen einschaltet, bleibt auf diesem Gerät angemeldet: Dann
+  liegt dieselbe verschlossene Anmeldung zusätzlich im dauerhaften Speicher
+  des Browsers, bis man sich abmeldet. Wer das Gerät in die Hände bekommt,
+  könnte dann den Code durchprobieren; deshalb ist das aus, solange man es
+  nicht selbst einschaltet.
 - Die App beobachtet weder Maus noch Tastatur, um Untätigkeit zu erkennen.
 
 ## Was der Server nicht kann
@@ -182,10 +200,13 @@ bekommt nur Geheimtext.
   Server aktiv eingreift, könnte den Schlüssel des Eingangs austauschen oder
   die App verändern und dann mitlesen. Das Prüf-Programm erkennt nur eine
   veränderte App. Sicher schützt die Onion-Adresse.
-- Schein-Verkehr und Schein-Abrufe erschweren es, aus Zeitpunkten zu
-  schließen, wer mit wem schreibt. Unmöglich machen sie es nicht: Wer sehr
-  lange alle Anschlüsse beobachtet, kann Häufungen erkennen. Je mehr Apps
-  gleichzeitig offen sind, desto schwerer wird das.
+- Außerhalb des Takts bleiben sichtbar: wann ein Anschluss verbunden ist,
+  das Anmelden, seltene Schritte wie Einstellungen speichern, Anhänge und
+  sehr lange Nachrichten (eigene Größen) und ein zweites Gerät am selben
+  Konto (zusätzliche Abrufe).
+- Friert ein Handy die Seite im Hintergrund ganz ein, sieht es von außen aus,
+  als wäre der Anschluss nicht verbunden. Nachrichten kommen dann erst an,
+  wenn die Seite wieder geöffnet wird.
 - Für ältere, noch offene Fenster nimmt der Server Anfragen übergangsweise
   auch ohne Umschlag an. Die aktuelle App lädt nur die Seite selbst und den
   öffentlichen Schlüssel des Eingangs ohne Umschlag, alles andere mit.
@@ -206,10 +227,19 @@ bekommt nur Geheimtext.
   dabei keine Anmeldung. Wer davor am Netz die IP-Adressen sieht, kann wegen
   des versiegelten Umschlags nicht erkennen, welcher Block es war oder ob
   überhaupt etwas abgeholt wurde.
-- Warten mehrere Nachrichten auf ein Gerät, holt die App sie kurz
-  hintereinander ab. Der Server könnte aus der zeitlichen Nähe schließen, dass
-  diese Blöcke an dasselbe Gerät gehen, und sieht am Abholen, dass ein
-  Empfänger gerade da ist. An wen, sieht er nicht.
+- Der Server selbst sieht die echten Vorgänge (Block abgelegt, abgeholt,
+  gelöscht), aber nicht von wem. Eine Kennung für den Chat-Kanal gibt es
+  nirgends, jede Nachricht hat eine neue Marke. Aus dem zeitlichen Ablauf
+  könnte ein Server, der mitschreibt, bei wenig Betrieb trotzdem vermuten,
+  welche Blöcke zu einem Gespräch gehören. Deshalb laufen ständig
+  Schein-Gespräche mit, und das Speichern der Konten hängt zeitlich nicht mehr
+  an einzelnen Nachrichten.
+- Ohne behaltenen Verlauf wird ein gelesener Block entfernt, bevor der neue
+  Stand im Konto gespeichert ist (das Speichern folgt im festen Abstand). Lädt
+  die Seite genau dazwischen neu, könnte ein böswilliger Server denselben
+  Block noch einmal zustellen. Er bekäme dadurch nichts zu lesen; der
+  Empfänger sähe eine Nachricht doppelt. Mit behaltenem Verlauf wird erst
+  nach dem Speichern entfernt.
 
 ## Schutz des Servers
 

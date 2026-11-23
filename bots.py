@@ -53,8 +53,9 @@ MAX_PENDING = 1500                       # so viele eigene Löschungen stehen h�
 MAX_LINGER = 400                         # so viele Blöcke dürfen ohne Löschung liegen bleiben
 MAX_ATTACHMENTS = 2                      # so viele Schein-Anhänge gleichzeitig unterwegs
 MAX_LINGER_ATTACHMENTS = 30              # so viele kleine Schein-Anhänge dürfen liegen bleiben
-MAX_WORK_BITS = 24                       # wird die Rechenaufgabe schwerer, pausieren die Bots (wie die Schein-Blöcke der App)
-CLIENT_VER = 3            # dieselbe Fassungs-Angabe wie die App
+MAX_WORK_BITS = 24                       # wird die Rechenaufgabe schwerer, pausieren die Bots (wie die App)
+AUX_PLAIN = 512
+CLIENT_VER = 4            # dieselbe Fassungs-Angabe wie die App
 
 PEOPLE_MIN, PEOPLE_MAX = 5, 24           # so viele Schein-Menschen gibt es gleichzeitig
 NEW_PER_DAY_MAX = 6                      # mehr neue Schein-Konten entstehen nie an einem Tag
@@ -119,7 +120,8 @@ mood = Mood()
 X_SIZES = (512, 1024, 2048, 4608)
 X_BLOCK_REQ = 4608
 X_BIN_FIELDS = ("data", "blob", "wipe_blob")
-X_BLOCK_OPS = {("POST", "/api/v2/pile"), ("POST", "/api/v2/pile/fetch"), ("POST", "/api/v2/pile/delete")}
+X_BLOCK_OPS = {("POST", "/api/v2/pile"), ("POST", "/api/v2/pile/fetch"), ("POST", "/api/v2/pile/delete"), ("POST", "/api/v2/pile/beat")}
+BEAT_CODE = {0: 0, 1: 200, 2: 409, 3: 428, 4: 507, 5: 429, 6: 404, 7: 400}
 
 
 class Answer:
@@ -216,9 +218,69 @@ class Sealed:
 
 class Api:
     def __init__(self):
-        self.client = Sealed(httpx.AsyncClient(base_url=TARGET, headers={"host": HOST}, timeout=60.0))
+        self.client = Sealed(httpx.AsyncClient(base_url=TARGET, headers={
+            "host": HOST,
+            # dieselben allgemeinen Angaben wie ein verbreiteter Browser
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "accept": "*/*", "accept-language": "de-DE,de;q=0.9,en;q=0.8", "accept-encoding": "gzip, deflate, br",
+        }, timeout=60.0))
         self.work = {"salt": "", "pile": [12, 16], "delete": 8, "account": [17, 19, 21, 23, 25], "upload": [16, 18, 20, 22]}
-        self.fresh = 0          # neue Einträge im zuletzt abgerufenen Verzeichnis
+        # Fester Takt wie in der App: Vorgänge warten hier auf den nächsten Schlag.
+        # Rang 0 Nachrichten, 1 stille Steuerzeichen, 2 Löschen. Je Schlag höchstens ein Vorgang.
+        self.queue = []
+
+    def _wait(self, item):
+        item["done"] = asyncio.get_running_loop().create_future()
+        i = len(self.queue)
+        while i > 0 and self.queue[i - 1]["prio"] > item["prio"]:
+            i -= 1
+        self.queue.insert(i, item)
+        return item["done"]
+
+    async def beat(self):
+        """Ein Schlag: ein Ablegen, ein Abholen oder ein Löschen, sonst leer."""
+        op = self.queue.pop(0) if self.queue else None
+        body = {}
+        if op and op["kind"] == "post":
+            body.update(post_tag=op["tag"], post_del_hash=op["del_hash"], post_work=op["work"], data=op["data"])
+        elif op and op["kind"] == "del":
+            body.update(del_tag=op["tag"], del_token=op["token"], del_work=op["work"])
+        elif op:
+            body["fetch"] = op["tag"]
+        out = None
+        try:
+            r = await self.client.post("/api/v2/pile/beat", json=body)
+            if r.status_code == 200 and len(r.content) >= 6:
+                out = r.content
+        except Exception:
+            out = None
+        if not op or op["done"].done():
+            return
+        if not out:
+            op["done"].set_result(None)
+        elif op["kind"] == "post":
+            op["done"].set_result(BEAT_CODE.get(out[0], 500))
+        elif op["kind"] == "del":
+            op["done"].set_result(BEAT_CODE.get(out[1], 500))
+        else:
+            size = int.from_bytes(out[2:6], "big")
+            if size == 0xFFFFFFFF:
+                # Großer Block: wie die App eigens holen.
+                try:
+                    await self.client.post("/api/v2/pile/fetch", json={"tags": [op["tag"]]})
+                except Exception:
+                    pass
+            op["done"].set_result(size > 0)
+
+    async def pump(self, until=None):
+        """Schickt Schläge im selben Abstand wie eine offene App."""
+        loop = asyncio.get_running_loop()
+        while until is None or loop.time() < until:
+            await asyncio.sleep(0.75 + rng.random() * 1.4)
+            try:
+                await self.beat()
+            except Exception:
+                pass
 
     def subject(self, raw: bytes) -> bytes:
         """Gegenstand der Rechenaufgabe: aktuelles Salz des Servers + Kennung + Art."""
@@ -237,7 +299,7 @@ class Api:
             await self.load_config()
             await asyncio.sleep(120 + rng.random() * 240)
 
-    async def post_block(self, size: int):
+    async def post_block(self, size: int, prio: int = 0):
         """Legt einen Block ab. Gibt (Marke, Lösch-Geheimnis) zurück oder None."""
         if _pending >= MAX_PENDING:
             return None
@@ -247,14 +309,20 @@ class Api:
             if bits > MAX_WORK_BITS:
                 return None                # Server ist unter Last: Bots halten sich zurück
             work = await asyncio.to_thread(solve, self.subject(bytes.fromhex(tag) + b"p"), bits)
-            body = {"tag": tag, "data": b64(secrets.token_bytes(size)), "del_hash": hashlib.sha256(bytes.fromhex(token)).hexdigest(), "work": work}
-            r = await self.client.post("/api/v2/pile", json=body)
-            if r.status_code != 200:
-                return None
-            answer = r.json()
-            if answer.get("ok") is True:
+            del_hash = hashlib.sha256(bytes.fromhex(token)).hexdigest()
+            data = b64(secrets.token_bytes(size))
+            if size == BIG:
+                # Große Blöcke passen nicht in einen Schlag (wie in der App).
+                r = await self.client.post("/api/v2/pile", json={"tag": tag, "data": data, "del_hash": del_hash, "work": work})
+                if r.status_code != 200:
+                    return None
+                answer = r.json()
+                code = 200 if answer.get("ok") is True else answer.get("code")
+            else:
+                code = await self._wait({"kind": "post", "prio": prio, "tag": tag, "del_hash": del_hash, "work": work, "data": data})
+            if code == 200:
                 return tag, token
-            if answer.get("code") != 428:
+            if code != 428:
                 return None
             await self.load_config()
         return None
@@ -269,24 +337,20 @@ class Api:
                 if bits > MAX_WORK_BITS:
                     continue
                 work = await asyncio.to_thread(solve, self.subject(bytes.fromhex(tag) + b"d"), bits)
-                base = len(json.dumps({"tag": tag, "token": token, "work": work, "pad": ""}, separators=(",", ":")))
-                body = {"tag": tag, "token": token, "work": work, "pad": ""}
-                r = await self.client.post("/api/v2/pile/delete", json=body)
-                if r.status_code == 200:
-                    answer = r.json()
-                    if answer.get("ok") is True or answer.get("code") == 404:
-                        return
-                    if answer.get("code") == 428:
-                        await self.load_config()
+                code = await self._wait({"kind": "del", "prio": 2, "tag": tag, "token": token, "work": work})
+                if code in (200, 404):
+                    return
+                if code == 428:
+                    await self.load_config()
             except Exception:
                 pass
 
-    async def fetch_block(self, tag: str):
+    async def fetch_block(self, tag: str, prio: int = 0):
         """Holt einen Block gezielt ab, so wie die App des Gegenübers."""
         try:
-            await self.client.post("/api/v2/pile/fetch", json={"tags": [tag]})
+            return bool(await self._wait({"kind": "fetch", "prio": prio, "tag": tag}))
         except Exception:
-            pass
+            return False
 
     async def fetch_pile(self, cursor: int) -> int:
         """Ruft das Verzeichnis ab wie die App. Gibt die neue Lesemarke zurück."""
@@ -294,7 +358,6 @@ class Api:
             r = await self.client.get("/api/v2/pile/index", params={"since": cursor})
             if r.status_code != 200:
                 return cursor
-            self.fresh += len(r.content) // 5
             state = (r.headers.get("x-pile") or "ende:%d:0" % cursor).split(":")
             try:
                 cursor = max(cursor, int(state[1]))
@@ -348,6 +411,7 @@ class Account:
         self.cls = 0
         self.wcls = 0
         self.version = None
+        self.aux_version = 0
         self.gone = False
 
     @property
@@ -358,9 +422,25 @@ class Account:
         return {"blob": b64(secrets.token_bytes(ACCOUNT_PLAIN[cls] + 28)), "wipe_blob": b64(secrets.token_bytes(WIPE_PLAIN[wcls] + 28))}
 
     def save_pause(self) -> float:
-        """Abstand bis zum nächsten Speichern, wie in der App: große Konten seltener."""
-        mean = 14 if self.cls == 0 else (45 if self.cls == 1 else 120)
-        return expo(mean, mean / 4, mean * 4)
+        """Abstand bis zum nächsten Speichern, wie in der App: je nach Größe des Kontos."""
+        base = (20, 60, 180, 600, 1200)[min(4, self.cls)]
+        return base + rng.random() * base
+
+    async def aux(self):
+        """Schreibt den kleinen Zusatz-Block, wie die App in festen Abständen."""
+        try:
+            body = {"data": b64(secrets.token_bytes(AUX_PLAIN + 28)), "expected": self.aux_version, "cv": CLIENT_VER}
+            r = await self.api.client.post("/api/v2/account/aux", headers=self.auth, json=body)
+            if r.status_code == 200:
+                self.aux_version = r.json().get("version", self.aux_version)
+        except Exception:
+            pass
+
+    async def aux_loop(self, until: float):
+        loop = asyncio.get_running_loop()
+        while loop.time() < until and not self.gone:
+            await asyncio.sleep(2 + rng.random() * 3)
+            await self.aux()
 
     async def create(self) -> bool:
         """Legt das Konto an, genau wie die App beim Anlegen."""
@@ -392,6 +472,7 @@ class Account:
         r = await self.api.client.get("/api/v2/account", headers=self.auth)
         if r.status_code == 200:
             self.version = r.json()["version"]
+            self.aux_version = r.json().get("aux_version", 0)
             return True
         if r.status_code == 401:
             self.gone = True
@@ -485,32 +566,27 @@ async def session(api: Api, account: Account, spawn):
     cursor = await api.fetch_pile(0)
     loop = asyncio.get_running_loop()
     end = loop.time() + lognorm(420 * mood.level, 1.0, 25, 4 * 3600)
+    for i in range(30):                           # wie die App: feste Zahl Schläge direkt nach dem Anmelden
+        spawn(later(i * 0.12, api.beat))
+    spawn(api.pump(end))                          # Schläge im festen Takt, solange die Sitzung dauert
+    spawn(account.aux_loop(end))                  # kleiner Zusatz-Block in festen Abständen
     next_post = expo(mood.scale(25), 1, 600)
     next_save = account.save_pause()
     next_decoy = expo(10, 1.2, 45)
     chatting = 0
-    tokens = 1.0
     while loop.time() < end:
         step = 0.6 + rng.random() * 1.1           # Abruf wie die App
         await asyncio.sleep(step)
         try:
-            api.fresh = 0
             cursor = await api.fetch_pile(cursor)
-            # Wie die App: auf neue Einträge mit einem Schein-Abruf reagieren (begrenzt).
-            tokens = min(3.0, tokens + step / 6.0)
-            for _ in range(min(api.fresh, 12)):
-                if tokens >= 1 and rng.random() < 0.35:
-                    tokens -= 1
-                    spawn(later(rng.random() * 0.15, api.fetch_block, secrets.token_hex(16)))
             next_decoy -= step
             if next_decoy <= 0:
-                # Schein-Block der App: kurz da, dann wieder weg
-                next_decoy = expo(10, 1.2, 45)
+                # Ab und zu ein Schein-Block: kurz da, abgeholt, wieder weg. So liegen auf dem
+                # Server immer auch Blöcke, hinter denen keine Nachricht steckt.
+                next_decoy = expo(25, 3, 120)
                 got = await api.post_block(BIG if rng.random() < 0.025 else SMALL)
                 if got:
-                    if rng.random() < 0.8:
-                        spawn(later(0.7 + rng.random() * 2.8, api.fetch_block, got[0]))
-                    spawn(later(4 + rng.random() * 86, api.delete_block, *got))
+                    spawn(later(0, read_block, api, got, spawn, 0.0, True, None))
             if rng.random() < 0.0004:
                 # selten: ein Einmal-Schlüssel wird angelegt und eingelöst
                 spawn(later(0, invite_like, api, spawn))
@@ -520,7 +596,6 @@ async def session(api: Api, account: Account, spawn):
                 if chatting <= 0:
                     if rng.random() < 0.6:
                         chatting = rng.randint(2, 14)
-                    await account.save()          # wie die App vor der ersten Nachricht
                 chatting -= 1
                 next_post = lognorm(7, 0.8, 1.2, 90) if chatting > 0 else expo(mood.scale(70), 3, 1800)
                 got = await api.post_block(BIG if rng.random() < 0.03 else SMALL)
@@ -592,31 +667,31 @@ def poll_gap() -> float:
 
 
 async def read_block(api: Api, got, spawn, life=0.0, early=False, account=None):
-    """Das "Gegenüber" holt den Block ab (sofort, wenn es gerade da ist, sonst wenn es
-    wiederkommt), liest ihn später und löscht ihn. Oft folgt eine Lesebestätigung."""
+    """Das "Gegenüber" holt den Block ab (gleich, wenn es gerade da ist, sonst wenn es
+    wiederkommt), liest ihn und entfernt ihn kurz darauf. Oft folgt eine Lesebestätigung."""
     if early:
         gap = poll_gap()
         await asyncio.sleep(gap)
         await api.fetch_block(got[0])
-        await asyncio.sleep(max(0.0, life - gap))
+        if life > gap and rng.random() < 0.4:
+            await asyncio.sleep(life - gap)                    # abgeholt, aber erst später gelesen
     else:
         await asyncio.sleep(life)
         await api.fetch_block(got[0])
-        await asyncio.sleep(0.2 + rng.random() * 2.5)
-    if account is not None and rng.random() < 0.7:
-        try:
-            await account.save()                  # die App sichert den Stand, bevor sie löscht
-        except Exception:
-            pass
+    await asyncio.sleep(0.6 + rng.random() * 8.4)              # gelesene Blöcke werden kurz versetzt entfernt
     await api.delete_block(*got)
     if rng.random() < 0.8:
-        await asyncio.sleep(0.05 + rng.random() * 0.6)
-        receipt = await api.post_block(SMALL)
+        await asyncio.sleep(1.2 + rng.random() * 2.0)          # Bestätigungen werden kurz gesammelt
+        receipt = await api.post_block(SMALL, 1)
         if receipt:
             if rng.random() < 0.6:
-                spawn(later(poll_gap(), api.fetch_block, receipt[0]))
-            # Die Bestätigung wird immer wieder entfernt.
-            spawn(later(lognorm(60, 1.2, 2, 6 * 3600), api.delete_block, *receipt))
+                await asyncio.sleep(poll_gap())
+                await api.fetch_block(receipt[0], 1)
+                await asyncio.sleep(0.6 + rng.random() * 8.4)
+                await api.delete_block(*receipt)
+            else:
+                # Die Bestätigung wird immer wieder entfernt.
+                spawn(later(lognorm(60, 1.2, 2, 6 * 3600), api.delete_block, *receipt))
 
 
 async def invite_like(api: Api, spawn):
@@ -718,7 +793,9 @@ async def main():
     await api.load_config()
     tasks: set = set()
     print("bots running", file=sys.stderr)
-    await asyncio.gather(mood.drift(), api.config_loop(), newcomers(api, tasks))
+    # Ein Taktgeber läuft immer, damit Wartendes auch dann abgearbeitet wird, wenn gerade
+    # kein Schein-Nutzer angemeldet ist.
+    await asyncio.gather(mood.drift(), api.config_loop(), api.pump(), newcomers(api, tasks))
 
 
 if __name__ == "__main__":

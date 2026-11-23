@@ -329,7 +329,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     wipe_blob TEXT NOT NULL,
     version INTEGER NOT NULL,
     size_bytes INTEGER NOT NULL,
-    wk INTEGER NOT NULL
+    wk INTEGER NOT NULL,
+    aux TEXT NOT NULL DEFAULT '',
+    aux_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS pile (
@@ -371,6 +373,13 @@ def init_db():
         except OSError:
             pass
     con = sqlite3.connect(DB_PATH)
+    # Ältere Datenbanken bekommen die beiden Spalten für den kleinen Zusatz-Block nachträglich.
+    have = {r[1] for r in con.execute("PRAGMA table_info(accounts)").fetchall()}
+    if "aux" not in have:
+        con.execute("ALTER TABLE accounts ADD COLUMN aux TEXT NOT NULL DEFAULT ''")
+    if "aux_version" not in have:
+        con.execute("ALTER TABLE accounts ADD COLUMN aux_version INTEGER NOT NULL DEFAULT 0")
+    con.commit()
     # Ältere Konten bekamen fortlaufende Zeilennummern: durch Zufallszahlen ersetzen.
     for (rid,) in con.execute("SELECT rowid FROM accounts WHERE rowid < ?", (2**40,)).fetchall():
         con.execute("UPDATE accounts SET rowid=? WHERE rowid=?", (2**40 + secrets.randbits(62), rid))
@@ -488,7 +497,7 @@ BIG_ROUTES = {
 X_PATH = "/api/v2/x"
 X_BIG_BYTES = 262144        # ab dieser Größe gilt ein Umschlag (oder seine Antwort) als groß
 X_BIG_PARALLEL = 8
-SMALL_BODIES = {("POST", "/api/v2/pile/fetch"): 2048, ("POST", X_PATH): MAX_BODY_ATTACHMENT + 131072}
+SMALL_BODIES = {("POST", "/api/v2/pile/fetch"): 2048, ("POST", "/api/v2/pile/beat"): 8192, ("POST", "/api/v2/account/aux"): 4096, ("POST", X_PATH): MAX_BODY_ATTACHMENT + 131072}
 # Kopfzeilen, mit denen sich das Änderungsdatum von Dateien erfragen ließe.
 STRIP_REQUEST_HEADERS = (b"if-modified-since", b"if-none-match", b"if-range", b"range", b"if-unmodified-since")
 DEFAULT_TIMEOUT = 60
@@ -623,10 +632,10 @@ class AccountCreateReq(StrictModel):
 # Fassungen ohne diese Angabe (0) dürfen weiter speichern: Sie würden eine
 # Ablehnung nicht verstehen, und Angelegtes (etwa ein Einmal-Schlüssel) ginge verloren.
 MIN_CLIENT = max(0, int(os.environ.get("LEHNO_MESH_MIN_CLIENT", "0")))
-# Ab dieser Fassung schickt die App alles im versiegelten Umschlag. Offene Fenster
+# Ab dieser Fassung sendet die App im festen Takt. Offene Fenster
 # mit einer älteren Fassung, die den Hinweis schon kennen, werden gebeten, neu zu
 # laden. Speichern dürfen sie weiter.
-RELOAD_HINT = 3
+RELOAD_HINT = 4
 
 
 class AccountPutReq(StrictModel):
@@ -723,11 +732,48 @@ async def account_create(req: AccountCreateReq, con: aiosqlite.Connection = Depe
 
 @app.get("/api/v2/account")
 async def account_get(con: aiosqlite.Connection = Depends(db), me: str = Depends(current_account)):
-    cur = await con.execute("SELECT blob, version FROM accounts WHERE id=?", (me,))
+    cur = await con.execute("SELECT blob, version, aux, aux_version FROM accounts WHERE id=?", (me,))
     row = await cur.fetchone()
     if not row:
         raise HTTPException(401, "not signed in")
-    return {"blob": row["blob"], "version": row["version"]}
+    return {"blob": row["blob"], "version": row["version"], "aux": row["aux"], "aux_version": row["aux_version"]}
+
+
+# Kleiner Zusatz-Block je Konto (verschlüsselt, feste Größe). Die App legt darin ab, welche
+# Nummern sie für das Senden reserviert hat. Er wird in festen Abständen geschrieben, mit
+# und ohne Anlass, und ist viel kleiner als der Konto-Block: So muss vor dem Senden nie
+# eigens das ganze Konto gespeichert werden. Geschrieben wird nur, wenn die App den
+# aktuellen Stand kennt; sonst bekommt sie den aktuellen zurück. Die Antwort ist in beiden
+# Fällen gleich groß.
+AUX_PLAIN = 512
+AUX_B64 = len(base64.b64encode(b"\0" * (AUX_PLAIN + 28)))
+
+
+class AuxReq(StrictModel):
+    data: str = Field(..., min_length=AUX_B64, max_length=AUX_B64)
+    expected: int = Field(..., ge=0, le=2**62)
+    cv: int = Field(0, ge=0, le=100000)
+
+
+@app.post("/api/v2/account/aux")
+async def account_aux(req: AuxReq, con: aiosqlite.Connection = Depends(db), me: str = Depends(current_account)):
+    b64_bytes(req.data, "data")
+    if not limit_ok(f"account:aux:{me}", 240, 60):
+        raise HTTPException(429, "too many requests")
+    version = new_version()
+    cur = await con.execute("UPDATE accounts SET aux=?, aux_version=? WHERE id=? AND aux_version=?",
+                            (req.data, version, me, req.expected))
+    wrote = cur.rowcount == 1
+    if wrote:
+        await con.commit()
+    cur = await con.execute("SELECT aux, aux_version, version FROM accounts WHERE id=?", (me,))
+    row = await cur.fetchone()
+    if not row:
+        raise HTTPException(401, "not signed in")
+    # Die Antwort ist in beiden Fällen gleich lang, auch wenn noch nie etwas abgelegt wurde.
+    # "acct" nennt die Versionsmarke des Kontos: Hat ein anderes Gerät das Konto inzwischen
+    # gespeichert, holt die App es nach.
+    return {"ok": 1 if wrote else 0, "version": row["aux_version"], "acct": row["version"], "aux": row["aux"] or ("A" * AUX_B64)}
 
 
 @app.put("/api/v2/account")
@@ -890,6 +936,95 @@ async def pile_delete(req: PileDeleteReq, con: aiosqlite.Connection = Depends(db
     limiter.note("pile:delete")
     _totals["pile"] -= row["size_bytes"]
     return await _even(started, _reply(True))
+
+
+class BeatReq(StrictModel):
+    """Ein Schlag im festen Takt: alles ist freiwillig, die Anfrage ist immer gleich groß."""
+    post_tag: constr(pattern=HEX32) | None = None
+    post_del_hash: constr(pattern=HEX64) | None = None
+    post_work: str = Field("", max_length=16)
+    data: str = Field("", max_length=6000)          # nur kleine Blöcke
+    fetch: constr(pattern=HEX32) | None = None
+    del_tag: constr(pattern=HEX32) | None = None
+    del_token: constr(pattern=HEX32) | None = None
+    del_work: str = Field("", max_length=16)
+
+
+# Ergebnis je Teil eines Schlags (ein Byte): 0 nichts verlangt, 1 erledigt, sonst der Grund.
+BEAT_CODES = {200: 1, 409: 2, 428: 3, 507: 4, 429: 5, 404: 6, 400: 7}
+BEAT_BIG = 0xFFFFFFFF          # statt einer Länge: "Block ist zu groß für einen Schlag"
+
+
+@app.post("/api/v2/pile/beat")
+async def pile_beat(req: BeatReq, con: aiosqlite.Connection = Depends(db)):
+    """Ein Schlag: einen kleinen Block ablegen, einen löschen oder einen abholen. Die App
+    schickt je Schlag höchstens eines davon (oder nichts).
+    Antwort: Ergebnis Ablegen (1 Byte) | Ergebnis Löschen (1 Byte) | Länge (4 Bytes) | Block.
+    Ein großer Block wird nicht mitgeschickt (Länge BEAT_BIG): Den holt die App eigens.
+    Von außen ist nicht zu sehen, was ein Schlag enthält."""
+    if not limit_ok("pile:beat", 900000, 60):
+        raise HTTPException(429, "too many requests")
+    post_code = del_code = 0
+    if req.post_tag is not None:
+        post_code = 200
+        raw = b""
+        if req.post_del_hash is None or len(req.data) != BLOCK_B64[0]:
+            post_code = 400
+        else:
+            try:
+                raw = b64_bytes(req.data, "data")
+            except HTTPException:
+                post_code = 400
+            if post_code == 200 and len(raw) != BLOCK_BYTES[0]:
+                post_code = 400
+        if post_code == 200:
+            if not work_ok(bytes.fromhex(req.post_tag) + b"p", req.post_work, work_bits_pile(len(raw))):
+                post_code = 428
+            elif limiter.count("pile:post", 60) >= 20000:
+                post_code = 429
+            elif not disk_ok(len(raw)) or _totals["pile"] + len(raw) > MAX_PILE_BYTES:
+                post_code = 507
+            else:
+                try:
+                    await con.execute(
+                        "INSERT INTO pile (tag, data, del_hash, size_bytes, wk) VALUES (?,?,?,?,?)",
+                        (req.post_tag, raw, req.post_del_hash, len(raw), week_bucket(int(time.time()))),
+                    )
+                    await con.commit()
+                    limiter.note("pile:post")
+                    _totals["pile"] += len(raw)
+                except sqlite3.IntegrityError:
+                    post_code = 409
+    if req.del_tag is not None:
+        del_code = 200
+        if req.del_token is None:
+            del_code = 400
+        elif not work_ok(bytes.fromhex(req.del_tag) + b"d", req.del_work, work_bits_delete()):
+            del_code = 428
+        elif limiter.count("pile:delete", 60) >= 20000:
+            del_code = 429
+        else:
+            cur = await con.execute("DELETE FROM pile WHERE tag=? AND del_hash=? RETURNING size_bytes",
+                                    (req.del_tag, sha256_hex(bytes.fromhex(req.del_token))))
+            row = await cur.fetchone()
+            await con.commit()
+            if row:
+                limiter.note("pile:delete")
+                _totals["pile"] -= row["size_bytes"]
+            else:
+                del_code = 404
+    block, length = b"", 0
+    if req.fetch is not None:
+        cur = await con.execute("SELECT data, size_bytes FROM pile WHERE tag=?", (req.fetch,))
+        row = await cur.fetchone()
+        if row:
+            if row["size_bytes"] > BLOCK_BYTES[0]:
+                length = BEAT_BIG
+            else:
+                block = bytes(row["data"])
+                length = len(block)
+    head = bytes([BEAT_CODES.get(post_code, 9) if post_code else 0, BEAT_CODES.get(del_code, 9) if del_code else 0])
+    return Response(content=head + struct.pack(">I", length) + block, media_type="application/octet-stream")
 
 
 PILE_CHUNK_BYTES = 2 * 1024 * 1024
@@ -1064,9 +1199,9 @@ async def seal_loop():
 
 
 # Was im Umschlag erlaubt ist: nur die Wege der App, nie der Eingang selbst.
-X_ROUTES = re.compile(r"/api/(v2/(account|wipe|config|pile|pile/index|pile/fetch|pile/delete)|attachments(/[0-9a-f]{32})?)")
+X_ROUTES = re.compile(r"/api/(v2/(account|account/aux|wipe|config|pile|pile/index|pile/fetch|pile/delete|pile/beat)|attachments(/[0-9a-f]{32})?)")
 # Ablegen, Abholen und Löschen eines kleinen Blocks sehen von außen gleich aus.
-X_BLOCK_OPS = {("POST", "/api/v2/pile"), ("POST", "/api/v2/pile/fetch"), ("POST", "/api/v2/pile/delete")}
+X_BLOCK_OPS = {("POST", "/api/v2/pile"), ("POST", "/api/v2/pile/fetch"), ("POST", "/api/v2/pile/delete"), ("POST", "/api/v2/pile/beat")}
 X_SIZES = (512, 1024, 2048, 4608)
 X_BLOCK_MIN = 4608
 X_BLOCK_SECONDS = 0.075     # Mindestdauer eines Block-Vorgangs im Umschlag
@@ -1480,7 +1615,7 @@ PROOF_FILES = [
     "static/index.html", "static/app.js", "static/crypto.js", "static/media.js", "static/bip39.js",
     "static/style.css", "static/landing.html", "static/landing.js",
     "static/proof.html", "static/proof.js", "static/manifest.json",
-    "static/vendor/jsqr.js", "static/vendor/qrcode.js",
+    "static/vendor/jsqr.js", "static/vendor/qrcode.js", "static/tick.js",
 ]
 REPO_URL = os.environ.get("LEHNO_MESH_REPO_URL", "https://github.com/aliecommerce123-web/lehno-mesh")
 PROOF_REFRESH_SECONDS = max(1, int(os.environ.get("LEHNO_MESH_PROOF_REFRESH", "600")))

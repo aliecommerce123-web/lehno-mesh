@@ -33,6 +33,7 @@ PROTECTED = [
     "static/manifest.json",
     "static/vendor/jsqr.js",
     "static/vendor/qrcode.js",
+    "static/tick.js",
 ]
 
 result = {}
